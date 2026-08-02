@@ -103,7 +103,7 @@ function buildShareText(deal) {
   return lines.join("\n");
 }
 
-/* ---------- shrink photos so they fit in saved storage ---------- */
+/* ---------- shrink photos so they fit in the database ---------- */
 function resizeImage(file, maxDim = 900, quality = 0.6) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -129,6 +129,7 @@ const blankDeal = () => ({
   id: uid(), address: "", borough: "Bronx", neighborhood: "", zone: "R6",
   streetWidth: "narrow", lotArea: "", customFar: "", askingPrice: "", sellerNumber: "",
   vacancy: "TBD", existingSf: "", contactName: "", contactPhone: "", notes: "",
+  photos: [],
   created: new Date().toISOString().slice(0, 10),
 });
 const blankBuyer = () => ({
@@ -137,23 +138,32 @@ const blankBuyer = () => ({
 });
 
 /* ============================================================
-   SHARED PERSISTENCE — one row in Supabase holds the whole team's data
+   SHARED PERSISTENCE — deals and buyers each live in their own
+   Supabase table, one row per record: { id, data, updated_at }
 ============================================================ */
-const STATE_ROW_ID = "shared";
-
-async function loadState() {
-  const { data } = await supabase.from("app_state").select("data").eq("id", STATE_ROW_ID).maybeSingle();
-  if (data?.data) return data.data;
-  const initial = { deals: [], buyers: [], photos: {} };
-  await supabase.from("app_state").insert({ id: STATE_ROW_ID, data: initial });
-  return initial;
+async function fetchAll() {
+  const [{ data: dealRows, error: dErr }, { data: buyerRows, error: bErr }] = await Promise.all([
+    supabase.from("deals").select("id, data").order("updated_at", { ascending: false }),
+    supabase.from("buyers").select("id, data").order("updated_at", { ascending: false }),
+  ]);
+  if (dErr) throw dErr;
+  if (bErr) throw bErr;
+  return {
+    deals: (dealRows || []).map((r) => ({ ...r.data, id: r.id })),
+    buyers: (buyerRows || []).map((r) => ({ ...r.data, id: r.id })),
+  };
 }
 
-async function saveState(next) {
-  await supabase
-    .from("app_state")
-    .update({ data: next, updated_at: new Date().toISOString() })
-    .eq("id", STATE_ROW_ID);
+async function upsertRow(table, record) {
+  const { error } = await supabase
+    .from(table)
+    .upsert({ id: record.id, data: record, updated_at: new Date().toISOString() });
+  if (error) throw error;
+}
+
+async function deleteRow(table, id) {
+  const { error } = await supabase.from(table).delete().eq("id", id);
+  if (error) throw error;
 }
 
 /* ============================================================ */
@@ -161,7 +171,6 @@ function DealDesk() {
   const [tab, setTab] = useState("deals");
   const [deals, setDeals] = useState([]);
   const [buyers, setBuyers] = useState([]);
-  const [photos, setPhotos] = useState({}); // dealId -> [dataUrl]
   const [loaded, setLoaded] = useState(false);
   const [saveState_, setSaveState_] = useState("idle");
 
@@ -180,10 +189,9 @@ function DealDesk() {
   useEffect(() => {
     (async () => {
       try {
-        const s = await loadState();
-        setDeals(s.deals || []);
-        setBuyers(s.buyers || []);
-        setPhotos(s.photos || {});
+        const s = await fetchAll();
+        setDeals(s.deals);
+        setBuyers(s.buyers);
       } catch (e) {
         console.error(e);
         notify("Couldn't reach the database. Check your connection and reload.");
@@ -192,58 +200,60 @@ function DealDesk() {
     })();
   }, []);
 
-  const persist = async (nextDeals, nextBuyers) => {
+  const saveDeal = async () => {
+    if (!dealForm.address.trim()) return;
     setSaveState_("saving");
     try {
-      await saveState({ deals: nextDeals, buyers: nextBuyers, photos });
+      await upsertRow("deals", dealForm);
+      const exists = deals.some((d) => d.id === dealForm.id);
+      setDeals(exists ? deals.map((d) => (d.id === dealForm.id ? dealForm : d)) : [dealForm, ...deals]);
       setSaveState_("saved"); setTimeout(() => setSaveState_("idle"), 1500);
-    } catch (e) { setSaveState_("error"); }
-  };
-  const persistPhotos = async (next) => {
-    try { await saveState({ deals, buyers, photos: next }); return true; }
-    catch (e) { notify("Couldn't save photos. Try again."); return false; }
-  };
-  const commitDeals = (next) => { setDeals(next); persist(next, buyers); };
-  const commitBuyers = (next) => { setBuyers(next); persist(deals, next); };
-
-  const saveDeal = () => {
-    if (!dealForm.address.trim()) return;
-    const exists = deals.some((d) => d.id === dealForm.id);
-    commitDeals(exists ? deals.map((d) => (d.id === dealForm.id ? dealForm : d)) : [dealForm, ...deals]);
+    } catch (e) { setSaveState_("error"); notify("Couldn't save that deal."); }
     setDealForm(null);
   };
-  const deleteDeal = (id) => {
-    commitDeals(deals.filter((d) => d.id !== id));
-    const np = { ...photos }; delete np[id]; setPhotos(np); persistPhotos(np);
+  const deleteDeal = async (id) => {
+    try { await deleteRow("deals", id); } catch (e) { notify("Couldn't delete that deal."); }
+    setDeals(deals.filter((d) => d.id !== id));
     setDealForm(null);
   };
-  const saveBuyer = () => {
+  const saveBuyer = async () => {
     if (!buyerForm.name.trim()) return;
-    const exists = buyers.some((b) => b.id === buyerForm.id);
-    commitBuyers(exists ? buyers.map((b) => (b.id === buyerForm.id ? buyerForm : b)) : [buyerForm, ...buyers]);
+    setSaveState_("saving");
+    try {
+      await upsertRow("buyers", buyerForm);
+      const exists = buyers.some((b) => b.id === buyerForm.id);
+      setBuyers(exists ? buyers.map((b) => (b.id === buyerForm.id ? buyerForm : b)) : [buyerForm, ...buyers]);
+      setSaveState_("saved"); setTimeout(() => setSaveState_("idle"), 1500);
+    } catch (e) { setSaveState_("error"); notify("Couldn't save that buyer."); }
     setBuyerForm(null);
   };
 
-  const addPhotos = async (dealId, files) => {
+  const addPhotos = async (files) => {
     const urls = [];
     for (const f of files) {
       try { urls.push(await resizeImage(f)); } catch (e) { notify("Couldn't read that image."); }
     }
     if (!urls.length) return;
-    const next = { ...photos, [dealId]: [...(photos[dealId] || []), ...urls] };
-    setPhotos(next);
-    const ok = await persistPhotos(next);
-    if (!ok) setPhotos(photos);
+    const nextDeal = { ...dealForm, photos: [...(dealForm.photos || []), ...urls] };
+    setDealForm(nextDeal);
+    try {
+      await upsertRow("deals", nextDeal);
+      setDeals(deals.map((d) => (d.id === nextDeal.id ? nextDeal : d)));
+    } catch (e) { notify("Couldn't save that photo. Try again."); }
   };
-  const removePhoto = (dealId, idx) => {
-    const next = { ...photos, [dealId]: (photos[dealId] || []).filter((_, i) => i !== idx) };
-    setPhotos(next); persistPhotos(next);
+  const removePhoto = async (idx) => {
+    const nextDeal = { ...dealForm, photos: (dealForm.photos || []).filter((_, i) => i !== idx) };
+    setDealForm(nextDeal);
+    try {
+      await upsertRow("deals", nextDeal);
+      setDeals(deals.map((d) => (d.id === nextDeal.id ? nextDeal : d)));
+    } catch (e) { notify("Couldn't remove that photo."); }
   };
 
   const handleCsv = (file) => {
     Papa.parse(file, {
       header: true, skipEmptyLines: true,
-      complete: (res) => {
+      complete: async (res) => {
         const pick = (row, keys) => {
           const k = Object.keys(row).find((h) => keys.some((x) => h.toLowerCase().includes(x)));
           return k ? String(row[k]).trim() : "";
@@ -257,8 +267,13 @@ function DealDesk() {
           notes: pick(row, ["note", "description", "comment", "background"]),
         })).filter((b) => b.name || b.phone || b.email);
         if (!imported.length) { setImportMsg("No rows found — check the file has a header row with Name / Phone / Email columns."); return; }
-        commitBuyers([...imported, ...buyers]);
+        setBuyers([...imported, ...buyers]);
         setImportMsg(`Imported ${imported.length} contact${imported.length > 1 ? "s" : ""}. Open each to tag boroughs and criteria.`);
+        try {
+          await supabase.from("buyers").upsert(
+            imported.map((b) => ({ id: b.id, data: b, updated_at: new Date().toISOString() }))
+          );
+        } catch (e) { notify("Contacts imported locally but failed to save — try reloading."); }
       },
       error: () => setImportMsg("Couldn't read that file. Export your CRM as CSV and try again."),
     });
@@ -340,7 +355,7 @@ function DealDesk() {
                 const matches = matchBuyers(d, buyers);
                 const ask = parseFloat(d.askingPrice);
                 const ppbsf = z && z.baseZfa > 0 && ask ? ask / (z.uapZfa || z.baseZfa) : null;
-                const cover = photos[d.id]?.[0];
+                const cover = d.photos?.[0];
                 return (
                   <div key={d.id} className="card" onClick={() => setDealForm({ ...d })}>
                     {cover && <img className="cardPhoto" src={cover} alt="" />}
@@ -372,9 +387,9 @@ function DealDesk() {
         {tab === "deals" && dealForm && (
           <DealForm
             deal={dealForm} setDeal={setDealForm} buyers={buyers}
-            photos={photos[dealForm.id] || []}
-            onAddPhotos={(files) => addPhotos(dealForm.id, files)}
-            onRemovePhoto={(i) => removePhoto(dealForm.id, i)}
+            photos={dealForm.photos || []}
+            onAddPhotos={addPhotos}
+            onRemovePhoto={removePhoto}
             onShare={() => setShareFor(dealForm)}
             onSave={saveDeal}
             onCancel={() => setDealForm(null)}
@@ -436,7 +451,11 @@ function DealDesk() {
             buyer={buyerForm} setBuyer={setBuyerForm}
             onSave={saveBuyer}
             onCancel={() => setBuyerForm(null)}
-            onDelete={() => { commitBuyers(buyers.filter((b) => b.id !== buyerForm.id)); setBuyerForm(null); }}
+            onDelete={async () => {
+              try { await deleteRow("buyers", buyerForm.id); } catch (e) { notify("Couldn't delete that buyer."); }
+              setBuyers(buyers.filter((b) => b.id !== buyerForm.id));
+              setBuyerForm(null);
+            }}
             isNew={!buyers.some((b) => b.id === buyerForm.id)}
           />
         )}
@@ -447,7 +466,7 @@ function DealDesk() {
       {shareFor && (
         <ShareSheet
           deal={shareFor}
-          photos={photos[shareFor.id] || []}
+          photos={shareFor.photos || []}
           onClose={() => setShareFor(null)}
           notify={notify}
         />
