@@ -1,0 +1,885 @@
+import React, { useState, useEffect, useMemo, useRef } from "react";
+import Papa from "papaparse";
+
+/* ============================================================
+   J REALTY GROUP — DEAL DESK (in-chat version)
+   Saves to your Claude account. Photos + client share included.
+   ============================================================ */
+
+const STORE_KEY = "jrg:platform";
+const PHOTO_KEY = "jrg:photos";
+
+const ZONING = {
+  "R5":   { base: 1.25, uap: null },
+  "R5B":  { base: 1.35, uap: null },
+  "R5D":  { base: 2.0,  uap: null },
+  "R6":   { narrow: 2.2, wide: 3.0, uap: 3.9 },
+  "R6A":  { base: 3.0,  uap: 3.9 },
+  "R6B":  { base: 2.0,  uap: 2.2 },
+  "R7-1": { narrow: 3.44, wide: 4.0, uap: 5.01 },
+  "R7-2": { narrow: 3.44, wide: 4.0, uap: 5.01 },
+  "R7A":  { base: 4.0,  uap: 5.01 },
+  "R7B":  { base: 3.0,  uap: null },
+  "R7D":  { base: 4.66, uap: 5.6 },
+  "R7X":  { base: 5.0,  uap: 6.0 },
+  "R8":   { base: 6.02, uap: 7.2 },
+  "R8A":  { base: 6.02, uap: 7.2 },
+  "R8B":  { base: 4.0,  uap: null },
+  "R8X":  { base: 6.02, uap: 7.2 },
+  "R9":   { base: 7.52, uap: 9.0 },
+  "R9A":  { base: 7.52, uap: 9.0 },
+  "R9X":  { base: 9.0,  uap: 10.0 },
+  "R10":  { base: 10.0, uap: 12.0 },
+  "R10A": { base: 10.0, uap: 12.0 },
+  "R10X": { base: 10.0, uap: 12.0 },
+  "C4-4  (R7 equiv)":  { narrow: 3.44, wide: 4.0, uap: 5.01 },
+  "C4-4A (R7A equiv)": { base: 4.0,  uap: 5.01 },
+  "C4-5X (R7X equiv)": { base: 5.0,  uap: 6.0 },
+  "C6-2  (R8 equiv)":  { base: 6.02, uap: 7.2 },
+  "C6-3  (R9 equiv)":  { base: 7.52, uap: 9.0 },
+  "C6-4  (R10 equiv)": { base: 10.0, uap: 12.0 },
+  "M1-2/R6 (MX)":      { base: 3.0,  uap: 3.9 },
+  "M1-4/R7A (MX)":     { base: 4.0,  uap: 5.01 },
+  "Custom": { base: null, uap: null },
+};
+
+const BOROUGHS = ["Bronx", "Brooklyn", "Queens", "Manhattan", "Staten Island"];
+const ASSET_TYPES = ["Development site", "Multifamily", "Mixed-use", "Conversion", "Other"];
+const VACANCY = ["Delivered vacant", "Partially occupied", "Fully occupied", "TBD"];
+
+function computeZoning(zone, streetWidth, lotArea, customFar, useUap) {
+  const z = ZONING[zone];
+  if (!z) return null;
+  let baseFar =
+    zone === "Custom"
+      ? parseFloat(customFar) || 0
+      : z.narrow != null
+      ? (streetWidth === "wide" ? z.wide : z.narrow)
+      : z.base;
+  const uapFar = zone === "Custom" ? (baseFar ? baseFar * 1.2 : 0) : z.uap;
+  const area = parseFloat(lotArea) || 0;
+  return {
+    baseFar, uapFar,
+    baseZfa: baseFar * area,
+    uapZfa: uapFar ? uapFar * area : null,
+    effZfa: (useUap && uapFar ? uapFar : baseFar) * area,
+  };
+}
+
+const fmt = (n, d = 0) =>
+  n == null || isNaN(n) ? "—" : Number(n).toLocaleString("en-US", { maximumFractionDigits: d });
+const money = (n) => (n == null || n === "" || isNaN(n) ? "—" : "$" + fmt(Number(n)));
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+
+function matchBuyers(deal, buyers) {
+  const zres = computeZoning(deal.zone, deal.streetWidth, deal.lotArea, deal.customFar, true);
+  const bsf = zres ? Math.max(zres.baseZfa, zres.uapZfa || 0) : 0;
+  const price = parseFloat(deal.askingPrice) || null;
+  return buyers.filter((b) => {
+    if (b.boroughs?.length && !b.boroughs.includes(deal.borough)) return false;
+    if (b.maxBudget && price && price > Number(b.maxBudget) * 1.1) return false;
+    if (b.minSize && bsf && bsf < Number(b.minSize)) return false;
+    return true;
+  });
+}
+
+/* ---------- client-facing share text (no seller number, no contact, no notes) ---------- */
+function buildShareText(deal) {
+  const z = computeZoning(deal.zone, deal.streetWidth, deal.lotArea, deal.customFar, false);
+  const ask = parseFloat(deal.askingPrice);
+  const lines = [];
+  lines.push(`🏢 ${deal.address}${deal.neighborhood ? " · " + deal.neighborhood : ""} — ${deal.borough}`);
+  const zBits = [`Zoning ${deal.zone}`];
+  if (deal.lotArea) zBits.push(`${fmt(deal.lotArea)} SF lot`);
+  lines.push(zBits.join(" · "));
+  if (z && z.baseZfa > 0)
+    lines.push(`Buildable: ~${fmt(z.baseZfa)} SF as-of-right${z.uapZfa ? ` / ~${fmt(z.uapZfa)} SF with UAP` : ""}`);
+  if (deal.existingSf) lines.push(`Existing building: ${fmt(deal.existingSf)} SF`);
+  if (ask > 0) {
+    const per = z && z.baseZfa > 0 ? ` (~$${fmt(ask / (z.uapZfa || z.baseZfa))}/BSF)` : "";
+    lines.push(`Asking: ${money(ask)}${per}`);
+  }
+  if (deal.vacancy && deal.vacancy !== "TBD") lines.push(deal.vacancy);
+  lines.push("");
+  lines.push("J Realty Group");
+  return lines.join("\n");
+}
+
+/* ---------- shrink photos so they fit in saved storage ---------- */
+function resizeImage(file, maxDim = 900, quality = 0.6) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.round(img.width * scale);
+        canvas.height = Math.round(img.height * scale);
+        canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.onerror = reject;
+      img.src = reader.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+const blankDeal = () => ({
+  id: uid(), address: "", borough: "Bronx", neighborhood: "", zone: "R6",
+  streetWidth: "narrow", lotArea: "", customFar: "", askingPrice: "", sellerNumber: "",
+  vacancy: "TBD", existingSf: "", contactName: "", contactPhone: "", notes: "",
+  created: new Date().toISOString().slice(0, 10),
+});
+const blankBuyer = () => ({
+  id: uid(), name: "", company: "", phone: "", email: "",
+  boroughs: [], minSize: "", maxBudget: "", assetTypes: [], notes: "",
+});
+
+/* ============================================================ */
+export default function DealDesk() {
+  const [tab, setTab] = useState("deals");
+  const [deals, setDeals] = useState([]);
+  const [buyers, setBuyers] = useState([]);
+  const [photos, setPhotos] = useState({});   // dealId -> [dataUrl]
+  const [loaded, setLoaded] = useState(false);
+  const [saveState, setSaveState] = useState("idle");
+
+  const [dealForm, setDealForm] = useState(null);
+  const [buyerForm, setBuyerForm] = useState(null);
+  const [shareFor, setShareFor] = useState(null);
+  const [q, setQ] = useState("");
+  const [boroFilter, setBoroFilter] = useState("All");
+  const [bq, setBq] = useState("");
+  const [bBoroFilter, setBBoroFilter] = useState("All");
+  const [importMsg, setImportMsg] = useState("");
+  const [toast, setToast] = useState("");
+  const fileRef = useRef(null);
+  const notify = (m) => { setToast(m); setTimeout(() => setToast(""), 3500); };
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await window.storage.get(STORE_KEY);
+        if (r?.value) { const d = JSON.parse(r.value); setDeals(d.deals || []); setBuyers(d.buyers || []); }
+      } catch (e) {}
+      try {
+        const p = await window.storage.get(PHOTO_KEY);
+        if (p?.value) setPhotos(JSON.parse(p.value));
+      } catch (e) {}
+      setLoaded(true);
+    })();
+  }, []);
+
+  const persist = async (nextDeals, nextBuyers) => {
+    setSaveState("saving");
+    try {
+      await window.storage.set(STORE_KEY, JSON.stringify({ deals: nextDeals, buyers: nextBuyers }));
+      setSaveState("saved"); setTimeout(() => setSaveState("idle"), 1500);
+    } catch (e) { setSaveState("error"); }
+  };
+  const persistPhotos = async (next) => {
+    try { await window.storage.set(PHOTO_KEY, JSON.stringify(next)); return true; }
+    catch (e) { notify("Photo storage is full. Delete a few photos to add more."); return false; }
+  };
+  const commitDeals = (next) => { setDeals(next); persist(next, buyers); };
+  const commitBuyers = (next) => { setBuyers(next); persist(deals, next); };
+
+  const saveDeal = () => {
+    if (!dealForm.address.trim()) return;
+    const exists = deals.some((d) => d.id === dealForm.id);
+    commitDeals(exists ? deals.map((d) => (d.id === dealForm.id ? dealForm : d)) : [dealForm, ...deals]);
+    setDealForm(null);
+  };
+  const deleteDeal = (id) => {
+    commitDeals(deals.filter((d) => d.id !== id));
+    const np = { ...photos }; delete np[id]; setPhotos(np); persistPhotos(np);
+    setDealForm(null);
+  };
+  const saveBuyer = () => {
+    if (!buyerForm.name.trim()) return;
+    const exists = buyers.some((b) => b.id === buyerForm.id);
+    commitBuyers(exists ? buyers.map((b) => (b.id === buyerForm.id ? buyerForm : b)) : [buyerForm, ...buyers]);
+    setBuyerForm(null);
+  };
+
+  const addPhotos = async (dealId, files) => {
+    const urls = [];
+    for (const f of files) {
+      try { urls.push(await resizeImage(f)); } catch (e) { notify("Couldn't read that image."); }
+    }
+    if (!urls.length) return;
+    const next = { ...photos, [dealId]: [...(photos[dealId] || []), ...urls] };
+    setPhotos(next);
+    const ok = await persistPhotos(next);
+    if (!ok) setPhotos(photos);
+  };
+  const removePhoto = (dealId, idx) => {
+    const next = { ...photos, [dealId]: (photos[dealId] || []).filter((_, i) => i !== idx) };
+    setPhotos(next); persistPhotos(next);
+  };
+
+  const handleCsv = (file) => {
+    Papa.parse(file, {
+      header: true, skipEmptyLines: true,
+      complete: (res) => {
+        const pick = (row, keys) => {
+          const k = Object.keys(row).find((h) => keys.some((x) => h.toLowerCase().includes(x)));
+          return k ? String(row[k]).trim() : "";
+        };
+        const imported = res.data.map((row) => ({
+          ...blankBuyer(),
+          name: pick(row, ["name", "contact", "lead"]),
+          company: pick(row, ["company", "organization", "firm"]),
+          phone: pick(row, ["phone", "mobile", "cell", "tel"]),
+          email: pick(row, ["email", "mail"]),
+          notes: pick(row, ["note", "description", "comment", "background"]),
+        })).filter((b) => b.name || b.phone || b.email);
+        if (!imported.length) { setImportMsg("No rows found — check the file has a header row with Name / Phone / Email columns."); return; }
+        commitBuyers([...imported, ...buyers]);
+        setImportMsg(`Imported ${imported.length} contact${imported.length > 1 ? "s" : ""}. Open each to tag boroughs and criteria.`);
+      },
+      error: () => setImportMsg("Couldn't read that file. Export your CRM as CSV and try again."),
+    });
+  };
+
+  const filteredDeals = useMemo(() => {
+    const t = q.toLowerCase();
+    return deals.filter((d) =>
+      (boroFilter === "All" || d.borough === boroFilter) &&
+      (!t || [d.address, d.neighborhood, d.zone, d.notes, d.contactName].join(" ").toLowerCase().includes(t))
+    );
+  }, [deals, q, boroFilter]);
+
+  const filteredBuyers = useMemo(() => {
+    const t = bq.toLowerCase();
+    return buyers.filter((b) =>
+      (bBoroFilter === "All" || b.boroughs?.includes(bBoroFilter)) &&
+      (!t || [b.name, b.company, b.notes, b.email, b.phone].join(" ").toLowerCase().includes(t))
+    );
+  }, [buyers, bq, bBoroFilter]);
+
+  if (!loaded) return <div style={S.loading}>Loading your desk…</div>;
+
+  return (
+    <div className="appShell" style={S.app}>
+      <style>{CSS}</style>
+
+      <aside className="sideBar" style={S.side}>
+        <div className="brandWrap" style={S.brand}>
+          <div style={S.brandMark}>J</div>
+          <div>
+            <div style={S.brandName}>J REALTY GROUP</div>
+            <div style={S.brandSub}>Deal Desk</div>
+          </div>
+        </div>
+        <nav style={S.nav}>
+          {[["deals", "Deals", deals.length], ["buyers", "Buyers", buyers.length], ["zoning", "Zoning calc", null]].map(([id, label, count]) => (
+            <button key={id} className="navBtn" data-active={tab === id} onClick={() => { setTab(id); setDealForm(null); setBuyerForm(null); }}>
+              <span>{label}</span>
+              {count != null && <span style={S.navCount}>{count}</span>}
+            </button>
+          ))}
+        </nav>
+        <div className="saveNote" style={S.saveTag}>
+          {saveState === "saving" ? "Saving…" : saveState === "saved" ? "✓ Saved" : saveState === "error" ? "Save failed — retry an edit" : "Auto-saves every change"}
+        </div>
+      </aside>
+
+      <main style={S.main}>
+        {toast && <div className="toast">{toast}</div>}
+
+        {tab === "deals" && !dealForm && (
+          <>
+            <header style={S.head}>
+              <h1 style={S.h1}>Deals</h1>
+              <button className="primary" onClick={() => setDealForm(blankDeal())}>+ New deal</button>
+            </header>
+            <div style={S.filterRow}>
+              <input className="search" placeholder="Search address, zoning, contact, notes…" value={q} onChange={(e) => setQ(e.target.value)} />
+              <div style={S.chips}>
+                {["All", ...BOROUGHS].map((b) => (
+                  <button key={b} className="chip" data-active={boroFilter === b} onClick={() => setBoroFilter(b)}>{b}</button>
+                ))}
+              </div>
+            </div>
+
+            {filteredDeals.length === 0 && (
+              <div style={S.empty}>
+                {deals.length === 0
+                  ? "No deals yet. Someone calls with a property — hit “New deal” and lock it in while you're still on the phone."
+                  : "Nothing matches that search."}
+              </div>
+            )}
+
+            <div style={S.cardGrid}>
+              {filteredDeals.map((d) => {
+                const z = computeZoning(d.zone, d.streetWidth, d.lotArea, d.customFar, false);
+                const matches = matchBuyers(d, buyers);
+                const ask = parseFloat(d.askingPrice);
+                const ppbsf = z && z.baseZfa > 0 && ask ? ask / (z.uapZfa || z.baseZfa) : null;
+                const cover = photos[d.id]?.[0];
+                return (
+                  <div key={d.id} className="card" onClick={() => setDealForm({ ...d })}>
+                    {cover && <img className="cardPhoto" src={cover} alt="" />}
+                    <div style={S.cardTop}>
+                      <span className="tag">{d.borough}</span>
+                      <span className="tag alt">{d.zone}</span>
+                      {d.vacancy === "Delivered vacant" && <span className="tag green">Vacant</span>}
+                      <button className="shareBtn" onClick={(e) => { e.stopPropagation(); setShareFor(d); }}>Share ↗</button>
+                    </div>
+                    <div style={S.cardAddr}>{d.address || "Untitled"}</div>
+                    {d.neighborhood && <div style={S.cardSub}>{d.neighborhood}</div>}
+                    <div style={S.cardStats}>
+                      <div><label>Ask</label><b>{money(d.askingPrice)}</b></div>
+                      <div><label>Lot</label><b>{fmt(d.lotArea)} SF</b></div>
+                      <div><label>Buildable</label><b>{z ? fmt(z.uapZfa || z.baseZfa) : "—"} SF</b></div>
+                      <div><label>$/BSF</label><b>{ppbsf ? "$" + fmt(ppbsf) : "—"}</b></div>
+                    </div>
+                    <div style={S.cardFoot}>
+                      <span>{matches.length} matching buyer{matches.length !== 1 ? "s" : ""}</span>
+                      <span style={{ opacity: 0.5 }}>{d.created}</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+
+        {tab === "deals" && dealForm && (
+          <DealForm
+            deal={dealForm} setDeal={setDealForm} buyers={buyers}
+            photos={photos[dealForm.id] || []}
+            onAddPhotos={(files) => addPhotos(dealForm.id, files)}
+            onRemovePhoto={(i) => removePhoto(dealForm.id, i)}
+            onShare={() => setShareFor(dealForm)}
+            onSave={saveDeal}
+            onCancel={() => setDealForm(null)}
+            onDelete={() => deleteDeal(dealForm.id)}
+            isNew={!deals.some((d) => d.id === dealForm.id)}
+          />
+        )}
+
+        {tab === "buyers" && !buyerForm && (
+          <>
+            <header style={S.head}>
+              <h1 style={S.h1}>Buyers</h1>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button className="ghost" onClick={() => fileRef.current?.click()}>Import CSV</button>
+                <input ref={fileRef} type="file" accept=".csv,text/csv" style={{ display: "none" }}
+                  onChange={(e) => { if (e.target.files?.[0]) handleCsv(e.target.files[0]); e.target.value = ""; }} />
+                <button className="primary" onClick={() => setBuyerForm(blankBuyer())}>+ New buyer</button>
+              </div>
+            </header>
+            {importMsg && <div style={S.notice}>{importMsg}</div>}
+            <div style={S.filterRow}>
+              <input className="search" placeholder="Search name, company, notes…" value={bq} onChange={(e) => setBq(e.target.value)} />
+              <div style={S.chips}>
+                {["All", ...BOROUGHS].map((b) => (
+                  <button key={b} className="chip" data-active={bBoroFilter === b} onClick={() => setBBoroFilter(b)}>{b}</button>
+                ))}
+              </div>
+            </div>
+            {filteredBuyers.length === 0 && (
+              <div style={S.empty}>
+                {buyers.length === 0
+                  ? "No buyers yet. Add them one by one, or import your old CRM export as a CSV."
+                  : "No buyers match. Tip: imported contacts need boroughs tagged before borough filters find them."}
+              </div>
+            )}
+            <div style={S.buyerList}>
+              {filteredBuyers.map((b) => (
+                <div key={b.id} className="row" onClick={() => setBuyerForm({ ...b })}>
+                  <div style={{ flex: 2, minWidth: 140 }}>
+                    <b>{b.name}</b>
+                    {b.company && <div style={S.rowSub}>{b.company}</div>}
+                  </div>
+                  <div style={{ flex: 2, minWidth: 120 }}>
+                    {(b.boroughs || []).map((x) => <span key={x} className="tag" style={{ marginRight: 4 }}>{x}</span>)}
+                    {!b.boroughs?.length && <span style={{ opacity: 0.4 }}>no boroughs tagged</span>}
+                  </div>
+                  <div style={{ flex: 1, minWidth: 90 }}>{b.minSize ? `${fmt(b.minSize)}+ SF` : ""}</div>
+                  <div style={{ flex: 1, minWidth: 90 }}>{b.maxBudget ? `≤ ${money(b.maxBudget)}` : ""}</div>
+                  <div style={{ flex: 1, minWidth: 100, opacity: 0.7 }}>{b.phone}</div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+
+        {tab === "buyers" && buyerForm && (
+          <BuyerForm
+            buyer={buyerForm} setBuyer={setBuyerForm}
+            onSave={saveBuyer}
+            onCancel={() => setBuyerForm(null)}
+            onDelete={() => { commitBuyers(buyers.filter((b) => b.id !== buyerForm.id)); setBuyerForm(null); }}
+            isNew={!buyers.some((b) => b.id === buyerForm.id)}
+          />
+        )}
+
+        {tab === "zoning" && <ZoningCalc />}
+      </main>
+
+      {shareFor && (
+        <ShareSheet
+          deal={shareFor}
+          photos={photos[shareFor.id] || []}
+          onClose={() => setShareFor(null)}
+          notify={notify}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ============================================================
+   SHARE SHEET
+   ============================================================ */
+function ShareSheet({ deal, photos, onClose, notify }) {
+  const text = buildShareText(deal);
+  const taRef = useRef(null);
+  const [copied, setCopied] = useState(false);
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true); setTimeout(() => setCopied(false), 2000);
+    } catch (e) {
+      taRef.current?.select();
+      notify("Press ⌘C / long-press Copy to grab the text.");
+    }
+  };
+
+  const nativeShare = async () => {
+    if (!navigator.share) { copy(); return; }
+    try {
+      if (photos[0] && navigator.canShare) {
+        try {
+          const blob = await (await fetch(photos[0])).blob();
+          const file = new File([blob], "property.jpg", { type: "image/jpeg" });
+          if (navigator.canShare({ files: [file] })) { await navigator.share({ text, files: [file] }); return; }
+        } catch (e) {}
+      }
+      await navigator.share({ text });
+    } catch (e) {
+      if (e.name !== "AbortError") copy();
+    }
+  };
+
+  const savePhoto = () => {
+    if (!photos[0]) return;
+    const a = document.createElement("a");
+    a.href = photos[0];
+    a.download = (deal.address || "property").replace(/[^\w]+/g, "-") + ".jpg";
+    a.click();
+  };
+
+  return (
+    <div className="modalWrap" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modalHead">
+          <span>Share with client</span>
+          <button className="modalX" onClick={onClose}>×</button>
+        </div>
+        {photos[0] && <img className="sharePhoto" src={photos[0]} alt="" />}
+        <textarea ref={taRef} className="shareText" readOnly value={text} rows={9} onFocus={(e) => e.target.select()} />
+        <div className="shareNote">Client-safe: seller's number, contact, and your notes are not included.</div>
+        <div className="shareBtns">
+          <button className="primary" onClick={nativeShare}>Share ↗</button>
+          <button className="ghost" onClick={copy}>{copied ? "✓ Copied" : "Copy text"}</button>
+          {photos[0] && <button className="ghost" onClick={savePhoto}>Save photo</button>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================ */
+function ZoningPanel({ zone, streetWidth, lotArea, customFar, askingPrice }) {
+  const z = computeZoning(zone, streetWidth, lotArea, customFar, false);
+  if (!z) return null;
+  const ask = parseFloat(askingPrice);
+  const hasNw = ZONING[zone]?.narrow != null;
+  return (
+    <div className="zpanel">
+      <div className="zpanelTitle">Zoning analysis · {zone}{hasNw ? ` · ${streetWidth} street` : ""}</div>
+      <div className="zgrid">
+        <div className="zcell"><label>Base FAR</label><div className="znum">{z.baseFar ? z.baseFar.toFixed(2) : "—"}</div></div>
+        <div className="zcell"><label>UAP FAR</label><div className="znum">{z.uapFar ? z.uapFar.toFixed(2) : "n/a"}</div></div>
+        <div className="zcell big"><label>Buildable — as of right</label><div className="znum brass">{fmt(z.baseZfa)} <small>SF</small></div></div>
+        <div className="zcell big"><label>Buildable — with UAP</label><div className="znum brass">{z.uapZfa ? fmt(z.uapZfa) : "n/a"} {z.uapZfa && <small>SF</small>}</div></div>
+        {ask > 0 && z.baseZfa > 0 && (
+          <>
+            <div className="zcell"><label>$/BSF as-of-right</label><div className="znum">${fmt(ask / z.baseZfa)}</div></div>
+            <div className="zcell"><label>$/BSF with UAP</label><div className="znum">{z.uapZfa ? "$" + fmt(ask / z.uapZfa) : "n/a"}</div></div>
+          </>
+        )}
+      </div>
+      <div className="zfoot">Reference values — confirm district & FAR on ZoLa before you quote it.</div>
+    </div>
+  );
+}
+
+/* ============================================================ */
+function DealForm({ deal, setDeal, buyers, photos, onAddPhotos, onRemovePhoto, onShare, onSave, onCancel, onDelete, isNew }) {
+  const set = (k) => (e) => setDeal({ ...deal, [k]: e.target.value });
+  const [armDelete, setArmDelete] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const photoRef = useRef(null);
+  const matches = matchBuyers(deal, buyers);
+  const hasNw = ZONING[deal.zone]?.narrow != null;
+
+  return (
+    <>
+      <header style={S.head}>
+        <h1 style={S.h1}>{isNew ? "New deal" : deal.address || "Edit deal"}</h1>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {!isNew && (
+            <button className="danger" onClick={() => (armDelete ? onDelete() : setArmDelete(true))}>
+              {armDelete ? "Tap again to delete" : "Delete"}
+            </button>
+          )}
+          {!isNew && <button className="ghost" onClick={onShare}>Share ↗</button>}
+          <button className="ghost" onClick={onCancel}>Cancel</button>
+          <button className="primary" onClick={onSave} disabled={!deal.address.trim()}>Save deal</button>
+        </div>
+      </header>
+
+      <div style={S.formCols}>
+        <div style={S.formMain}>
+          <div className="fgroup">
+            <div className="ftitle">Property</div>
+            <div className="frow">
+              <Field label="Address *" wide><input value={deal.address} onChange={set("address")} placeholder="1982 Belmont Ave" /></Field>
+            </div>
+            <div className="frow">
+              <Field label="Borough">
+                <select value={deal.borough} onChange={set("borough")}>{BOROUGHS.map((b) => <option key={b}>{b}</option>)}</select>
+              </Field>
+              <Field label="Neighborhood"><input value={deal.neighborhood} onChange={set("neighborhood")} placeholder="Belmont / Fordham" /></Field>
+            </div>
+          </div>
+
+          <div className="fgroup">
+            <div className="ftitle">Photos</div>
+            {isNew && <div style={{ fontSize: 13, opacity: 0.6, marginBottom: 8 }}>Save the deal first, then add photos.</div>}
+            <div className="photoGrid">
+              {photos.map((url, i) => (
+                <div key={i} className="photoThumb">
+                  <img src={url} alt="" />
+                  <button className="photoX" onClick={() => onRemovePhoto(i)}>×</button>
+                  {i === 0 && <span className="coverTag">Cover</span>}
+                </div>
+              ))}
+              {!isNew && (
+                <button className="photoAdd" onClick={() => photoRef.current?.click()} disabled={busy}>
+                  {busy ? "Adding…" : "+ Add photo"}
+                </button>
+              )}
+              <input ref={photoRef} type="file" accept="image/*" multiple style={{ display: "none" }}
+                onChange={async (e) => {
+                  const files = [...(e.target.files || [])]; e.target.value = "";
+                  if (!files.length) return;
+                  setBusy(true); await onAddPhotos(files); setBusy(false);
+                }} />
+            </div>
+            {!isNew && <div style={{ fontSize: 12, opacity: 0.55, marginTop: 8 }}>First photo is the cover and goes out when you share. Snap the building or screenshot Google Maps.</div>}
+          </div>
+
+          <div className="fgroup">
+            <div className="ftitle">Zoning & size</div>
+            <div className="frow">
+              <Field label="Zoning district">
+                <select value={deal.zone} onChange={set("zone")}>{Object.keys(ZONING).map((z) => <option key={z}>{z}</option>)}</select>
+              </Field>
+              {hasNw && (
+                <Field label="Street">
+                  <select value={deal.streetWidth} onChange={set("streetWidth")}>
+                    <option value="narrow">Narrow (&lt;75 ft)</option>
+                    <option value="wide">Wide (≥75 ft)</option>
+                  </select>
+                </Field>
+              )}
+              {deal.zone === "Custom" && (
+                <Field label="Custom FAR"><input type="number" value={deal.customFar} onChange={set("customFar")} placeholder="3.0" /></Field>
+              )}
+              <Field label="Lot area (SF)"><input type="number" value={deal.lotArea} onChange={set("lotArea")} placeholder="5,000" /></Field>
+              <Field label="Existing bldg SF"><input type="number" value={deal.existingSf} onChange={set("existingSf")} placeholder="optional" /></Field>
+            </div>
+          </div>
+
+          <div className="fgroup">
+            <div className="ftitle">Pricing & status</div>
+            <div className="frow">
+              <Field label="Asking price ($)"><input type="number" value={deal.askingPrice} onChange={set("askingPrice")} placeholder="4,500,000" /></Field>
+              <Field label="Seller's number ($)"><input type="number" value={deal.sellerNumber} onChange={set("sellerNumber")} placeholder="what he really wants" /></Field>
+              <Field label="Delivery">
+                <select value={deal.vacancy} onChange={set("vacancy")}>{VACANCY.map((v) => <option key={v}>{v}</option>)}</select>
+              </Field>
+            </div>
+          </div>
+
+          <div className="fgroup">
+            <div className="ftitle">Seller contact</div>
+            <div className="frow">
+              <Field label="Name"><input value={deal.contactName} onChange={set("contactName")} /></Field>
+              <Field label="Phone"><input value={deal.contactPhone} onChange={set("contactPhone")} /></Field>
+            </div>
+            <Field label="Notes" wide>
+              <textarea rows={3} value={deal.notes} onChange={set("notes")} placeholder="Off-market, wants quiet process, open to seller financing…" />
+            </Field>
+          </div>
+        </div>
+
+        <div style={S.formSide}>
+          <ZoningPanel zone={deal.zone} streetWidth={deal.streetWidth} lotArea={deal.lotArea} customFar={deal.customFar} askingPrice={deal.askingPrice} />
+          <div className="zpanel" style={{ marginTop: 14 }}>
+            <div className="zpanelTitle">Matching buyers ({matches.length})</div>
+            {matches.length === 0 && <div style={{ padding: "10px 2px", fontSize: 13, opacity: 0.6 }}>No buyers match this borough / size / budget yet.</div>}
+            {matches.slice(0, 8).map((b) => (
+              <div key={b.id} className="matchRow"><b>{b.name}</b><span>{b.phone || b.email || ""}</span></div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+/* ============================================================ */
+function BuyerForm({ buyer, setBuyer, onSave, onCancel, onDelete, isNew }) {
+  const set = (k) => (e) => setBuyer({ ...buyer, [k]: e.target.value });
+  const [armDelete, setArmDelete] = useState(false);
+  const toggle = (k, v) => () => {
+    const arr = buyer[k] || [];
+    setBuyer({ ...buyer, [k]: arr.includes(v) ? arr.filter((x) => x !== v) : [...arr, v] });
+  };
+  return (
+    <>
+      <header style={S.head}>
+        <h1 style={S.h1}>{isNew ? "New buyer" : buyer.name || "Edit buyer"}</h1>
+        <div style={{ display: "flex", gap: 8 }}>
+          {!isNew && (
+            <button className="danger" onClick={() => (armDelete ? onDelete() : setArmDelete(true))}>
+              {armDelete ? "Tap again to delete" : "Delete"}
+            </button>
+          )}
+          <button className="ghost" onClick={onCancel}>Cancel</button>
+          <button className="primary" onClick={onSave} disabled={!buyer.name.trim()}>Save buyer</button>
+        </div>
+      </header>
+
+      <div style={{ maxWidth: 720 }}>
+        <div className="fgroup">
+          <div className="ftitle">Contact</div>
+          <div className="frow">
+            <Field label="Name *"><input value={buyer.name} onChange={set("name")} /></Field>
+            <Field label="Company"><input value={buyer.company} onChange={set("company")} /></Field>
+          </div>
+          <div className="frow">
+            <Field label="Phone"><input value={buyer.phone} onChange={set("phone")} /></Field>
+            <Field label="Email"><input value={buyer.email} onChange={set("email")} /></Field>
+          </div>
+        </div>
+
+        <div className="fgroup">
+          <div className="ftitle">Buy box</div>
+          <Field label="Boroughs" wide>
+            <div style={S.chips}>
+              {BOROUGHS.map((b) => (
+                <button key={b} className="chip" data-active={buyer.boroughs?.includes(b)} onClick={toggle("boroughs", b)}>{b}</button>
+              ))}
+            </div>
+          </Field>
+          <Field label="Asset types" wide>
+            <div style={S.chips}>
+              {ASSET_TYPES.map((a) => (
+                <button key={a} className="chip" data-active={buyer.assetTypes?.includes(a)} onClick={toggle("assetTypes", a)}>{a}</button>
+              ))}
+            </div>
+          </Field>
+          <div className="frow">
+            <Field label="Min size (BSF)"><input type="number" value={buyer.minSize} onChange={set("minSize")} placeholder="5,000" /></Field>
+            <Field label="Max budget ($)"><input type="number" value={buyer.maxBudget} onChange={set("maxBudget")} placeholder="10,000,000" /></Field>
+          </div>
+          <Field label="Notes" wide>
+            <textarea rows={3} value={buyer.notes} onChange={set("notes")} placeholder="All-cash, closes fast, only prime Brooklyn, hates re-trades…" />
+          </Field>
+        </div>
+      </div>
+    </>
+  );
+}
+
+/* ============================================================ */
+function ZoningCalc() {
+  const [zone, setZone] = useState("R6");
+  const [sw, setSw] = useState("narrow");
+  const [lot, setLot] = useState("");
+  const [far, setFar] = useState("");
+  const [ask, setAsk] = useState("");
+  const hasNw = ZONING[zone]?.narrow != null;
+  return (
+    <>
+      <header style={S.head}><h1 style={S.h1}>Zoning calculator</h1></header>
+      <p style={{ margin: "0 0 18px", opacity: 0.7, fontSize: 14, maxWidth: 560 }}>
+        Quick check while you're on the phone: district + lot size in, buildable SF and $/BSF out.
+      </p>
+      <div style={S.formCols}>
+        <div style={{ ...S.formMain, maxWidth: 460 }}>
+          <div className="fgroup">
+            <div className="frow">
+              <Field label="Zoning district">
+                <select value={zone} onChange={(e) => setZone(e.target.value)}>{Object.keys(ZONING).map((z) => <option key={z}>{z}</option>)}</select>
+              </Field>
+              {hasNw && (
+                <Field label="Street">
+                  <select value={sw} onChange={(e) => setSw(e.target.value)}>
+                    <option value="narrow">Narrow (&lt;75 ft)</option>
+                    <option value="wide">Wide (≥75 ft)</option>
+                  </select>
+                </Field>
+              )}
+            </div>
+            <div className="frow">
+              {zone === "Custom" && <Field label="Custom FAR"><input type="number" value={far} onChange={(e) => setFar(e.target.value)} /></Field>}
+              <Field label="Lot area (SF)"><input type="number" value={lot} onChange={(e) => setLot(e.target.value)} placeholder="5,000" /></Field>
+              <Field label="Price ($, optional)"><input type="number" value={ask} onChange={(e) => setAsk(e.target.value)} /></Field>
+            </div>
+          </div>
+        </div>
+        <div style={S.formSide}>
+          <ZoningPanel zone={zone} streetWidth={sw} lotArea={lot} customFar={far} askingPrice={ask} />
+        </div>
+      </div>
+    </>
+  );
+}
+
+function Field({ label, children, wide }) {
+  return (
+    <div className="field" style={wide ? { flex: "1 1 100%" } : {}}>
+      <label className="flabel">{label}</label>
+      {children}
+    </div>
+  );
+}
+
+/* ============================================================ */
+const INK = "#101B2D";
+const PAPER = "#FAFAF7";
+const BLUE = "#2456C8";
+const LINE = "#E3E1D9";
+
+const S = {
+  app: { display: "flex", minHeight: "100vh", background: PAPER, color: INK, fontFamily: "'Archivo', -apple-system, 'Segoe UI', sans-serif" },
+  loading: { minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: PAPER, fontFamily: "sans-serif", color: "#666" },
+  side: { width: 210, flexShrink: 0, background: INK, color: "#EDEDE8", display: "flex", flexDirection: "column", padding: "22px 14px", position: "sticky", top: 0, height: "100vh", boxSizing: "border-box" },
+  brand: { display: "flex", gap: 10, alignItems: "center", marginBottom: 28 },
+  brandMark: { width: 36, height: 36, borderRadius: 6, background: BLUE, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 800, fontSize: 20 },
+  brandName: { fontSize: 12, fontWeight: 800, letterSpacing: "0.12em" },
+  brandSub: { fontSize: 11, opacity: 0.55, letterSpacing: "0.04em" },
+  nav: { display: "flex", flexDirection: "column", gap: 4, flex: 1 },
+  navCount: { background: "rgba(255,255,255,0.12)", borderRadius: 20, padding: "1px 8px", fontSize: 11 },
+  saveTag: { fontSize: 11, opacity: 0.5, letterSpacing: "0.03em" },
+  main: { flex: 1, padding: "28px 32px 60px", maxWidth: 1100, boxSizing: "border-box", minWidth: 0 },
+  head: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18, gap: 12, flexWrap: "wrap" },
+  h1: { margin: 0, fontSize: 26, fontWeight: 800, letterSpacing: "-0.01em" },
+  filterRow: { display: "flex", flexDirection: "column", gap: 10, marginBottom: 20 },
+  chips: { display: "flex", gap: 6, flexWrap: "wrap" },
+  cardGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(290px, 1fr))", gap: 14 },
+  cardTop: { display: "flex", gap: 6, marginBottom: 8, flexWrap: "wrap", alignItems: "center" },
+  cardAddr: { fontSize: 17, fontWeight: 800, lineHeight: 1.2 },
+  cardSub: { fontSize: 13, opacity: 0.6, marginTop: 2 },
+  cardStats: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px 12px", margin: "12px 0", fontSize: 13 },
+  cardFoot: { display: "flex", justifyContent: "space-between", fontSize: 12, color: BLUE, fontWeight: 600, borderTop: `1px solid ${LINE}`, paddingTop: 8 },
+  empty: { padding: "40px 20px", textAlign: "center", opacity: 0.55, fontSize: 14, maxWidth: 480, margin: "0 auto", lineHeight: 1.5 },
+  notice: { background: "#EEF3E6", border: "1px solid #CBD8B4", borderRadius: 8, padding: "10px 14px", fontSize: 13, marginBottom: 14 },
+  buyerList: { display: "flex", flexDirection: "column", gap: 6 },
+  rowSub: { fontSize: 12, opacity: 0.55 },
+  formCols: { display: "flex", gap: 22, alignItems: "flex-start", flexWrap: "wrap" },
+  formMain: { flex: "1 1 420px", minWidth: 0 },
+  formSide: { flex: "0 1 340px", minWidth: 280 },
+};
+
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@500;600&display=swap');
+* { box-sizing: border-box; }
+button { font-family: inherit; cursor: pointer; }
+input, select, textarea {
+  font-family: inherit; font-size: 14px; width: 100%;
+  padding: 9px 11px; border: 1px solid ${LINE}; border-radius: 7px;
+  background: #fff; color: ${INK}; outline: none;
+}
+input:focus, select:focus, textarea:focus { border-color: ${BLUE}; box-shadow: 0 0 0 3px rgba(36,86,200,0.12); }
+.search { max-width: 480px; }
+.navBtn { display: flex; justify-content: space-between; align-items: center; background: none; border: none; color: inherit; padding: 10px 12px; border-radius: 8px; font-size: 14px; font-weight: 600; text-align: left; opacity: 0.7; }
+.navBtn:hover { opacity: 1; background: rgba(255,255,255,0.06); }
+.navBtn[data-active="true"] { opacity: 1; background: ${BLUE}; }
+.primary { background: ${BLUE}; color: #fff; border: none; padding: 10px 16px; border-radius: 8px; font-weight: 700; font-size: 14px; }
+.primary:hover { background: #1c46a6; }
+.primary:disabled { opacity: 0.4; cursor: default; }
+.ghost { background: none; border: 1px solid ${LINE}; padding: 10px 14px; border-radius: 8px; font-weight: 600; font-size: 14px; color: ${INK}; }
+.ghost:hover { border-color: ${INK}; }
+.danger { background: none; border: 1px solid #d8b4b4; color: #a33; padding: 10px 14px; border-radius: 8px; font-weight: 600; font-size: 14px; }
+.danger:hover { background: #fbf0f0; }
+.chip { background: #fff; border: 1px solid ${LINE}; border-radius: 20px; padding: 5px 13px; font-size: 13px; font-weight: 600; color: ${INK}; }
+.chip[data-active="true"] { background: ${INK}; color: #fff; border-color: ${INK}; }
+.tag { display: inline-block; background: ${INK}; color: #fff; font-size: 11px; font-weight: 700; letter-spacing: 0.04em; padding: 2px 8px; border-radius: 4px; }
+.tag.alt { background: #fff; color: ${BLUE}; border: 1px solid ${BLUE}; }
+.tag.green { background: #2E7D5B; }
+.card { background: #fff; border: 1px solid ${LINE}; border-radius: 10px; padding: 16px; cursor: pointer; transition: box-shadow 0.15s, transform 0.15s; }
+.card:hover { box-shadow: 0 4px 16px rgba(16,27,45,0.1); transform: translateY(-1px); }
+.card label { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; opacity: 0.5; margin-bottom: 1px; }
+.cardPhoto { width: calc(100% + 32px); margin: -16px -16px 12px; height: 150px; object-fit: cover; border-radius: 10px 10px 0 0; display: block; }
+.shareBtn { margin-left: auto; background: none; border: 1px solid ${BLUE}; color: ${BLUE}; border-radius: 6px; padding: 3px 10px; font-size: 12px; font-weight: 700; }
+.shareBtn:hover { background: ${BLUE}; color: #fff; }
+.row { display: flex; gap: 14px; align-items: center; background: #fff; border: 1px solid ${LINE}; border-radius: 9px; padding: 12px 16px; cursor: pointer; font-size: 14px; flex-wrap: wrap; }
+.row:hover { border-color: ${BLUE}; }
+.fgroup { background: #fff; border: 1px solid ${LINE}; border-radius: 10px; padding: 16px 18px; margin-bottom: 14px; }
+.ftitle { font-size: 11px; font-weight: 800; letter-spacing: 0.1em; text-transform: uppercase; color: ${BLUE}; margin-bottom: 12px; }
+.frow { display: flex; gap: 12px; flex-wrap: wrap; }
+.field { flex: 1 1 160px; margin-bottom: 10px; }
+.flabel { display: block; font-size: 12px; font-weight: 600; margin-bottom: 4px; opacity: 0.75; }
+.photoGrid { display: flex; gap: 10px; flex-wrap: wrap; }
+.photoThumb { position: relative; width: 112px; height: 84px; border-radius: 8px; overflow: hidden; border: 1px solid ${LINE}; }
+.photoThumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.photoX { position: absolute; top: 4px; right: 4px; width: 22px; height: 22px; border-radius: 50%; border: none; background: rgba(16,27,45,0.75); color: #fff; font-size: 15px; line-height: 1; }
+.coverTag { position: absolute; bottom: 0; left: 0; background: ${BLUE}; color: #fff; font-size: 9px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; padding: 2px 6px; border-radius: 0 6px 0 0; }
+.photoAdd { width: 112px; height: 84px; border: 2px dashed ${LINE}; border-radius: 8px; background: none; color: ${INK}; font-size: 13px; font-weight: 600; opacity: 0.7; }
+.photoAdd:hover { border-color: ${BLUE}; color: ${BLUE}; opacity: 1; }
+.zpanel { background: ${INK}; color: #EDEDE8; border-radius: 10px; padding: 16px 18px;
+  background-image: linear-gradient(rgba(255,255,255,0.04) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.04) 1px, transparent 1px);
+  background-size: 22px 22px; }
+.zpanelTitle { font-size: 11px; font-weight: 800; letter-spacing: 0.1em; text-transform: uppercase; opacity: 0.7; margin-bottom: 12px; }
+.zgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.zcell label { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; opacity: 0.55; margin-bottom: 3px; }
+.znum { font-family: 'IBM Plex Mono', monospace; font-size: 18px; font-weight: 600; }
+.zcell.big .znum { font-size: 24px; }
+.znum.brass { color: #D6B45C; }
+.znum small { font-size: 12px; opacity: 0.6; }
+.zfoot { margin-top: 12px; font-size: 11px; opacity: 0.5; line-height: 1.4; }
+.matchRow { display: flex; justify-content: space-between; gap: 10px; padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.08); font-size: 13px; }
+.matchRow span { opacity: 0.6; }
+.toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: ${INK}; color: #fff; padding: 12px 18px; border-radius: 10px; font-size: 13px; z-index: 60; max-width: 90vw; box-shadow: 0 6px 24px rgba(0,0,0,0.25); }
+.modalWrap { position: fixed; inset: 0; background: rgba(16,27,45,0.55); display: flex; align-items: center; justify-content: center; padding: 20px; z-index: 50; }
+.modal { background: #fff; border-radius: 14px; padding: 18px; width: 420px; max-width: 100%; max-height: 90vh; overflow-y: auto; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
+.modalHead { display: flex; justify-content: space-between; align-items: center; font-size: 12px; font-weight: 800; letter-spacing: 0.1em; text-transform: uppercase; color: ${BLUE}; margin-bottom: 14px; }
+.modalX { background: none; border: none; font-size: 24px; line-height: 1; color: ${INK}; opacity: 0.5; }
+.sharePhoto { width: 100%; height: 170px; object-fit: cover; border-radius: 9px; margin-bottom: 12px; display: block; }
+.shareText { font-family: 'IBM Plex Mono', monospace; font-size: 13px; line-height: 1.55; resize: vertical; }
+.shareNote { font-size: 11px; opacity: 0.55; margin: 8px 0 14px; line-height: 1.4; }
+.shareBtns { display: flex; gap: 8px; flex-wrap: wrap; }
+@media (max-width: 760px) {
+  .appShell { flex-direction: column !important; }
+  .sideBar { width: 100% !important; height: auto !important; position: static !important; flex-direction: row !important; align-items: center; padding: 12px 14px !important; gap: 10px; }
+  .sideBar .brandWrap { margin-bottom: 0 !important; }
+  .sideBar nav { flex-direction: row !important; flex: 1; }
+  .sideBar .saveNote { display: none; }
+  .navBtn { padding: 8px 10px; font-size: 13px; }
+  main { padding: 18px 14px 50px !important; }
+}
+`;
