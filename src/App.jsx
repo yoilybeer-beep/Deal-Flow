@@ -1506,9 +1506,18 @@ function App() {
     return () => sub?.subscription?.unsubscribe();
   }, []);
 
-  if (session === undefined) return <div className="center">Connecting…</div>;
-  if (!session) return <SignIn />;
-  return <Shell user={session.user} key={session.user.id} />;
+  // styles must live above the auth gate, otherwise the sign-in screen
+  // renders before Shell mounts and arrives with no CSS at all
+  return (
+    <>
+      <style id="jrg-styles">{CSS}</style>
+      {session === undefined
+        ? <div className="center">Connecting…</div>
+        : !session
+          ? <SignIn />
+          : <Shell user={session.user} key={session.user.id} />}
+    </>
+  );
 }
 
 function SignIn() {
@@ -1601,7 +1610,6 @@ function Shell({ user }) {
 
   return (
     <>
-      <style id="jrg-styles">{CSS}</style>
       <div className="appShell">
         <aside className="sideBar">
           <div className="brandWrap brand">
