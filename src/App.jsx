@@ -119,6 +119,20 @@ const pct = (n) => (isNaN(n) ? '—' : Number(n).toFixed(1) + '%');
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const N = (v) => { const x = parseFloat(v); return isNaN(x) ? 0 : x; };
 
+/* ---------- follow-up date status (today, relative to the device clock) ---------- */
+function followUpStatus(dateStr) {
+  if (!dateStr) return null;
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const due = new Date(dateStr + 'T00:00:00');
+  if (isNaN(due.getTime())) return null;
+  const days = Math.round((due - today) / 86400000);
+  if (days < 0) return { cls: 'overdue', label: `Overdue ${Math.abs(days)}d`, days };
+  if (days === 0) return { cls: 'due', label: 'Follow up today', days };
+  if (days === 1) return { cls: 'soon', label: 'Follow up tomorrow', days };
+  if (days <= 7) return { cls: 'soon', label: `Follow up in ${days}d`, days };
+  return { cls: 'upcoming', label: `Follow up ${due.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`, days };
+}
+
 function matchBuyers(deal, buyers) {
   const z = computeZoning(deal.zone, deal.streetWidth, deal.lotArea, deal.customFar);
   const bsf = z ? Math.max(z.baseZfa, z.uapZfa || 0) : 0;
@@ -899,7 +913,8 @@ const initials = (n) =>
 const blankDeal = () => ({
   id: uid(), address: "", borough: "Bronx", neighborhood: "", zone: "R6", photos: [],
   streetWidth: "narrow", devPath: "aor", lotArea: "", customFar: "", askingPrice: "", sellerNumber: "",
-  vacancy: "TBD", existingSf: "", contactName: "", contactPhone: "", notes: "", isPublic: false,
+  vacancy: "TBD", existingSf: "", contactName: "", contactPhone: "", contactEmail: "", notes: "",
+  followUpDate: "", followUpNotes: "", isPublic: false,
   created: new Date().toISOString().slice(0, 10),
 });
 const blankBuyer = () => ({
@@ -1008,7 +1023,7 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName }) {
       if (ownFilter === "Mine" && !mine) return false;
       if (ownFilter === "Shared with me" && mine) return false;
       if (boroFilter !== "All" && d.borough !== boroFilter) return false;
-      return !t || [d.address, d.neighborhood, d.zone, d.notes, d.contactName].join(" ").toLowerCase().includes(t);
+      return !t || [d.address, d.neighborhood, d.zone, d.notes, d.contactName, d.contactEmail, d.followUpNotes].join(" ").toLowerCase().includes(t);
     });
   }, [deals, q, boroFilter, ownFilter, userId]);
 
@@ -1054,6 +1069,7 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName }) {
           const mine = !d._owner || d._owner === userId;
           const perAor = z && z.baseZfa > 0 && ask ? ask / z.baseZfa : null;
           const perUap = z && z.uapZfa > 0 && ask ? ask / z.uapZfa : null;
+          const fu = followUpStatus(d.followUpDate);
           return (
             <div key={d.id} className="card" onClick={() => setDealForm({ ...d })}>
               {d.photos?.[0] && <img className="cardPhoto" src={photoUrl(d.photos[0])} alt="" loading="lazy" />}
@@ -1068,6 +1084,7 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName }) {
               </div>
               <div className="cardAddr">{d.address || "Untitled"}</div>
               {d.neighborhood && <div className="cardSub">{d.neighborhood}</div>}
+              {fu && <div className={"followTag " + fu.cls}>● {fu.label}</div>}
               <div className="cardStats">
                 <div><label>Ask</label><b>{money(d.askingPrice)}</b></div>
                 <div><label>Lot</label><b>{fmt(d.lotArea)} SF</b></div>
@@ -1368,8 +1385,19 @@ function DealForm({ deal, setDeal, buyers, onSave, onCancel, onDelete, onShare, 
             <div className="frow">
               <Fld label="Name"><input value={deal.contactName} onChange={set("contactName")} /></Fld>
               <Fld label="Phone"><input value={deal.contactPhone} onChange={set("contactPhone")} /></Fld>
+              <Fld label="Email"><input type="email" value={deal.contactEmail || ""} onChange={set("contactEmail")} placeholder="seller@email.com" /></Fld>
             </div>
             <Fld label="Notes" wide><textarea rows={3} value={deal.notes} onChange={set("notes")} placeholder="Off-market, wants quiet process, open to seller financing…" /></Fld>
+          </div>
+          <div className="fgroup">
+            <div className="ftitle">Follow-up</div>
+            <div className="frow">
+              <Fld label="Follow-up date"><input type="date" value={deal.followUpDate || ""} onChange={set("followUpDate")} /></Fld>
+            </div>
+            <Fld label="Comments" wide><textarea rows={3} value={deal.followUpNotes || ""} onChange={set("followUpNotes")} placeholder="What to check on, who to call, where things stand…" /></Fld>
+            {followUpStatus(deal.followUpDate) && (
+              <div className={"followTag inForm " + followUpStatus(deal.followUpDate).cls}>● {followUpStatus(deal.followUpDate).label}</div>
+            )}
           </div>
         </div>
         <div className="formSide">
@@ -1789,6 +1817,12 @@ main{flex:1;padding:28px 32px 60px;max-width:1180px;min-width:0}
 .visBtn[data-on="true"]{border-color:${BLUE};background:#F4F7FE;box-shadow:0 0 0 2px rgba(36,86,200,.12)}
 .ghost[data-on="true"]{border-color:#2E7D5B;color:#2E7D5B}
 .tag.green{background:#2E7D5B}
+.followTag{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:700;letter-spacing:.02em;padding:3px 9px;border-radius:20px;margin-top:8px;width:fit-content}
+.followTag.overdue{background:#FBEAE8;color:${RED}}
+.followTag.due{background:#FDEFD8;color:#9C6B0B}
+.followTag.soon{background:#FDEFD8;color:#9C6B0B;opacity:.8}
+.followTag.upcoming{background:#EAF0FB;color:${BLUE}}
+.followTag.inForm{margin-top:10px;font-size:12.5px}
 .cardStats > div[data-hi="false"]{opacity:.45}
 .zcell[data-dim="true"]{opacity:.45}
 .empty{padding:40px 20px;text-align:center;opacity:.55;font-size:14px;max-width:480px;margin:0 auto;line-height:1.5}
