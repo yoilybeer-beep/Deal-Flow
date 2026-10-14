@@ -1,6 +1,9 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import Papa from "papaparse";
 import { supabase } from "./supabaseClient";
+import Contacts from "./Contacts";
+import Team from "./Team";
+import { QuickActions, LastContactedTag, lastContacted, todayISO } from "./crmKit";
 
 /* ============================================================
    JSTONE REALTY — DEAL PLATFORM
@@ -108,8 +111,14 @@ function computeZoning(zoneLabel, street, lotArea, customFar) {
 }
 
 const BOROUGHS = ['Bronx','Brooklyn','Queens','Manhattan','Staten Island'];
-const ASSET_TYPES = ['Development site','Multifamily','Mixed-use','Conversion','Other'];
+const ASSET_TYPES = ['Development / Land','Value-add','Existing / Stabilized','Office','Retail','Industrial','Conversion','Other'];
+// Tags saved before the new list. Read as the new names; the next save writes the new name.
+const ASSET_ALIAS = { 'Development site': 'Development / Land', 'Multifamily': 'Existing / Stabilized', 'Mixed-use': 'Existing / Stabilized' };
+const normTypes = (arr) => [...new Set((arr || []).map((t) => ASSET_ALIAS[t] || t))];
 const VACANCY = ['Delivered vacant','Partially occupied','Fully occupied','TBD'];
+// Deal pipeline. Saved in deals.data.stage; deals without one are "New".
+const DEAL_STAGES = ['New','Underwriting','Sent to buyers','Offer','Contract','Closed'];
+const stageOf = (d) => (DEAL_STAGES.includes(d?.stage) ? d.stage : 'New');
 
 const fmt = (n, d = 0) =>
   n == null || isNaN(n) ? '—' : Number(n).toLocaleString('en-US', { maximumFractionDigits: d });
@@ -133,16 +142,25 @@ function followUpStatus(dateStr) {
   return { cls: 'upcoming', label: `Follow up ${due.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`, days };
 }
 
+// Auto-match: a buyer fits when nothing in their buy box rules the deal out
+// (borough, what they buy, budget with 10% stretch, min size). Each criterion the
+// buyer actually has filled in and that fits counts as a "hit"; best fits first.
 function matchBuyers(deal, buyers) {
   const z = computeZoning(deal.zone, deal.streetWidth, deal.lotArea, deal.customFar);
   const bsf = z ? Math.max(z.baseZfa, z.uapZfa || 0) : 0;
   const price = parseFloat(deal.askingPrice) || null;
-  return buyers.filter((b) => {
-    if (b.boroughs?.length && !b.boroughs.includes(deal.borough)) return false;
-    if (b.maxBudget && price && price > Number(b.maxBudget) * 1.1) return false;
-    if (b.minSize && bsf && bsf < Number(b.minSize)) return false;
-    return true;
-  });
+  const type = deal.assetType || '';
+  const out = [];
+  for (const b of buyers) {
+    const hits = [];
+    if (b.boroughs?.length) { if (!b.boroughs.includes(deal.borough)) continue; hits.push(deal.borough); }
+    const bt = normTypes(b.assetTypes);
+    if (type && bt.length) { if (!bt.includes(type)) continue; hits.push(type); }
+    if (b.maxBudget && price) { if (price > Number(b.maxBudget) * 1.1) continue; hits.push('Budget ' + money(b.maxBudget)); }
+    if (b.minSize && bsf) { if (bsf < Number(b.minSize)) continue; hits.push(fmt(b.minSize) + '+ SF'); }
+    out.push({ ...b, _hits: hits });
+  }
+  return out.sort((a, b) => b._hits.length - a._hits.length);
 }
 
 /* ---------- client-facing share text (no seller number / contact / notes) ---------- */
@@ -914,15 +932,16 @@ const blankDeal = () => ({
   id: uid(), address: "", borough: "Bronx", neighborhood: "", zone: "R6", photos: [],
   streetWidth: "narrow", devPath: "aor", lotArea: "", customFar: "", askingPrice: "", sellerNumber: "",
   vacancy: "TBD", existingSf: "", contactName: "", contactPhone: "", contactEmail: "", notes: "",
-  followUpDate: "", followUpNotes: "", isPublic: false,
+  followUpDate: "", followUpNotes: "", isPublic: false, stage: "New", assetType: "",
   created: new Date().toISOString().slice(0, 10),
 });
 const blankBuyer = () => ({
   id: uid(), name: "", company: "", phone: "", email: "",
   boroughs: [], minSize: "", maxBudget: "", assetTypes: [], notes: "", isPublic: false,
+  followUpDate: "", lastContacted: "",
 });
 
-function DealDesk({ view, notify, onUnderwrite, userId, userName }) {
+function DealDesk({ view, notify, onUnderwrite, userId, userName, openId, onOpened }) {
   const [deals, setDeals] = useState([]);
   const [buyers, setBuyers] = useState([]);
   const [loaded, setLoaded] = useState(false);
@@ -934,8 +953,13 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName }) {
   const [ownFilter, setOwnFilter] = useState("All");
   const [bq, setBq] = useState("");
   const [bBoro, setBBoro] = useState("All");
+  const [bTypes, setBTypes] = useState([]);
+  const [bCold, setBCold] = useState(false);   // only buyers not contacted in 30+ days   // "what they buy" filter, multi-select, matches ANY
   const [importMsg, setImportMsg] = useState("");
+  const [dealLayout, setDealLayout] = useState(() => localStorage.getItem("dealLayout") || "board");
+  const [dragId, setDragId] = useState(null);
   const fileRef = useRef(null);
+  const pickLayout = (l) => { setDealLayout(l); try { localStorage.setItem("dealLayout", l); } catch (e) {} };
 
   useEffect(() => {
     (async () => {
@@ -945,12 +969,20 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName }) {
       ]);
       const hydrate = (rows) => (rows || []).map((r) => ({ ...r.data, isPublic: !!r.is_public, _owner: r.owner_id }));
       setDeals(hydrate(d.data));
-      setBuyers(hydrate(b.data));
+      setBuyers(hydrate(b.data).map((x) => ({ ...x, assetTypes: normTypes(x.assetTypes) })));
       setLoaded(true);
     })();
   }, []);
 
   useEffect(() => { setDealForm(null); setBuyerForm(null); }, [view]);
+
+  // opened from Home's Today list or from a converted contact: jump straight to the record
+  useEffect(() => {
+    if (!loaded || !openId) return;
+    if (view === "deals") { const d = deals.find((x) => x.id === openId); if (d) setDealForm({ ...d }); }
+    if (view === "buyers") { const b = buyers.find((x) => x.id === openId); if (b) setBuyerForm({ ...b }); }
+    onOpened?.();
+  }, [loaded, openId, view]);
 
   const saveDeal = async () => {
     if (!dealForm.address.trim()) return;
@@ -959,9 +991,19 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName }) {
     setDeals(exists ? deals.map((d) => (d.id === rec.id ? rec : d)) : [rec, ...deals]);
     setDealForm(null);
     const { error } = await supabase.from("deals").upsert({
-      id: rec.id, data: rec, owner_id: userId, is_public: !!rec.isPublic, updated_at: new Date().toISOString(),
+      id: rec.id, data: rec, owner_id: rec._owner || userId, is_public: !!rec.isPublic, updated_at: new Date().toISOString(),
     });
     notify?.(error ? (error.message || "Save failed.") : (rec.isPublic ? "Deal saved and published to the team." : "Deal saved — visible only to you."));
+  };
+  // stage change from the board (dropdown or drag) saves right away
+  const setStage = async (d, stage) => {
+    if (stageOf(d) === stage) return;
+    const mine = !d._owner || d._owner === userId;
+    if (!mine) return notify?.("Only the person who added this deal can move it.");
+    const rec = { ...d, stage };
+    setDeals(deals.map((x) => (x.id === d.id ? rec : x)));
+    const { error } = await supabase.from("deals").update({ data: rec, updated_at: new Date().toISOString() }).eq("id", d.id);
+    notify?.(error ? (error.message || "Couldn't move the deal.") : `${d.address || "Deal"} → ${stage}`);
   };
   const deleteDeal = async (id) => {
     const d = deals.find((x) => x.id === id);
@@ -971,16 +1013,17 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName }) {
     await supabase.from("deals").delete().eq("id", id);
   };
 
-  const saveBuyer = async () => {
-    if (!buyerForm.name.trim()) return;
-    const rec = { ...buyerForm, ownerName: buyerForm.ownerName || userName };
+  const saveBuyer = async (draft, keepOpen) => {
+    const src = draft || buyerForm;
+    if (!src.name.trim()) return;
+    const rec = { ...src, ownerName: src.ownerName || userName };
     const exists = buyers.some((b) => b.id === rec.id);
     setBuyers(exists ? buyers.map((b) => (b.id === rec.id ? rec : b)) : [rec, ...buyers]);
-    setBuyerForm(null);
+    if (keepOpen) setBuyerForm(rec); else setBuyerForm(null);
     const { error } = await supabase.from("buyers").upsert({
-      id: rec.id, data: rec, owner_id: userId, is_public: !!rec.isPublic, updated_at: new Date().toISOString(),
+      id: rec.id, data: rec, owner_id: rec._owner || userId, is_public: !!rec.isPublic, updated_at: new Date().toISOString(),
     });
-    notify?.(error ? (error.message || "Save failed.") : "Buyer saved.");
+    notify?.(error ? (error.message || "Save failed.") : keepOpen ? "Call logged." : "Buyer saved.");
   };
   const deleteBuyer = async (id) => {
     setBuyers(buyers.filter((b) => b.id !== id));
@@ -1031,8 +1074,12 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName }) {
     const t = bq.toLowerCase();
     return buyers.filter((b) =>
       (bBoro === "All" || b.boroughs?.includes(bBoro)) &&
+      (bTypes.length === 0 || bTypes.some((x) => b.assetTypes?.includes(x))) &&
+      (!bCold || lastContacted(b.lastContacted).cold || lastContacted(b.lastContacted).never) &&
       (!t || [b.name, b.company, b.notes, b.email, b.phone].join(" ").toLowerCase().includes(t)));
-  }, [buyers, bq, bBoro]);
+  }, [buyers, bq, bBoro, bTypes, bCold]);
+  const coldCount = buyers.filter((b) => { const l = lastContacted(b.lastContacted); return l.cold || l.never; }).length;
+  const toggleBType = (x) => setBTypes(bTypes.includes(x) ? bTypes.filter((y) => y !== x) : [...bTypes, x]);
 
   if (!loaded) return <div style={{ padding: 40, opacity: 0.6 }}>Loading your desk…</div>;
 
@@ -1041,7 +1088,13 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName }) {
     <>
       <header className="pageHead">
         <h1>Deals</h1>
-        <button className="primary" onClick={() => setDealForm(blankDeal())}>+ New deal</button>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <div className="seg">
+            <button data-on={dealLayout === "board"} onClick={() => pickLayout("board")}>Board</button>
+            <button data-on={dealLayout === "list"} onClick={() => pickLayout("list")}>List</button>
+          </div>
+          <button className="primary" onClick={() => setDealForm(blankDeal())}>+ New deal</button>
+        </div>
       </header>
       <div className="filterRow">
         <input className="search" placeholder="Search address, zoning, contact, notes…" value={q} onChange={(e) => setQ(e.target.value)} />
@@ -1061,7 +1114,42 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName }) {
           ? "No deals yet. Someone calls with a property — hit “New deal” and lock it in while you're still on the phone."
           : "Nothing matches that search."}</div>
       )}
-      <div className="cardGrid">
+      {dealLayout === "board" && filteredDeals.length > 0 && (
+        <div className="board">
+          {DEAL_STAGES.map((s) => {
+            const col = filteredDeals.filter((d) => stageOf(d) === s);
+            return (
+              <div key={s} className="boardCol" data-drop={dragId ? "1" : ""}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => { e.preventDefault(); const d = deals.find((x) => x.id === dragId); setDragId(null); if (d) setStage(d, s); }}>
+                <div className="boardHead"><span>{s}</span><b>{col.length}</b></div>
+                {col.length === 0 && <div className="boardEmpty">No deals</div>}
+                {col.map((d) => {
+                  const fu = followUpStatus(d.followUpDate);
+                  const n = matchBuyers(d, buyers).length;
+                  return (
+                    <div key={d.id} className="boardCard" draggable onDragStart={() => setDragId(d.id)} onDragEnd={() => setDragId(null)}
+                      onClick={() => setDealForm({ ...d })}>
+                      {d.photos?.[0] && <img className="boardPhoto" src={photoUrl(d.photos[0])} alt="" loading="lazy" />}
+                      <div className="boardAddr">{d.address || "Untitled"}</div>
+                      <div className="boardSub">{[d.neighborhood, d.borough].filter(Boolean).join(" · ")}</div>
+                      <div className="boardMeta">
+                        <span>{money(d.askingPrice)}</span>
+                        {n > 0 && <span className="matchCount">{n} buyer{n === 1 ? "" : "s"} fit</span>}
+                      </div>
+                      {fu && <div className={"followTag " + fu.cls}>● {fu.label}</div>}
+                      <select className="stageSel" value={s} onClick={(e) => e.stopPropagation()} onChange={(e) => setStage(d, e.target.value)}>
+                        {DEAL_STAGES.map((x) => <option key={x}>{x}</option>)}
+                      </select>
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {dealLayout === "list" && <div className="cardGrid">
         {filteredDeals.map((d) => {
           const z = computeZoning(d.zone, d.streetWidth, d.lotArea, d.customFar);
           const ask = parseFloat(d.askingPrice);
@@ -1078,6 +1166,7 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName }) {
                 <span className="tag alt">{d.zone}</span>
                 <span className="tag path">{uapPath ? "UAP" : "As-of-right"}</span>
                 <span className={"tag " + (d.isPublic ? "pub" : "priv")}>{d.isPublic ? "Published" : "Private"}</span>
+                <span className="tag stage">{stageOf(d)}</span>
                 {!mine && <span className="tag shared">Shared</span>}
                 {d.vacancy === "Delivered vacant" && <span className="tag green">Vacant</span>}
                 <button className="shareBtn" onClick={(e) => { e.stopPropagation(); setShareFor(d); }}>Share ↗</button>
@@ -1100,7 +1189,7 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName }) {
             </div>
           );
         })}
-      </div>
+      </div>}
       {shareFor && <ShareSheet deal={shareFor} onClose={() => setShareFor(null)} notify={notify} />}
     </>
   );
@@ -1136,16 +1225,31 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName }) {
       {importMsg && <div className="notice">{importMsg}</div>}
       <div className="filterRow">
         <input className="search" placeholder="Search name, company, notes…" value={bq} onChange={(e) => setBq(e.target.value)} />
-        <div className="chips">
-          {["All", ...BOROUGHS].map((b) => (
-            <button key={b} className="chip" data-on={bBoro === b} onClick={() => setBBoro(b)}>{b}</button>
-          ))}
+        <div>
+          <div className="filterLabel">Borough</div>
+          <div className="chips">
+            {["All", ...BOROUGHS].map((b) => (
+              <button key={b} className="chip" data-on={bBoro === b} onClick={() => setBBoro(b)}>{b}</button>
+            ))}
+          </div>
         </div>
+        <div>
+          <div className="filterLabel">What they buy {bTypes.length > 0 && <span className="clearLink" onClick={() => setBTypes([])}>Clear</span>}</div>
+          <div className="chips">
+            {ASSET_TYPES.map((a) => (
+              <button key={a} className="chip" data-on={bTypes.includes(a)} onClick={() => toggleBType(a)}>{bTypes.includes(a) ? "✓ " : ""}{a}</button>
+            ))}
+          </div>
+        </div>
+        <div className="chips">
+          <button className="chip small" data-on={bCold} onClick={() => setBCold(!bCold)}>● Not contacted in 30+ days or never logged ({coldCount})</button>
+        </div>
+        <div className="resultCount">{filteredBuyers.length} of {buyers.length} buyers</div>
       </div>
       {filteredBuyers.length === 0 && (
         <div className="empty">{buyers.length === 0
           ? "No buyers yet. Add them one by one, or import your old CRM export as a CSV."
-          : "No buyers match. Imported contacts need boroughs tagged before borough filters find them."}</div>
+          : "No buyers match. Imported contacts need boroughs and asset types tagged before the filters find them."}</div>
       )}
       <div className="rowList">
         {filteredBuyers.map((b) => (
@@ -1157,10 +1261,18 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName }) {
             <div style={{ flex: 2, minWidth: 120 }}>
               {(b.boroughs || []).map((x) => <span key={x} className="tag" style={{ marginRight: 4 }}>{x}</span>)}
               {!b.boroughs?.length && <span style={{ opacity: 0.4 }}>no boroughs tagged</span>}
+              <div style={{ marginTop: 5 }}>
+                {(b.assetTypes || []).map((x) => <span key={x} className="tag alt" data-hit={bTypes.includes(x)} style={{ marginRight: 4, marginBottom: 3 }}>{x}</span>)}
+              </div>
             </div>
             <div style={{ flex: 1, minWidth: 90 }}>{b.minSize ? `${fmt(b.minSize)}+ SF` : ""}</div>
             <div style={{ flex: 1, minWidth: 90 }}>{b.maxBudget ? `≤ ${money(b.maxBudget)}` : ""}</div>
-            <div style={{ flex: 1, minWidth: 100, opacity: 0.7 }}>{b.phone}</div>
+            <div style={{ flex: "1 1 150px", minWidth: 130, display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 5 }}>
+              {b.phone && <span style={{ opacity: 0.7 }}>{b.phone}</span>}
+              <QuickActions phone={b.phone} email={b.email} small />
+              <LastContactedTag date={b.lastContacted} />
+              {followUpStatus(b.followUpDate) && <div className={"followTag " + followUpStatus(b.followUpDate).cls}>● {followUpStatus(b.followUpDate).label}</div>}
+            </div>
             <span className="byline"><i>{initials(b.ownerName || userName)}</i>{b.ownerName || userName}</span>
           </div>
         ))}
@@ -1169,7 +1281,7 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName }) {
   );
 
   if (view === "buyers" && buyerForm) return (
-    <BuyerForm buyer={buyerForm} setBuyer={setBuyerForm} onSave={saveBuyer}
+    <BuyerForm buyer={buyerForm} setBuyer={setBuyerForm} onSave={() => saveBuyer()} onLogCall={(b) => saveBuyer(b, true)}
       onCancel={() => setBuyerForm(null)} onDelete={() => deleteBuyer(buyerForm.id)}
       isNew={!buyers.some((b) => b.id === buyerForm.id)}
       mine={!buyerForm._owner || buyerForm._owner === userId} />
@@ -1267,6 +1379,7 @@ function DealForm({ deal, setDeal, buyers, onSave, onCancel, onDelete, onShare, 
   const [busy, setBusy] = useState(false);
   const photoRef = useRef(null);
   const matches = matchBuyers(deal, buyers);
+  const [showAll, setShowAll] = useState(false);
   const ss = ["R6", "R7-1", "R7-2", "R8"].includes(DEAL_ZONES[deal.zone]);
 
   const upload = async (files) => {
@@ -1330,6 +1443,17 @@ function DealForm({ deal, setDeal, buyers, onSave, onCancel, onDelete, onShare, 
             <div className="frow">
               <Fld label="Borough"><select value={deal.borough} onChange={set("borough")}>{BOROUGHS.map((b) => <option key={b}>{b}</option>)}</select></Fld>
               <Fld label="Neighborhood"><input value={deal.neighborhood} onChange={set("neighborhood")} placeholder="Belmont / Fordham" /></Fld>
+            </div>
+            <div className="frow">
+              <Fld label="Asset type">
+                <select value={deal.assetType || ""} onChange={set("assetType")}>
+                  <option value="">Any (not set)</option>
+                  {ASSET_TYPES.map((a) => <option key={a}>{a}</option>)}
+                </select>
+              </Fld>
+              <Fld label="Stage">
+                <select value={stageOf(deal)} onChange={set("stage")}>{DEAL_STAGES.map((s) => <option key={s}>{s}</option>)}</select>
+              </Fld>
             </div>
           </div>
           <div className="fgroup">
@@ -1403,11 +1527,33 @@ function DealForm({ deal, setDeal, buyers, onSave, onCancel, onDelete, onShare, 
         <div className="formSide">
           <ZoningPanel zone={deal.zone} streetWidth={deal.streetWidth} lotArea={deal.lotArea} customFar={deal.customFar} askingPrice={deal.askingPrice} devPath={deal.devPath} />
           <div className="zpanel" style={{ marginTop: 14 }}>
-            <div className="zpanelTitle">Matching buyers ({matches.length})</div>
-            {matches.length === 0 && <div style={{ padding: "10px 2px", fontSize: 13, opacity: 0.6 }}>No buyers match this borough / size / budget yet.</div>}
-            {matches.slice(0, 8).map((b) => (
-              <div key={b.id} className="matchRow"><b>{b.name}</b><span>{b.phone || b.email || ""}</span></div>
+            <div className="zpanelTitle">Buyers that fit ({matches.length})</div>
+            <div className="matchHint">
+              Checks borough{deal.assetType ? `, ${deal.assetType}` : ""}, budget and size against each buyer's buy box.
+              {!deal.assetType && " Set an asset type above to narrow it."}
+            </div>
+            {matches.length === 0 && <div style={{ padding: "10px 2px", fontSize: 13, opacity: 0.6 }}>No buyers fit this deal yet.</div>}
+            {matches.slice(0, showAll ? matches.length : 8).map((b) => (
+              <div key={b.id} className="matchRow">
+                <div className="matchMain">
+                  <b>{b.name}</b>{b.company && <span className="matchCo"> · {b.company}</span>}
+                  <div className="matchHits">
+                    {b._hits.map((h) => <span key={h} className="hit">✓ {h}</span>)}
+                    {b._hits.length === 0 && <span className="hit open">Open buy box</span>}
+                  </div>
+                  <LastContactedTag date={b.lastContacted} />
+                </div>
+                <QuickActions phone={b.phone} email={b.email} subject={deal.address} small />
+              </div>
             ))}
+            {matches.length > 8 && (
+              <button className="linkBtn" onClick={() => setShowAll(!showAll)}>{showAll ? "Show top 8" : `Show all ${matches.length}`}</button>
+            )}
+            {matches.some((b) => b.email) && (
+              <a className="linkBtn" href={`mailto:?bcc=${matches.filter((b) => b.email).map((b) => b.email).join(",")}&subject=${encodeURIComponent(deal.address || "New deal")}`}>
+                Email all {matches.filter((b) => b.email).length} (BCC) →
+              </a>
+            )}
           </div>
         </div>
       </div>
@@ -1415,9 +1561,20 @@ function DealForm({ deal, setDeal, buyers, onSave, onCancel, onDelete, onShare, 
   );
 }
 
-function BuyerForm({ buyer, setBuyer, onSave, onCancel, onDelete, isNew, mine = true }) {
+function BuyerForm({ buyer, setBuyer, onSave, onLogCall, onCancel, onDelete, isNew, mine = true }) {
   const set = (k) => (e) => setBuyer({ ...buyer, [k]: e.target.value });
   const [arm, setArm] = useState(false);
+  const [callNote, setCallNote] = useState("");
+  const fu = followUpStatus(buyer.followUpDate);
+  // log a call: dated line on top of the notes + last contacted = today; saves right away
+  const logCall = () => {
+    const t = todayISO();
+    const stamp = new Date(t + "T12:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+    const line = `${stamp}: ${callNote.trim() || "Called"}`;
+    const next = { ...buyer, lastContacted: t, notes: buyer.notes ? `${line}\n${buyer.notes}` : line };
+    setCallNote("");
+    if (isNew || !mine) setBuyer(next); else onLogCall(next);
+  };
   const toggle = (k, v) => () => {
     const arr = buyer[k] || [];
     setBuyer({ ...buyer, [k]: arr.includes(v) ? arr.filter((x) => x !== v) : [...arr, v] });
@@ -1453,9 +1610,34 @@ function BuyerForm({ buyer, setBuyer, onSave, onCancel, onDelete, isNew, mine = 
             <Fld label="Company"><input value={buyer.company} onChange={set("company")} /></Fld>
           </div>
           <div className="frow">
-            <Fld label="Phone"><input value={buyer.phone} onChange={set("phone")} /></Fld>
-            <Fld label="Email"><input value={buyer.email} onChange={set("email")} /></Fld>
+            <Fld label="Phone"><input type="tel" value={buyer.phone} onChange={set("phone")} /></Fld>
+            <Fld label="Email"><input type="email" value={buyer.email} onChange={set("email")} /></Fld>
           </div>
+          <QuickActions phone={buyer.phone} email={buyer.email} />
+        </div>
+        <div className="fgroup">
+          <div className="ftitle">Follow-up & call log</div>
+          <div className="frow">
+            <Fld label="Last contacted">
+              <div className="dateWithBtn">
+                <input type="date" value={buyer.lastContacted || ""} onChange={set("lastContacted")} />
+                <button className="ghost" onClick={() => setBuyer({ ...buyer, lastContacted: todayISO() })}>Today</button>
+              </div>
+            </Fld>
+            <Fld label="Next follow-up"><input type="date" value={buyer.followUpDate || ""} onChange={set("followUpDate")} /></Fld>
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 10 }}>
+            <LastContactedTag date={buyer.lastContacted} />
+            {fu && <div className={"followTag " + fu.cls}>● {fu.label}</div>}
+          </div>
+          {mine && (
+            <div className="noteAddRow">
+              <input value={callNote} onChange={(e) => setCallNote(e.target.value)} placeholder="Quick note on the call (optional)"
+                onKeyDown={(e) => { if (e.key === "Enter") logCall(); }} />
+              <button className="primary" onClick={logCall}>Log call</button>
+            </div>
+          )}
+          <div className="hintline">Log call stamps today's date into the notes and updates Last contacted.</div>
         </div>
         <div className="fgroup">
           <div className="ftitle">Buy box</div>
@@ -1605,12 +1787,7 @@ function SignIn() {
           {busy ? "Working…" : mode === "up" ? "Create account" : "Sign in"}
         </button>
         <div style={{ textAlign: "center", marginTop: 12, fontSize: 13 }}>
-          <span
-            style={{ color: BLUE, fontWeight: 600, cursor: "pointer" }}
-            onClick={() => { setMode(mode === "up" ? "in" : "up"); setMsg(""); }}
-          >
-            {mode === "up" ? "I already have an account" : "New here? Create an account"}
-          </span>
+          <span style={{ opacity: 0.55 }}>Invite only. Ask your admin for access.</span>
         </div>
       </form>
     </div>
@@ -1622,7 +1799,9 @@ function Shell({ user }) {
   const [userName, setUserName] = useState(user.user_metadata?.full_name?.trim() || "");
   const displayName = userName || (user.email || "You").split("@")[0];
 
-  const [view, setView] = useState("home");     // home | deals | buyers | zcalc | uw
+  const [view, setView] = useState("home");     // home | deals | buyers | contacts | zcalc | uw | team
+  const [openTarget, setOpenTarget] = useState(null);   // { view, id } to open one record after switching screens
+  const go = (v, id) => { setOpenTarget(id ? { view: v, id } : null); setView(v); window.scrollTo(0, 0); };
   const [uwModel, setUwModel] = useState(() => blankModel());
   const [returnTo, setReturnTo] = useState(null);
   const [toast, setToast] = useState("");
@@ -1634,7 +1813,16 @@ function Shell({ user }) {
     setView("uw");
   };
 
-  const NAV = [["home", "Home"], ["deals", "Deals"], ["buyers", "Buyers"], ["zcalc", "Zoning calc"], ["uw", "Underwriting"]];
+  // role comes from team_members (RLS allowlist); only admins see the Team screen
+  const [role, setRole] = useState(undefined);   // undefined = loading, null = not on the team
+  useEffect(() => {
+    supabase.from("team_members").select("role").eq("user_id", userId).maybeSingle().then(({ data }) => setRole(data?.role || null));
+  }, [userId]);
+  // invite links land here with a session in the URL; ask for a password once
+  const [needsPassword, setNeedsPassword] = useState(() => /type=(invite|recovery)/.test(window.location.hash));
+
+  const NAV = [["home", "Home"], ["deals", "Deals"], ["buyers", "Buyers"], ["contacts", "Contacts"], ["zcalc", "Zoning calc"], ["uw", "Underwriting"],
+    ...(role === "admin" ? [["team", "Team"]] : [])];
 
   return (
     <>
@@ -1650,7 +1838,7 @@ function Shell({ user }) {
           <nav>
             {NAV.map(([id, label]) => (
               <button key={id} className="navBtn" data-on={view === id}
-                onClick={() => { if (id === "uw") setReturnTo(null); setView(id); }}>{label}</button>
+                onClick={() => { if (id === "uw") setReturnTo(null); go(id); }}>{label}</button>
             ))}
           </nav>
           <div className="sideFoot">
@@ -1663,23 +1851,26 @@ function Shell({ user }) {
         </aside>
         <main>
           {toast && <div className="toast">{toast}</div>}
+          {needsPassword && <SetPassword onDone={() => { setNeedsPassword(false); window.history.replaceState(null, "", window.location.pathname); }} />}
+          {role === null && <div className="notice">Your login isn't on the team list yet. Ask an admin to invite you.</div>}
 
           {view === "home" && (
             <>
               <header className="pageHead"><h1>Welcome back</h1></header>
               {!userName && <NamePrompt onSaved={setUserName} />}
+              <TodayPanel onOpen={go} />
               <p className="homeIntro">Where do you want to work?</p>
               <div className="homeCards">
                 <div className="homeCard" onClick={() => setView("deals")}>
                   <div className="hcTag">01</div>
                   <h2>Deal Desk</h2>
-                  <p>Log a property while you're still on the phone. Live zoning analysis, photos, one-tap client share, and instant buyer matching.</p>
+                  <p>Log a property while you're still on the phone. Live zoning, photos, one-tap share, a stage board, and the buyers that fit.</p>
                   <span className="hcGo">Open deals →</span>
                 </div>
                 <div className="homeCard" onClick={() => setView("buyers")}>
                   <div className="hcTag">02</div>
                   <h2>Buyers</h2>
-                  <p>Your whole database with buy boxes — borough, size, budget. Search by borough when a buyer calls.</p>
+                  <p>Your whole database with buy boxes — borough, what they buy, size, budget. Filter in a tap when a deal comes in.</p>
                   <span className="hcGo">Open buyers →</span>
                 </div>
                 <div className="homeCard" onClick={() => setView("zcalc")}>
@@ -1694,6 +1885,12 @@ function Shell({ user }) {
                   <p>Full development model — FAR and unit counts, 485-x / UAP / MIH programs, rent roll, costs, financing, exit. Client summary in one click.</p>
                   <span className="hcGo">Open model →</span>
                 </div>
+                <div className="homeCard" onClick={() => setView("contacts")}>
+                  <div className="hcTag">05</div>
+                  <h2>Contacts</h2>
+                  <p>Owners, buyers, brokers and lenders. Area, follow-up date, and a dated note for every call.</p>
+                  <span className="hcGo">Open contacts →</span>
+                </div>
               </div>
               <div className="homeNote">
                 Open any deal and hit <b>Underwrite →</b> — the address, zoning, lot size, buildable SF, and asking price carry straight into the model. No retyping.
@@ -1705,7 +1902,15 @@ function Shell({ user }) {
           )}
 
           {(view === "deals" || view === "buyers" || view === "zcalc") && (
-            <DealDesk view={view} notify={notify} onUnderwrite={underwriteDeal} userId={userId} userName={displayName} />
+            <DealDesk view={view} notify={notify} onUnderwrite={underwriteDeal} userId={userId} userName={displayName}
+              openId={openTarget?.view === view ? openTarget.id : null} onOpened={() => setOpenTarget(null)} />
+          )}
+
+          {view === "team" && role === "admin" && <Team userId={userId} notify={notify} />}
+
+          {view === "contacts" && (
+            <Contacts notify={notify} userId={userId} userName={displayName} onGo={go}
+              openId={openTarget?.view === "contacts" ? openTarget.id : null} onOpened={() => setOpenTarget(null)} />
           )}
 
           {view === "uw" && (
@@ -1721,6 +1926,72 @@ function Shell({ user }) {
         </main>
       </div>
     </>
+  );
+}
+
+/* ============================================================
+   TODAY — follow-ups due today or overdue (contacts, buyers, deals)
+   ============================================================ */
+function TodayPanel({ onOpen }) {
+  const [items, setItems] = useState(null);
+  useEffect(() => {
+    (async () => {
+      const t = todayISO();
+      const [c, b, d] = await Promise.all([
+        supabase.from("contacts").select("id, name, phone, email, area, address, follow_up_date, last_contacted").lte("follow_up_date", t),
+        supabase.from("buyers").select("id, data"),
+        supabase.from("deals").select("id, data"),
+      ]);
+      const out = [];
+      for (const k of c.data || []) out.push({ kind: "Contact", view: "contacts", id: k.id, title: k.name, sub: [k.area, k.address].filter(Boolean).join(" · "), date: k.follow_up_date, phone: k.phone, email: k.email, last: k.last_contacted });
+      for (const r of b.data || []) { const x = r.data || {}; if (x.followUpDate && x.followUpDate <= t) out.push({ kind: "Buyer", view: "buyers", id: r.id, title: x.name, sub: x.company || "", date: x.followUpDate, phone: x.phone, email: x.email, last: x.lastContacted }); }
+      for (const r of d.data || []) { const x = r.data || {}; if (x.followUpDate && x.followUpDate <= t && stageOf(x) !== "Closed") out.push({ kind: "Deal", view: "deals", id: r.id, title: x.address || "Untitled deal", sub: [x.contactName, stageOf(x)].filter(Boolean).join(" · "), date: x.followUpDate, phone: x.contactPhone, email: x.contactEmail, note: x.followUpNotes }); }
+      out.sort((a, z) => a.date.localeCompare(z.date));
+      setItems(out);
+    })();
+  }, []);
+  if (!items) return null;
+  return (
+    <div className="today">
+      <div className="todayHead">
+        <h2>Today</h2>
+        <span>{items.length === 0 ? "Nothing due" : `${items.length} follow-up${items.length === 1 ? "" : "s"} due`}</span>
+      </div>
+      {items.length === 0 && <div className="todayEmpty">You're all caught up. Follow-up dates you set on contacts, buyers and deals show up here the day they're due.</div>}
+      {items.map((it) => {
+        const fu = followUpStatus(it.date);
+        return (
+          <div key={it.kind + it.id} className="todayRow" onClick={() => onOpen(it.view, it.id)}>
+            <span className={"tag kind " + it.kind.toLowerCase()}>{it.kind}</span>
+            <div className="todayMain">
+              <b>{it.title}</b>
+              {(it.sub || it.note) && <div className="rowSub">{[it.sub, it.note].filter(Boolean).join(" — ")}</div>}
+            </div>
+            {fu && <div className={"followTag " + fu.cls}>● {fu.label}</div>}
+            <QuickActions phone={it.phone} email={it.email} small />
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function SetPassword({ onDone }) {
+  const [pw, setPw] = useState("");
+  const [msg, setMsg] = useState("");
+  const save = async () => {
+    if (pw.length < 8) return setMsg("At least 8 characters.");
+    const { error } = await supabase.auth.updateUser({ password: pw });
+    if (error) return setMsg(error.message);
+    onDone();
+  };
+  return (
+    <div className="notice" style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+      <span><b>Welcome to the team.</b> Choose a password for next time:</span>
+      <input type="password" style={{ width: 200 }} value={pw} onChange={(e) => setPw(e.target.value)} autoComplete="new-password" />
+      <button className="primary" onClick={save}>Save password</button>
+      {msg && <span style={{ color: RED }}>{msg}</span>}
+    </div>
   );
 }
 
@@ -1810,6 +2081,36 @@ main{flex:1;padding:28px 32px 60px;max-width:1180px;min-width:0}
 .byline{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:700;color:#5A5648;background:#F2F0E8;border:1px solid ${LINE};border-radius:20px;padding:2px 9px}
 .byline i{width:16px;height:16px;border-radius:50%;background:${INK};color:#fff;font-style:normal;font-size:9px;font-weight:800;display:flex;align-items:center;justify-content:center}
 .chip.small{padding:4px 11px;font-size:12px}
+.filterLabel{font-size:10.5px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;opacity:.5;margin-bottom:6px;display:flex;gap:10px;align-items:baseline}
+.clearLink{color:${BLUE};opacity:1;letter-spacing:0;text-transform:none;font-size:12px;font-weight:700;cursor:pointer}
+.resultCount{font-size:12.5px;font-weight:600;opacity:.55}
+.tag.alt[data-hit="true"]{background:${BLUE};color:#fff}
+.tag.type{background:#F2EEE0;color:#7A5F22;border:1px solid #DDD0AC}
+.tag.area{background:#fff;color:${INK};border:1px solid ${INK}}
+.lastNote{font-size:12.5px;opacity:.7;margin-top:4px;line-height:1.4;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.lastNote b{font-family:'IBM Plex Mono',monospace;font-weight:600;font-size:11px;opacity:.8;margin-right:6px}
+.noteAdd{display:flex;flex-direction:column;gap:8px}
+.noteAddRow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.noteAddRow input[type=date]{width:auto;flex:0 0 170px}
+.noteLog{margin-top:14px;display:flex;flex-direction:column}
+.noteItem{display:flex;gap:12px;padding:10px 0;border-top:1px solid ${LINE};font-size:14px;line-height:1.45}
+.noteDate{font-family:'IBM Plex Mono',monospace;font-size:11.5px;font-weight:600;color:#9C7A2E;flex:0 0 78px;padding-top:2px}
+.noteWho{font-size:11px;opacity:.5;margin-top:3px}
+.convertRow{display:flex;flex-direction:column;gap:8px}
+.convertRow .ghost{text-align:left;background:#fff}
+.teamList{display:flex;flex-direction:column}
+.teamRow{display:flex;gap:12px;align-items:center;padding:12px 0;border-top:1px solid ${LINE};flex-wrap:wrap}
+.teamRow:first-child{border-top:none;padding-top:2px}
+.avatar{width:34px;height:34px;border-radius:50%;background:${INK};color:#fff;font-style:normal;font-size:12px;font-weight:800;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.youTag{margin-left:6px;font-size:10px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;background:#F2EEE0;color:#7A5F22;border:1px solid #DDD0AC;border-radius:4px;padding:1px 6px}
+.statusTag{font-size:11.5px;font-weight:700;margin-top:4px}
+.statusTag.active{color:${GREEN}}
+.statusTag.invited{color:#9C6B0B}
+.teamCtl{display:flex;gap:8px;align-items:center;margin-left:auto}
+.teamCtl select{width:130px;font-size:14px;padding:7px 9px}
+.danger.small{padding:7px 11px;font-size:13px}
+.roleList{display:flex;flex-direction:column;gap:6px}
+.roleList .visBtn{flex:0 0 auto}
 .visRow{display:flex;gap:10px;flex-wrap:wrap}
 .visBtn{flex:1 1 180px;text-align:left;background:#fff;border:1px solid ${LINE};border-radius:9px;padding:11px 14px;color:${INK}}
 .visBtn b{display:block;font-size:14px}
@@ -1970,7 +2271,73 @@ table.rr tbody tr:last-child td{border-bottom:none}
   .sheetActions{display:none}
 }
 @media (max-width:900px){.uwGrid{grid-template-columns:1fr}.uwSum{position:static}}
+/* ---- quick actions, last contacted ---- */
+.qa{display:flex;gap:6px;flex-wrap:wrap}
+.qaBtn{display:inline-flex;align-items:center;justify-content:center;min-width:54px;padding:7px 12px;border:1px solid ${LINE};border-radius:20px;background:#fff;color:${BLUE};font-size:13px;font-weight:700;text-decoration:none;line-height:1}
+.qaBtn:hover{border-color:${BLUE}}
+.qa.small .qaBtn{min-width:0;padding:5px 10px;font-size:12px}
+.fgroup > .qa{margin-top:4px}
+.lastTag{display:inline-flex;font-size:11.5px;font-weight:700;padding:3px 9px;border-radius:20px;background:#EEF3E6;color:#2E7D5B;width:fit-content}
+.lastTag.cold{background:#FBEAE8;color:${RED}}
+.lastTag.never{background:#F1EFE8;color:#6A6558}
+.dateWithBtn{display:flex;gap:6px}
+.dateWithBtn input{flex:1;min-width:0}
+.dateWithBtn .ghost{padding:8px 12px;font-size:13px;flex:0 0 auto}
+/* ---- today ---- */
+.today{background:#fff;border:1px solid ${LINE};border-radius:12px;padding:16px 18px;margin-bottom:22px}
+.todayHead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px}
+.todayHead h2{margin:0;font-size:18px;font-weight:800}
+.todayHead span{font-size:12.5px;font-weight:700;opacity:.55}
+.todayEmpty{font-size:13.5px;opacity:.6;padding:6px 0 2px;line-height:1.45}
+.todayRow{display:flex;align-items:center;gap:12px;padding:11px 0;border-top:1px solid ${LINE};cursor:pointer;flex-wrap:wrap}
+.todayRow:first-of-type{border-top:none}
+.todayRow .followTag{margin-top:0}
+.todayMain{flex:1 1 180px;min-width:0}
+.tag.kind{flex:0 0 auto;min-width:58px;text-align:center}
+.tag.kind.contact{background:#F2EEE0;color:#7A5F22;border:1px solid #DDD0AC}
+.tag.kind.buyer{background:#fff;color:${BLUE};border:1px solid ${BLUE}}
+.tag.kind.deal{background:${INK}}
+/* ---- deals board ---- */
+.seg{display:inline-flex;border:1px solid ${LINE};border-radius:8px;overflow:hidden;background:#fff}
+.seg button{border:none;background:none;padding:9px 14px;font-size:13.5px;font-weight:700;color:${INK};opacity:.6}
+.seg button[data-on="true"]{background:${INK};color:#fff;opacity:1}
+.tag.stage{background:#EAF0FB;color:${BLUE}}
+.board{display:grid;grid-template-columns:repeat(6,minmax(150px,1fr));gap:10px;overflow-x:auto;padding-bottom:10px;align-items:start}
+.boardCol{background:#EFEBDF;border-radius:10px;padding:8px;min-height:120px;transition:.15s}
+.boardCol[data-drop="1"]{outline:2px dashed #C9C2AE;outline-offset:-2px}
+.boardHead{display:flex;justify-content:space-between;align-items:center;font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;padding:2px 4px 10px;opacity:.75}
+.boardHead b{background:#fff;border-radius:20px;padding:1px 8px;font-size:11px}
+.boardEmpty{font-size:12px;opacity:.4;padding:14px 4px;text-align:center}
+.boardCard{background:#fff;border:1px solid ${LINE};border-radius:9px;padding:11px 12px;margin-bottom:8px;cursor:pointer}
+.boardCard:hover{border-color:${INK}}
+.boardPhoto{width:100%;height:90px;object-fit:cover;border-radius:6px;margin-bottom:8px;display:block}
+.boardAddr{font-weight:800;font-size:14.5px;line-height:1.25}
+.boardSub{font-size:12px;opacity:.55;margin-top:2px}
+.boardMeta{display:flex;justify-content:space-between;align-items:center;gap:6px;margin-top:8px;font-size:13px;font-weight:700}
+.matchCount{font-size:11px;font-weight:700;color:#2E7D5B;background:#EEF3E6;padding:2px 8px;border-radius:20px}
+.boardCard .followTag{margin-top:6px}
+.stageSel{margin-top:9px;width:100%;font-size:12.5px;padding:6px 8px}
+/* ---- buyers that fit (dark panel) ---- */
+.matchHint{font-size:12px;opacity:.6;margin:-6px 0 8px;line-height:1.4}
+.matchRow .matchMain{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}
+.matchRow span.matchCo{opacity:.6;font-weight:400}
+.matchHits{display:flex;gap:4px;flex-wrap:wrap}
+.matchRow span.hit{opacity:1;font-size:11px;font-weight:700;color:#BFE3CF;background:rgba(46,125,91,.28);padding:1px 7px;border-radius:20px}
+.matchRow span.hit.open{color:#EDEDE8;background:rgba(255,255,255,.1)}
+.matchRow span.lastTag{opacity:1;font-size:10.5px;padding:1px 7px;background:rgba(255,255,255,.1);color:#EDEDE8}
+.matchRow span.lastTag.never{background:rgba(255,255,255,.06);color:#B9B8B0}
+.matchRow span.lastTag.cold{background:rgba(224,80,64,.25);color:#FFC9C1}
+.matchRow{flex-direction:column;align-items:stretch;gap:7px;padding:10px 0}
+.matchRow .matchMain{gap:5px}
+.zpanel .qaBtn{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.18);color:#fff}
+
+.linkBtn{display:block;background:none;border:none;color:#D6B45C;font-weight:700;font-size:12.5px;padding:10px 0 0;text-decoration:none;text-align:left}
 @media (max-width:760px){
+  .board{grid-template-columns:repeat(6,78vw);scroll-snap-type:x mandatory}
+  .boardCol{scroll-snap-align:start}
+  .todayRow .qa{width:100%}
+  .zpanel .qa{flex-wrap:wrap}
+  .seg button{padding:8px 11px}
   .appShell{flex-direction:column}
   .sideBar{width:100%;height:auto;position:static;flex-direction:row;align-items:center;padding:12px 14px;gap:10px;overflow-x:auto}
   .brandWrap{margin-bottom:0}
