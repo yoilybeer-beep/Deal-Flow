@@ -1134,7 +1134,7 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName, openId, onOpen
                       <div className="boardAddr">{d.address || "Untitled"}</div>
                       <div className="boardSub">{[d.neighborhood, d.borough].filter(Boolean).join(" · ")}</div>
                       <div className="boardMeta">
-                        <span>{money(d.askingPrice)}</span>
+                        <span>{d.askingPrice ? money(d.askingPrice) : "No ask yet"}</span>
                         {n > 0 && <span className="matchCount">{n} buyer{n === 1 ? "" : "s"} fit</span>}
                       </div>
                       {fu && <div className={"followTag " + fu.cls}>● {fu.label}</div>}
@@ -2313,8 +2313,8 @@ table.rr tbody tr:last-child td{border-bottom:none}
 .boardPhoto{width:100%;height:90px;object-fit:cover;border-radius:6px;margin-bottom:8px;display:block}
 .boardAddr{font-weight:800;font-size:14.5px;line-height:1.25}
 .boardSub{font-size:12px;opacity:.55;margin-top:2px}
-.boardMeta{display:flex;justify-content:space-between;align-items:center;gap:6px;margin-top:8px;font-size:13px;font-weight:700}
-.matchCount{font-size:11px;font-weight:700;color:#2E7D5B;background:#EEF3E6;padding:2px 8px;border-radius:20px}
+.boardMeta{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-top:8px;font-size:13px;font-weight:700}
+.matchCount{white-space:nowrap;font-size:11px;font-weight:700;color:#2E7D5B;background:#EEF3E6;padding:2px 8px;border-radius:20px}
 .boardCard .followTag{margin-top:6px}
 .stageSel{margin-top:9px;width:100%;font-size:12.5px;padding:6px 8px}
 /* ---- buyers that fit (dark panel) ---- */
