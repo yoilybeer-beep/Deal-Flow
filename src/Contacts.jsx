@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { supabase } from "./supabaseClient";
-import { QuickActions, LastContactedTag } from "./crmKit";
+import { QuickActions, LastContactedTag, autoContact, sellerFromDeal, personFromBuyer, FollowUpQuick } from "./crmKit";
 
 /* ============================================================
    CONTACTS — owners, buyers, brokers, lenders
@@ -49,19 +49,52 @@ export default function Contacts({ notify, userId, userName, onGo, openId, onOpe
   const [type, setType] = useState("All");
   const [dueOnly, setDueOnly] = useState(false);
 
-  useEffect(() => {
-    (async () => {
-      const { data, error } = await supabase
-        .from("contacts")
-        .select("*, contact_notes(id, body, noted_at, author_name)")
-        .order("updated_at", { ascending: false });
-      if (error) notify?.(error.message);
-      const list = (data || []).map(({ contact_notes, ...r }) => ({ ...r, notes: sortNotes(contact_notes) }));
-      setRows(list);
-      if (openId) { const k = list.find((r) => r.id === openId); if (k) setForm({ ...k }); onOpened?.(); }
-      setLoaded(true);
-    })();
-  }, []);
+  const load = async (first) => {
+    const { data, error } = await supabase
+      .from("contacts")
+      .select("*, contact_notes(id, body, noted_at, author_name)")
+      .order("updated_at", { ascending: false });
+    if (error) notify?.(error.message);
+    const list = (data || []).map(({ contact_notes, ...r }) => ({ ...r, notes: sortNotes(contact_notes) }));
+    setRows(list);
+    if (first && openId) { const k = list.find((r) => r.id === openId); if (k) setForm({ ...k }); onOpened?.(); }
+    setLoaded(true);
+  };
+  useEffect(() => { load(true); }, []);
+
+  // one tap: every seller on a deal and every buyer becomes a contact (no duplicates)
+  const [syncing, setSyncing] = useState(false);
+  const syncFromDeals = async () => {
+    setSyncing(true);
+    try {
+      const [d, b, k] = await Promise.all([
+        supabase.from("deals").select("id, data, is_public"),
+        supabase.from("buyers").select("id, data, is_public"),
+        supabase.from("contacts").select("id, name, phone, email, address, area, type, converted_deal_id, converted_buyer_id, owner_id"),
+      ]);
+      if (k.error) { notify?.(k.error.message); return; }
+      const cache = k.data || [];
+      let created = 0, updated = 0, failed = 0;
+      const people = [
+        ...(d.data || []).map((r) => sellerFromDeal({ ...(r.data || {}), id: r.id, isPublic: r.is_public })),
+        ...(b.data || []).map((r) => personFromBuyer({ ...(r.data || {}), id: r.id, isPublic: r.is_public })),
+      ];
+      for (const person of people) {
+        const res = await autoContact(person, userId, cache);
+        if (res.status === "created") created++; else if (res.status === "updated") updated++; else if (res.status === "error") failed++;
+      }
+      await load(false);
+      notify?.(`Contacts synced: ${created} added, ${updated} updated${failed ? `, ${failed} couldn't be saved` : ""}.`);
+    } finally { setSyncing(false); }
+  };
+
+  // Done / next follow-up straight from the list
+  const quickFollow = async (k, nextDate) => {
+    const patch = { follow_up_date: nextDate || null, last_contacted: todayISO() };
+    setRows(rows.map((r) => (r.id === k.id ? { ...r, ...patch } : r)));
+    const { error } = await supabase.from("contacts").update({ ...patch, updated_at: new Date().toISOString() }).eq("id", k.id);
+    notify?.(error ? (error.message || "Couldn't update.") : nextDate ? `Next follow-up with ${k.name}: ${shortDate(nextDate)}` : `Follow-up with ${k.name} done.`);
+  };
 
   const filtered = useMemo(() => {
     const t = q.toLowerCase();
@@ -158,7 +191,12 @@ export default function Contacts({ notify, userId, userName, onGo, openId, onOpe
     <>
       <header className="pageHead">
         <h1>Contacts</h1>
-        <button className="primary" onClick={() => setForm(blankContact())}>+ New contact</button>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button className="ghost" onClick={syncFromDeals} disabled={syncing} title="Adds every seller on a deal and every buyer to Contacts. Skips anyone already here.">
+            {syncing ? "Syncing…" : "↻ Sync sellers & buyers"}
+          </button>
+          <button className="primary" onClick={() => setForm(blankContact())}>+ New contact</button>
+        </div>
       </header>
       <div className="filterRow">
         <input className="search" placeholder="Search name, phone, address, notes…" value={q} onChange={(e) => setQ(e.target.value)} />
@@ -193,6 +231,7 @@ export default function Contacts({ notify, userId, userName, onGo, openId, onOpe
                 <div style={{ display: "flex", gap: 4, margin: "5px 0 2px", flexWrap: "wrap" }}>
                   <span className="tag type">{typeLabel(c.type)}</span>
                   {c.area && <span className="tag area">{c.area}</span>}
+                  {c.converted_deal_id && <span className="tag seller">Seller on a deal</span>}
                 </div>
                 {c.address && <div className="rowSub">{c.address}</div>}
                 {last && <div className="lastNote"><b>{shortDate(last.noted_at)}</b>{last.body}</div>}
@@ -204,6 +243,9 @@ export default function Contacts({ notify, userId, userName, onGo, openId, onOpe
                   <LastContactedTag date={c.last_contacted} />
                   {fu && <div className={"followTag " + fu.cls} style={{ marginTop: 0 }}>● {fu.label}</div>}
                 </div>
+                {fu && fu.days <= 0 && (
+                  <FollowUpQuick compact onDone={() => quickFollow(c, null)} onNext={(d) => quickFollow(c, d)} />
+                )}
                 <span className="rowSub" style={{ marginTop: 2 }}>{(c.notes || []).length} note{(c.notes || []).length === 1 ? "" : "s"}</span>
               </div>
             </div>
@@ -321,7 +363,7 @@ function ContactForm({ c, setC, onSave, onCancel, onDelete, isNew, mine, userId,
                   {c.converted_buyer_id ? "✓ In Buyers · open" : "→ Convert to Buyer"}
                 </button>
                 <button className="ghost" data-on={!!c.converted_deal_id} onClick={onToDeal}>
-                  {c.converted_deal_id ? "✓ Deal created · open" : "→ Convert to Seller / Deal"}
+                  {c.converted_deal_id ? "✓ On a deal · open" : "→ Convert to Seller / Deal"}
                 </button>
               </div>
               <div className="hintline">Buyer copies name, phone, email, area and notes into Buyers. Seller opens a deal on the Deal Desk with this address and {c.name ? c.name.split(" ")[0] : "the contact"} as the seller.</div>

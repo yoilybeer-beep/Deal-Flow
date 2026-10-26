@@ -3,7 +3,7 @@ import Papa from "papaparse";
 import { supabase } from "./supabaseClient";
 import Contacts from "./Contacts";
 import Team from "./Team";
-import { QuickActions, LastContactedTag, lastContacted, todayISO } from "./crmKit";
+import { QuickActions, LastContactedTag, lastContacted, todayISO, autoContact, sellerFromDeal, personFromBuyer, FollowUpQuick, shortDay } from "./crmKit";
 
 /* ============================================================
    JSTONE REALTY — DEAL PLATFORM
@@ -91,23 +91,56 @@ const DEAL_ZONES = {
   'M1-2/R6 (MX)':'R6A','M1-4/R7A (MX)':'R7A',
   'Custom':null,
 };
+/* Commercial districts -> residential equivalent (ZR 34-112 / 35-23), used when an
+   address lookup brings back a district that isn't in the picker above. */
+const COMM_EQUIV = {
+  'C1-6':'R7-2','C2-6':'R7-2','C1-6A':'R7A','C2-6A':'R7A','C1-7':'R8','C2-7':'R8','C1-7A':'R8A','C2-7A':'R8A',
+  'C1-8':'R9','C2-8':'R9','C1-8A':'R9A','C2-8A':'R9A','C1-8X':'R9X','C2-8X':'R9X','C1-9':'R10','C2-9':'R10','C1-9A':'R10A','C2-9A':'R10A',
+  'C4-1':'R5','C4-2':'R6','C4-2A':'R6A','C4-3':'R6','C4-3A':'R6A','C4-4':'R7-2','C4-4A':'R7A','C4-4D':'R8A','C4-4L':'R7A',
+  'C4-5':'R7-2','C4-5A':'R7A','C4-5D':'R7D','C4-5X':'R7X','C4-6':'R10','C4-6A':'R10A','C4-7':'R10','C4-7A':'R10A',
+  'C5-1':'R10','C5-1A':'R10A','C5-2':'R10','C5-2A':'R10A','C5-3':'R10','C5-5':'R10',
+  'C6-1':'R7-2','C6-1A':'R6','C6-2':'R8','C6-2A':'R8A','C6-3':'R9','C6-3A':'R9A','C6-3D':'R9D','C6-3X':'R9X',
+  'C6-4':'R10','C6-4A':'R10A','C6-4X':'R10X','C6-5':'R10','C6-6':'R10','C6-7':'R10','C6-9':'R10',
+};
+// any district label -> the residential district we have FARs for (null = use the typed / looked-up FAR)
+function resolveDistrict(label) {
+  if (!label) return null;
+  if (label in DEAL_ZONES) return DEAL_ZONES[label];
+  const z = String(label).toUpperCase().trim();
+  if (farDB[z]) return z;
+  if (COMM_EQUIV[z]) return COMM_EQUIV[z];
+  if (z.includes('/')) { const r = z.split('/').map((s) => s.trim()).find((s) => farDB[s]); if (r) return r; }   // MX: M1-4/R7A
+  return null;
+}
+const isStreetSensitive = (label) => streetSensitive.includes(resolveDistrict(label));
 function farFor(district, street) {
   const e = farDB[district];
   if (!e) return null;
   return streetSensitive.includes(district) ? e[street === 'wide' ? 'wide' : 'narrow'] : e;
 }
 function computeZoning(zoneLabel, street, lotArea, customFar) {
-  const district = DEAL_ZONES[zoneLabel];
+  const district = resolveDistrict(zoneLabel);
   const area = parseFloat(lotArea) || 0;
   if (!district) {
     const base = parseFloat(customFar) || 0;
-    return { district: null, baseFar: base, uapFar: base ? base * 1.2 : 0,
-             baseZfa: base * area, uapZfa: base ? base * 1.2 * area : null };
+    const uap = zoneLabel === 'Custom' && base ? base * 1.2 : 0;   // looked-up districts we can't map get no UAP guess
+    return { district: null, baseFar: base, uapFar: uap,
+             baseZfa: base * area, uapZfa: uap ? uap * area : null };
   }
   const v = farFor(district, street);
   if (!v) return null;
   return { district, baseFar: v.aor, uapFar: v.uap,
            baseZfa: v.aor * area, uapZfa: v.uap ? v.uap * area : null };
+}
+
+// buildable SF shown on cards: the typed override, else lot x FAR on the chosen path
+function dealBuildable(d) {
+  const o = parseFloat(d.buildableSf);
+  if (o > 0) return o;
+  const z = computeZoning(d.zone, d.streetWidth, d.lotArea, d.customFar);
+  if (!z) return null;
+  const v = d.devPath === 'uap' && z.uapZfa ? z.uapZfa : z.baseZfa;
+  return v > 0 ? v : null;
 }
 
 const BOROUGHS = ['Bronx','Brooklyn','Queens','Manhattan','Staten Island'];
@@ -128,6 +161,15 @@ const pct = (n) => (isNaN(n) ? '—' : Number(n).toFixed(1) + '%');
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const N = (v) => { const x = parseFloat(v); return isNaN(x) ? 0 : x; };
 
+// one clause for the save toast about the auto-contact
+function contactNote(c, who) {
+  if (!c) return "";
+  if (c.status === "created") return ` ${who} added to Contacts.`;
+  if (c.status === "updated") return ` ${who}'s contact updated.`;
+  if (c.status === "error") return ` (Couldn't add to Contacts: ${c.error})`;
+  return "";
+}
+
 /* ---------- follow-up date status (today, relative to the device clock) ---------- */
 function followUpStatus(dateStr) {
   if (!dateStr) return null;
@@ -147,7 +189,7 @@ function followUpStatus(dateStr) {
 // buyer actually has filled in and that fits counts as a "hit"; best fits first.
 function matchBuyers(deal, buyers) {
   const z = computeZoning(deal.zone, deal.streetWidth, deal.lotArea, deal.customFar);
-  const bsf = z ? Math.max(z.baseZfa, z.uapZfa || 0) : 0;
+  const bsf = dealBuildable(deal) || (z ? Math.max(z.baseZfa, z.uapZfa || 0) : 0);
   const price = parseFloat(deal.askingPrice) || null;
   const type = deal.assetType || '';
   const out = [];
@@ -182,6 +224,7 @@ function buildShareText(deal) {
       L.push(`With UAP: ~${fmt(z.uapZfa)} BSF${uapPer}${uapPath ? '  ←' : ''}`);
     }
   }
+  if (parseFloat(deal.buildableSf) > 0) L.push(`Buildable (provided): ~${fmt(deal.buildableSf)} SF`);
   if (deal.existingSf) L.push(`Existing building: ${fmt(deal.existingSf)} SF`);
   if (deal.vacancy && deal.vacancy !== 'TBD') L.push(deal.vacancy);
   L.push('');
@@ -297,7 +340,7 @@ function blankModel() {
 /* ---------- prefill a model from a Deal Desk deal ---------- */
 function modelFromDeal(deal) {
   const m = blankModel();
-  const district = DEAL_ZONES[deal.zone] || "";
+  const district = resolveDistrict(deal.zone) || "";
   const uapPath = deal.devPath === "uap";
   m.dealId = deal.id;
   m.dealName = deal.address || "Untitled Site";
@@ -318,6 +361,7 @@ function modelFromDeal(deal) {
     m.far = N(deal.customFar);
     m.actualBuildingSF = Math.round(m.lotSF * N(deal.customFar));
   }
+  if (N(deal.buildableSf) > 0) m.actualBuildingSF = Math.round(N(deal.buildableSf));   // his own buildable number wins
   return m;
 }
 
@@ -932,7 +976,7 @@ const blankDeal = () => ({
   id: uid(), address: "", borough: "Bronx", neighborhood: "", zone: "R6", photos: [],
   streetWidth: "narrow", devPath: "aor", lotArea: "", customFar: "", askingPrice: "", sellerNumber: "",
   vacancy: "TBD", existingSf: "", contactName: "", contactPhone: "", contactEmail: "", notes: "",
-  followUpDate: "", followUpNotes: "", isPublic: false, stage: "New", assetType: "",
+  followUpDate: "", followUpNotes: "", isPublic: false, stage: "New", assetType: "", buildableSf: "", lot: null, autoFilled: {},
   created: new Date().toISOString().slice(0, 10),
 });
 const blankBuyer = () => ({
@@ -993,7 +1037,10 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName, openId, onOpen
     const { error } = await supabase.from("deals").upsert({
       id: rec.id, data: rec, owner_id: rec._owner || userId, is_public: !!rec.isPublic, updated_at: new Date().toISOString(),
     });
-    notify?.(error ? (error.message || "Save failed.") : (rec.isPublic ? "Deal saved and published to the team." : "Deal saved — visible only to you."));
+    if (error) return notify?.(error.message || "Save failed.");
+    const base = rec.isPublic ? "Deal saved and published to the team." : "Deal saved — visible only to you.";
+    const c = await autoContact(sellerFromDeal(rec), userId);
+    notify?.(base + contactNote(c, rec.contactName || "Seller"));
   };
   // stage change from the board (dropdown or drag) saves right away
   const setStage = async (d, stage) => {
@@ -1004,6 +1051,19 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName, openId, onOpen
     setDeals(deals.map((x) => (x.id === d.id ? rec : x)));
     const { error } = await supabase.from("deals").update({ data: rec, updated_at: new Date().toISOString() }).eq("id", d.id);
     notify?.(error ? (error.message || "Couldn't move the deal.") : `${d.address || "Deal"} → ${stage}`);
+  };
+  // follow-up Done / next date, from the board or the open deal; saves right away
+  const followDeal = async (d, nextDate) => {
+    const mine = !d._owner || d._owner === userId;
+    if (!mine) return notify?.("Only the person who added this deal can change its follow-up.");
+    const patch = { followUpDate: nextDate || "", lastFollowUp: todayISO() };
+    const saved = deals.find((x) => x.id === d.id);
+    if (dealForm && dealForm.id === d.id) setDealForm((f) => ({ ...f, ...patch }));
+    if (!saved) return;   // a new, unsaved deal: the form keeps it until Save
+    const rec = { ...saved, ...patch };
+    setDeals(deals.map((x) => (x.id === d.id ? rec : x)));
+    const { error } = await supabase.from("deals").update({ data: rec, updated_at: new Date().toISOString() }).eq("id", d.id);
+    notify?.(error ? (error.message || "Couldn't update the follow-up.") : nextDate ? `Next follow-up: ${shortDay(nextDate)}` : "Follow-up done ✓");
   };
   const deleteDeal = async (id) => {
     const d = deals.find((x) => x.id === id);
@@ -1023,7 +1083,9 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName, openId, onOpen
     const { error } = await supabase.from("buyers").upsert({
       id: rec.id, data: rec, owner_id: rec._owner || userId, is_public: !!rec.isPublic, updated_at: new Date().toISOString(),
     });
-    notify?.(error ? (error.message || "Save failed.") : keepOpen ? "Call logged." : "Buyer saved.");
+    if (error) return notify?.(error.message || "Save failed.");
+    const c = await autoContact(personFromBuyer(rec), userId);
+    notify?.((keepOpen ? "Call logged." : "Buyer saved.") + contactNote(c, rec.name));
   };
   const deleteBuyer = async (id) => {
     setBuyers(buyers.filter((b) => b.id !== id));
@@ -1053,7 +1115,11 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName, openId, onOpen
         const { error } = await supabase.from("buyers").upsert(imported.map((b) => ({
           id: b.id, data: { ...b, ownerName: userName }, owner_id: userId, is_public: false, updated_at: now,
         })));
-        setImportMsg(error ? (error.message || "Import failed to save.") : `Imported ${imported.length} contacts. Open each to tag boroughs and criteria.`);
+        if (error) return setImportMsg(error.message || "Import failed to save.");
+        const cache = (await supabase.from("contacts").select("id, name, phone, email, address, area, type, converted_deal_id, converted_buyer_id, owner_id")).data;
+        let added = 0;
+        if (cache) for (const b of imported) { const c = await autoContact(personFromBuyer(b), userId, cache); if (c.status === "created") added++; }
+        setImportMsg(`Imported ${imported.length} buyers${added ? ` (${added} new in Contacts)` : ""}. Open each to tag boroughs and criteria.`);
       },
       error: () => setImportMsg("Couldn't read that file. Export your CRM as CSV and try again."),
     });
@@ -1127,17 +1193,22 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName, openId, onOpen
                 {col.map((d) => {
                   const fu = followUpStatus(d.followUpDate);
                   const n = matchBuyers(d, buyers).length;
+                  const bsf = dealBuildable(d);
                   return (
                     <div key={d.id} className="boardCard" draggable onDragStart={() => setDragId(d.id)} onDragEnd={() => setDragId(null)}
                       onClick={() => setDealForm({ ...d })}>
                       {d.photos?.[0] && <img className="boardPhoto" src={photoUrl(d.photos[0])} alt="" loading="lazy" />}
                       <div className="boardAddr">{d.address || "Untitled"}</div>
+                      {d.contactName && <div className="boardSeller">{d.contactName}</div>}
                       <div className="boardSub">{[d.neighborhood, d.borough].filter(Boolean).join(" · ")}</div>
+                      {bsf ? <div className="boardBsf">{fmt(bsf)} buildable SF{d.zone && d.zone !== "Custom" ? ` · ${d.zone}` : ""}</div>
+                        : <div className="boardBsf none">Buildable — add lot size</div>}
                       <div className="boardMeta">
                         <span>{d.askingPrice ? money(d.askingPrice) : "No ask yet"}</span>
                         {n > 0 && <span className="matchCount">{n} buyer{n === 1 ? "" : "s"} fit</span>}
                       </div>
                       {fu && <div className={"followTag " + fu.cls}>● {fu.label}</div>}
+                      {fu && fu.days <= 0 && <FollowUpQuick compact onDone={() => followDeal(d, null)} onNext={(x) => followDeal(d, x)} />}
                       <select className="stageSel" value={s} onClick={(e) => e.stopPropagation()} onChange={(e) => setStage(d, e.target.value)}>
                         {DEAL_STAGES.map((x) => <option key={x}>{x}</option>)}
                       </select>
@@ -1172,8 +1243,9 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName, openId, onOpen
                 <button className="shareBtn" onClick={(e) => { e.stopPropagation(); setShareFor(d); }}>Share ↗</button>
               </div>
               <div className="cardAddr">{d.address || "Untitled"}</div>
-              {d.neighborhood && <div className="cardSub">{d.neighborhood}</div>}
+              {(d.contactName || d.neighborhood) && <div className="cardSub">{[d.contactName, d.neighborhood].filter(Boolean).join(" · ")}</div>}
               {fu && <div className={"followTag " + fu.cls}>● {fu.label}</div>}
+              {fu && fu.days <= 0 && <FollowUpQuick compact onDone={() => followDeal(d, null)} onNext={(x) => followDeal(d, x)} />}
               <div className="cardStats">
                 <div><label>Ask</label><b>{money(d.askingPrice)}</b></div>
                 <div><label>Lot</label><b>{fmt(d.lotArea)} SF</b></div>
@@ -1205,6 +1277,7 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName, openId, onOpen
         isNew={!deals.some((d) => d.id === dealForm.id)}
         mine={!dealForm._owner || dealForm._owner === userId}
         notify={notify}
+        onFollow={(x) => followDeal(dealForm, x)}
       />
       {shareFor && <ShareSheet deal={shareFor} onClose={() => setShareFor(null)} notify={notify} />}
     </>
@@ -1301,7 +1374,7 @@ function ZoningCalc() {
   const [lot, setLot] = useState("");
   const [far, setFar] = useState("");
   const [price, setPrice] = useState("");
-  const ss = ["R6", "R7-1", "R7-2", "R8"].includes(DEAL_ZONES[zone]);
+  const ss = isStreetSensitive(zone);
   return (
     <>
       <header className="pageHead"><h1>Zoning calculator</h1></header>
@@ -1347,7 +1420,7 @@ function ZoningCalc() {
 }
 
 /* ============================================================ */
-function ZoningPanel({ zone, streetWidth, lotArea, customFar, askingPrice, devPath }) {
+function ZoningPanel({ zone, streetWidth, lotArea, customFar, askingPrice, devPath, buildableSf }) {
   const z = computeZoning(zone, streetWidth, lotArea, customFar);
   if (!z) return null;
   const ask = parseFloat(askingPrice);
@@ -1357,6 +1430,7 @@ function ZoningPanel({ zone, streetWidth, lotArea, customFar, askingPrice, devPa
     <div className="zpanel">
       <div className="zpanelTitle">Zoning analysis · {zone}{ss ? ` · ${streetWidth} street` : ""} · {uapPath ? "UAP" : "as-of-right"}</div>
       <div className="zgrid">
+        {parseFloat(buildableSf) > 0 && <div className="zcell big" style={{ gridColumn: "1 / -1" }}><label>Buildable · your number</label><div className="znum brass">{fmt(buildableSf)} <small>SF</small></div></div>}
         <div className="zcell"><label>Base FAR</label><div className="znum">{z.baseFar ? z.baseFar.toFixed(2) : "—"}</div></div>
         <div className="zcell"><label>UAP FAR</label><div className="znum">{z.uapFar ? z.uapFar.toFixed(2) : "n/a"}</div></div>
         <div className="zcell big" data-dim={uapPath}><label>Buildable — as of right</label><div className="znum brass">{fmt(z.baseZfa)} <small>SF</small></div></div>
@@ -1373,14 +1447,141 @@ function ZoningPanel({ zone, streetWidth, lotArea, customFar, askingPrice, devPa
   );
 }
 
-function DealForm({ deal, setDeal, buyers, onSave, onCancel, onDelete, onShare, onUnderwrite, isNew, mine = true, notify }) {
-  const set = (k) => (e) => setDeal({ ...deal, [k]: e.target.value });
+/* ============================================================
+   NYC lot lookup (free, public, called from the browser)
+   address -> GeoSearch (BBL) -> PLUTO (lot area, zoning, FARs, built SF)
+   PLUTO is asked two ways at once (NYC Open Data + NYC Planning's
+   MapPLUTO); whichever answers first wins.
+   ============================================================ */
+const PLUTO_FIELDS = 'bbl,address,zonedist1,zonedist2,spdist1,overlay1,lotarea,bldgarea,residfar,commfar,facilfar,builtfar,ownername,lotfront,numfloors,unitsres,yearbuilt';
+async function fetchJson(url, ms = 9000) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), ms);
+  try {
+    const r = await fetch(url, { signal: ctl.signal });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
+const titleCase = (s) => String(s || '').toLowerCase().replace(/\b([a-z])/g, (m) => m.toUpperCase())
+  .replace(/\b(Llc|Lp|Llp|Ny|Nyc|Usa)\b/g, (m) => m.toUpperCase());
+async function geoSearch(text) {
+  const j = await fetchJson(`https://geosearch.planninglabs.nyc/v2/search?size=8&text=${encodeURIComponent(text)}`);
+  const seen = new Set(), out = [];
+  for (const f of j.features || []) {
+    const pr = f.properties || {};
+    const bbl = pr.addendum?.pad?.bbl;
+    if (!bbl || seen.has(bbl)) continue;
+    seen.add(bbl);
+    out.push({ label: titleCase(String(pr.label || '').replace(/, NY, USA$/i, '')).replace(/, (Bronx|Brooklyn|Queens|Manhattan|Staten Island)$/i, ''),
+      bbl: String(bbl), borough: pr.borough, neighborhood: pr.neighbourhood || '' });
+  }
+  return out.slice(0, 4);
+}
+async function plutoLot(bbl) {
+  const soda = fetchJson(`https://data.cityofnewyork.us/resource/64uk-42ks.json?$select=${PLUTO_FIELDS}&bbl=${bbl}`)
+    .then((r) => { if (!r?.length) throw new Error('none'); return { ...r[0], src: 'NYC Open Data · PLUTO' }; });
+  const carto = fetchJson(`https://planninglabs.carto.com/api/v2/sql?q=${encodeURIComponent(`SELECT ${PLUTO_FIELDS} FROM dcp_mappluto WHERE bbl=${Number(bbl)}`)}`)
+    .then((r) => { if (!r?.rows?.length) throw new Error('none'); return { ...r.rows[0], src: 'NYC Planning · MapPLUTO' }; });
+  try { return await Promise.any([soda, carto]); }
+  catch (e) {
+    const all = await Promise.allSettled([soda, carto]);
+    if (all.every((x) => x.status === 'rejected' && x.reason?.message === 'none')) return null;   // both answered: no such lot
+    throw new Error('City data did not answer');
+  }
+}
+const bblParts = (bbl) => { const s = String(bbl || '').replace(/\D/g, '').padEnd(10, '0').slice(0, 10); return { boro: s[0], block: String(parseInt(s.slice(1, 6), 10)), lot: String(parseInt(s.slice(6, 10), 10)) }; };
+const zolaUrl = (bbl) => { const b = bblParts(bbl); return `https://zola.planning.nyc.gov/l/lot/${b.boro}/${b.block}/${b.lot}`; };
+const mapsUrl = (d) => `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent([d.address, d.borough, 'NY'].filter(Boolean).join(', '))}`;
+const roundSf = (v) => { const n = parseFloat(v); return n > 0 ? String(Math.round(n)) : ''; };
+// a PLUTO row -> the deal fields it fills (zone kept exactly as the city writes it)
+function lotFields(hit, lot) {
+  const zd = String(lot.zonedist1 || '').toUpperCase().trim();
+  const maxFar = Math.max(N(lot.residfar), N(lot.commfar));
+  return {
+    zone: zd || 'Custom',
+    customFar: resolveDistrict(zd) ? '' : (maxFar ? String(+maxFar.toFixed(2)) : ''),
+    lotArea: roundSf(lot.lotarea),
+    existingSf: roundSf(lot.bldgarea),
+    borough: BOROUGHS.includes(hit.borough) ? hit.borough : '',
+    neighborhood: hit.neighborhood || '',
+  };
+}
+
+function DealForm({ deal, setDeal, buyers, onSave, onCancel, onDelete, onShare, onUnderwrite, isNew, mine = true, notify, onFollow }) {
+  const touched = useRef(new Set());   // fields typed by hand in this visit: a lookup never overwrites them
+  const set = (k) => (e) => { touched.current.add(k); setDeal({ ...deal, [k]: e.target.value }); };
+
+  /* ---- auto zoning: look the address up and fill what the city knows ---- */
+  const [look, setLook] = useState({ state: deal.lot ? "found" : "idle", hits: [] });
+  const reqId = useRef(0);
+  const applyLot = (hit, lot, force) => {
+    const vals = lotFields(hit, lot);
+    setDeal((d) => {
+      const prev = d.autoFilled || {};
+      const next = { ...d };
+      const filled = {};
+      for (const [k, v] of Object.entries(vals)) {
+        if (!v) continue;
+        const cur = d[k] == null ? "" : String(d[k]);
+        const untouched = !touched.current.has(k) && (cur === "" || cur === String(prev[k] ?? "") || (isNew && (k === "zone" || k === "borough")));
+        if (force ? !touched.current.has(k) || cur === "" : untouched) { next[k] = v; filled[k] = v; }
+      }
+      const { boro, block, lot: lt } = bblParts(lot.bbl || hit.bbl);
+      next.lot = {
+        bbl: String(hit.bbl), boro, block, lot: lt, label: hit.label, query: d.address,
+        zonedist1: lot.zonedist1 || "", zonedist2: lot.zonedist2 || "", spdist1: lot.spdist1 || "", overlay1: lot.overlay1 || "",
+        residfar: N(lot.residfar), commfar: N(lot.commfar), facilfar: N(lot.facilfar), builtfar: N(lot.builtfar),
+        lotarea: N(lot.lotarea), bldgarea: N(lot.bldgarea), ownername: lot.ownername || "", lotfront: N(lot.lotfront),
+        numfloors: N(lot.numfloors), unitsres: N(lot.unitsres), yearbuilt: N(lot.yearbuilt) || "",
+        src: lot.src, at: new Date().toISOString(),
+      };
+      next.autoFilled = { ...prev, ...filled };
+      return next;
+    });
+  };
+  const runLookup = async (hitOverride) => {
+    const address = (deal.address || "").trim();
+    if (!hitOverride && (address.length < 5 || !/\d/.test(address))) return;
+    const id = ++reqId.current;
+    setLook((l) => ({ ...l, state: "looking" }));
+    try {
+      let hits = look.hits, hit = hitOverride;
+      if (!hit) {
+        const named = /\b(bronx|brooklyn|queens|manhattan|staten island|new york|ny)\b/i.test(address);
+        hits = await geoSearch(address);
+        if (!hits.length && !named && deal.borough) hits = await geoSearch(`${address}, ${deal.borough}`);
+        // a borough picked by hand wins over the top guess
+        hit = (touched.current.has("borough") && hits.find((h) => h.borough === deal.borough)) || hits[0];
+      }
+      if (id !== reqId.current) return;
+      if (!hit) { setLook({ state: "notfound", hits: [] }); return; }
+      const lot = await plutoLot(hit.bbl);
+      if (id !== reqId.current) return;
+      if (!lot) { setLook({ state: "nolot", hits, hit }); return; }
+      applyLot(hit, lot, !!hitOverride);
+      setLook({ state: "found", hits, hit });
+    } catch (e) {
+      if (id === reqId.current) setLook((l) => ({ ...l, state: "error", msg: e.message }));
+    }
+  };
+  useEffect(() => {
+    if (!mine) return;
+    const address = (deal.address || "").trim();
+    if (deal.lot && deal.lot.query === deal.address) return;   // already looked up
+    if (address.length < 5 || !/\d/.test(address)) return;
+    const t = setTimeout(() => runLookup(), 900);
+    return () => clearTimeout(t);
+  }, [deal.address]);
+  const lotInfo = deal.lot;
+  const zEst = computeZoning(deal.zone, deal.streetWidth, deal.lotArea, deal.customFar);
+  const estBsf = zEst ? (deal.devPath === "uap" && zEst.uapZfa ? zEst.uapZfa : zEst.baseZfa) : 0;
   const [arm, setArm] = useState(false);
   const [busy, setBusy] = useState(false);
   const photoRef = useRef(null);
   const matches = matchBuyers(deal, buyers);
   const [showAll, setShowAll] = useState(false);
-  const ss = ["R6", "R7-1", "R7-2", "R8"].includes(DEAL_ZONES[deal.zone]);
+  const ss = isStreetSensitive(deal.zone);
 
   const upload = async (files) => {
     setBusy(true);
@@ -1439,7 +1640,65 @@ function DealForm({ deal, setDeal, buyers, onSave, onCancel, onDelete, onShare, 
           )}
           <div className="fgroup">
             <div className="ftitle">Property</div>
-            <div className="frow"><Fld label="Address *" wide><input value={deal.address} onChange={set("address")} placeholder="1982 Belmont Ave" /></Fld></div>
+            <div className="frow"><Fld label="Address *" wide><input value={deal.address} onChange={set("address")} placeholder="1982 Belmont Ave" autoComplete="off" /></Fld></div>
+            {mine && look.state === "looking" && <div className="lookBox busy">Looking up NYC zoning for this address…</div>}
+            {mine && look.state === "notfound" && <div className="lookBox warn">Couldn't find that address in NYC records. Add the borough or check the spelling, or fill zoning by hand.</div>}
+            {mine && look.state === "nolot" && <div className="lookBox warn">Found {look.hit?.label}, but the city has no lot data for it. Fill zoning by hand.</div>}
+            {mine && look.state === "error" && (
+              <div className="lookBox warn">City data didn't answer. <button className="linkBtn inline" onClick={() => runLookup()}>Try again</button></div>
+            )}
+            {lotInfo && look.state !== "looking" && (
+              <div className="lookBox found">
+                <div className="lookHead">
+                  <b>✓ {lotInfo.label}</b>
+                  <span>Block {lotInfo.block} · Lot {lotInfo.lot}</span>
+                </div>
+                <div className="lookFacts">
+                  <span><label>Zoning</label>{[lotInfo.zonedist1, lotInfo.zonedist2].filter(Boolean).join(" / ") || "—"}{lotInfo.spdist1 ? ` · ${lotInfo.spdist1}` : ""}{lotInfo.overlay1 ? ` · ${lotInfo.overlay1}` : ""}</span>
+                  <span><label>Lot</label>{lotInfo.lotarea ? fmt(lotInfo.lotarea) + " SF" : "—"}{lotInfo.lotfront ? ` · ${fmt(lotInfo.lotfront)} ft front` : ""}</span>
+                  <span><label>Built</label>{lotInfo.bldgarea ? fmt(lotInfo.bldgarea) + " SF" : "Vacant / none"}{lotInfo.numfloors ? ` · ${fmt(lotInfo.numfloors)} fl` : ""}{lotInfo.yearbuilt ? ` · ${lotInfo.yearbuilt}` : ""}</span>
+                  <span><label>City FAR</label>resi {lotInfo.residfar || 0} · comm {lotInfo.commfar || 0} · facility {lotInfo.facilfar || 0}</span>
+                </div>
+                {lotInfo.ownername && !/unavailable/i.test(lotInfo.ownername) && (
+                  <div className="lookOwner">
+                    Owner of record: <b>{titleCase(lotInfo.ownername)}</b>
+                    {mine && !deal.contactName && (
+                      <button className="linkBtn inline" onClick={() => setDeal({ ...deal, contactName: titleCase(lotInfo.ownername) })}>Use as seller</button>
+                    )}
+                  </div>
+                )}
+                <div className="lookLinks">
+                  <a href={zolaUrl(lotInfo.bbl)} target="_blank" rel="noreferrer">ZoLa ↗</a>
+                  <a href={mapsUrl(deal)} target="_blank" rel="noreferrer">Google Maps ↗</a>
+                  {mine && <button className="linkBtn inline" onClick={() => { touched.current.clear(); runLookup(); }}>Look up again</button>}
+                </div>
+                {mine && look.hits?.length > 1 && look.state === "found" && (
+                  <div className="lookAlt">Not this one?{" "}
+                    {look.hits.filter((h) => h.bbl !== lotInfo.bbl).slice(0, 3).map((h) => (
+                      <button key={h.bbl} className="chip small" onClick={() => runLookup(h)}>{h.label}, {h.borough}</button>
+                    ))}
+                  </div>
+                )}
+                {mine && (() => {
+                  const city = lotFields({}, lotInfo);
+                  const diffs = [
+                    city.zone && resolveDistrict(city.zone) !== resolveDistrict(deal.zone) && city.zone !== deal.zone ? `zoning ${deal.zone} → ${city.zone}` : null,
+                    city.lotArea && String(deal.lotArea || "") !== city.lotArea ? `lot ${deal.lotArea ? fmt(deal.lotArea) : "blank"} → ${fmt(city.lotArea)}` : null,
+                    city.existingSf && String(deal.existingSf || "") !== city.existingSf ? `built ${deal.existingSf ? fmt(deal.existingSf) : "blank"} → ${fmt(city.existingSf)}` : null,
+                  ].filter(Boolean);
+                  if (!diffs.length) return null;
+                  return (
+                    <div className="lookDiff">City data differs: {diffs.join(" · ")}.{" "}
+                      <button className="linkBtn inline" onClick={() => setDeal({ ...deal, zone: city.zone, customFar: city.customFar, lotArea: city.lotArea || deal.lotArea, existingSf: city.existingSf || deal.existingSf })}>Use city data</button>
+                    </div>
+                  );
+                })()}
+                <div className="lookNote">Auto-filled from {lotInfo.src || "NYC PLUTO"} — an estimate. Edit any number below; confirm on ZoLa before you quote it.</div>
+              </div>
+            )}
+            {!lotInfo && deal.address.trim() && look.state !== "looking" && (
+              <div className="lookLinks solo"><a href={mapsUrl(deal)} target="_blank" rel="noreferrer">Google Maps ↗</a></div>
+            )}
             <div className="frow">
               <Fld label="Borough"><select value={deal.borough} onChange={set("borough")}>{BOROUGHS.map((b) => <option key={b}>{b}</option>)}</select></Fld>
               <Fld label="Neighborhood"><input value={deal.neighborhood} onChange={set("neighborhood")} placeholder="Belmont / Fordham" /></Fld>
@@ -1476,16 +1735,13 @@ function DealForm({ deal, setDeal, buyers, onSave, onCancel, onDelete, onShare, 
           <div className="fgroup">
             <div className="ftitle">Zoning & size</div>
             <div className="frow">
-              <Fld label="Zoning district"><select value={deal.zone} onChange={set("zone")}>{Object.keys(DEAL_ZONES).map((z) => <option key={z}>{z}</option>)}</select></Fld>
-              {ss && (
-                <Fld label="Street">
-                  <select value={deal.streetWidth} onChange={set("streetWidth")}>
-                    <option value="narrow">Narrow (&lt;75 ft)</option>
-                    <option value="wide">Wide (≥75 ft)</option>
-                  </select>
-                </Fld>
-              )}
-              {deal.zone === "Custom" && <Fld label="Custom FAR"><input type="number" value={deal.customFar} onChange={set("customFar")} placeholder="3.0" /></Fld>}
+              <Fld label="Zoning district">
+                <select value={deal.zone} onChange={set("zone")}>
+                  {deal.zone && !(deal.zone in DEAL_ZONES) && <option value={deal.zone}>{deal.zone}{resolveDistrict(deal.zone) && resolveDistrict(deal.zone) !== deal.zone ? ` (${resolveDistrict(deal.zone)} equiv)` : ""}</option>}
+                  {Object.keys(DEAL_ZONES).map((z) => <option key={z}>{z}</option>)}
+                </select>
+              </Fld>
+              {!resolveDistrict(deal.zone) && <Fld label={deal.zone === "Custom" ? "Custom FAR" : "Max FAR (city data)"}><input type="number" value={deal.customFar} onChange={set("customFar")} placeholder="3.0" /></Fld>}
               <Fld label="Development path">
                 <select value={deal.devPath || "aor"} onChange={set("devPath")}>
                   <option value="aor">As-of-right</option>
@@ -1494,7 +1750,25 @@ function DealForm({ deal, setDeal, buyers, onSave, onCancel, onDelete, onShare, 
               </Fld>
               <Fld label="Lot area (SF)"><input type="number" value={deal.lotArea} onChange={set("lotArea")} placeholder="5000" /></Fld>
               <Fld label="Existing bldg SF"><input type="number" value={deal.existingSf} onChange={set("existingSf")} placeholder="optional" /></Fld>
+              <Fld label="Max buildable SF">
+                <input type="number" value={deal.buildableSf || ""} onChange={set("buildableSf")} placeholder={estBsf ? `≈ ${fmt(estBsf)} (estimate)` : "lot × FAR"} />
+              </Fld>
             </div>
+            <div className="streetPick">
+              <div className="segLabel">Street</div>
+              <div className="seg">
+                <button data-on={deal.streetWidth === "narrow"} onClick={() => { touched.current.add("streetWidth"); setDeal({ ...deal, streetWidth: "narrow" }); }}>Narrow street</button>
+                <button data-on={deal.streetWidth === "wide"} onClick={() => { touched.current.add("streetWidth"); setDeal({ ...deal, streetWidth: "wide" }); }}>Wide street</button>
+              </div>
+              <div className="hintline">
+                {ss
+                  ? (() => { const d = resolveDistrict(deal.zone); const n = farFor(d, "narrow"), w = farFor(d, "wide"); return `Matters here: ${deal.zone} is ${n.aor} FAR on a narrow street, ${w.aor} on a wide one (75 ft+).${deal.streetWidth ? "" : " Counted as narrow until you pick."}`; })()
+                  : `Wide = 75 ft or more. Doesn't change the FAR in ${deal.zone || "this district"}; saved with the deal.`}
+              </div>
+            </div>
+            <div className="hintline">{parseFloat(deal.buildableSf) > 0
+              ? <>Using your number. <button className="linkBtn inline" onClick={() => setDeal({ ...deal, buildableSf: "" })}>Back to estimate{estBsf ? ` (${fmt(estBsf)})` : ""}</button></>
+              : "Buildable is lot area × FAR on the path you pick. Type a number above to override it."}</div>
           </div>
           <div className="fgroup">
             <div className="ftitle">Pricing & status</div>
@@ -1520,12 +1794,15 @@ function DealForm({ deal, setDeal, buyers, onSave, onCancel, onDelete, onShare, 
             </div>
             <Fld label="Comments" wide><textarea rows={3} value={deal.followUpNotes || ""} onChange={set("followUpNotes")} placeholder="What to check on, who to call, where things stand…" /></Fld>
             {followUpStatus(deal.followUpDate) && (
-              <div className={"followTag inForm " + followUpStatus(deal.followUpDate).cls}>● {followUpStatus(deal.followUpDate).label}</div>
+              <>
+                <div className={"followTag inForm " + followUpStatus(deal.followUpDate).cls}>● {followUpStatus(deal.followUpDate).label}</div>
+                {mine && <FollowUpQuick onDone={() => onFollow(null)} onNext={(x) => onFollow(x)} />}
+              </>
             )}
           </div>
         </div>
         <div className="formSide">
-          <ZoningPanel zone={deal.zone} streetWidth={deal.streetWidth} lotArea={deal.lotArea} customFar={deal.customFar} askingPrice={deal.askingPrice} devPath={deal.devPath} />
+          <ZoningPanel zone={deal.zone} streetWidth={deal.streetWidth} lotArea={deal.lotArea} customFar={deal.customFar} askingPrice={deal.askingPrice} devPath={deal.devPath} buildableSf={deal.buildableSf} />
           <div className="zpanel" style={{ marginTop: 14 }}>
             <div className="zpanelTitle">Buyers that fit ({matches.length})</div>
             <div className="matchHint">
@@ -1805,7 +2082,8 @@ function Shell({ user }) {
   const [uwModel, setUwModel] = useState(() => blankModel());
   const [returnTo, setReturnTo] = useState(null);
   const [toast, setToast] = useState("");
-  const notify = (m) => { setToast(m); setTimeout(() => setToast(""), 3500); };
+  const toastTimer = useRef(null);
+  const notify = (m) => { setToast(m); clearTimeout(toastTimer.current); toastTimer.current = setTimeout(() => setToast(""), 4000); };
 
   const underwriteDeal = (deal) => {
     setUwModel(modelFromDeal(deal));
@@ -1858,7 +2136,7 @@ function Shell({ user }) {
             <>
               <header className="pageHead"><h1>Welcome back</h1></header>
               {!userName && <NamePrompt onSaved={setUserName} />}
-              <TodayPanel onOpen={go} />
+              <TodayPanel onOpen={go} notify={notify} />
               <p className="homeIntro">Where do you want to work?</p>
               <div className="homeCards">
                 <div className="homeCard" onClick={() => setView("deals")}>
@@ -1932,46 +2210,86 @@ function Shell({ user }) {
 /* ============================================================
    TODAY — follow-ups due today or overdue (contacts, buyers, deals)
    ============================================================ */
-function TodayPanel({ onOpen }) {
+function TodayPanel({ onOpen, notify }) {
   const [items, setItems] = useState(null);
+  const [showSoon, setShowSoon] = useState(false);
   useEffect(() => {
     (async () => {
       const t = todayISO();
+      const wk = new Date(); wk.setDate(wk.getDate() + 7);
+      const w = new Date(wk.getTime() - wk.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
       const [c, b, d] = await Promise.all([
-        supabase.from("contacts").select("id, name, phone, email, area, address, follow_up_date, last_contacted").lte("follow_up_date", t),
+        supabase.from("contacts").select("id, name, phone, email, area, address, follow_up_date, last_contacted").lte("follow_up_date", w),
         supabase.from("buyers").select("id, data"),
         supabase.from("deals").select("id, data"),
       ]);
       const out = [];
-      for (const k of c.data || []) out.push({ kind: "Contact", view: "contacts", id: k.id, title: k.name, sub: [k.area, k.address].filter(Boolean).join(" · "), date: k.follow_up_date, phone: k.phone, email: k.email, last: k.last_contacted });
-      for (const r of b.data || []) { const x = r.data || {}; if (x.followUpDate && x.followUpDate <= t) out.push({ kind: "Buyer", view: "buyers", id: r.id, title: x.name, sub: x.company || "", date: x.followUpDate, phone: x.phone, email: x.email, last: x.lastContacted }); }
-      for (const r of d.data || []) { const x = r.data || {}; if (x.followUpDate && x.followUpDate <= t && stageOf(x) !== "Closed") out.push({ kind: "Deal", view: "deals", id: r.id, title: x.address || "Untitled deal", sub: [x.contactName, stageOf(x)].filter(Boolean).join(" · "), date: x.followUpDate, phone: x.contactPhone, email: x.contactEmail, note: x.followUpNotes }); }
+      for (const k of c.data || []) if (k.follow_up_date) out.push({ kind: "Contact", view: "contacts", id: k.id, title: k.name, sub: [k.area, k.address].filter(Boolean).join(" · "), date: k.follow_up_date, phone: k.phone, email: k.email, last: k.last_contacted });
+      for (const r of b.data || []) { const x = r.data || {}; if (x.followUpDate && x.followUpDate <= w) out.push({ kind: "Buyer", view: "buyers", id: r.id, raw: x, title: x.name, sub: x.company || "", date: x.followUpDate, phone: x.phone, email: x.email, last: x.lastContacted }); }
+      for (const r of d.data || []) { const x = r.data || {}; if (x.followUpDate && x.followUpDate <= w && stageOf(x) !== "Closed") out.push({ kind: "Deal", view: "deals", id: r.id, raw: x, title: x.address || "Untitled deal", sub: [x.contactName, stageOf(x)].filter(Boolean).join(" · "), date: x.followUpDate, phone: x.contactPhone, email: x.contactEmail, note: x.followUpNotes }); }
       out.sort((a, z) => a.date.localeCompare(z.date));
       setItems(out);
     })();
   }, []);
+
+  // Done clears the date; Next moves it. Both count as "followed up today".
+  const act = async (it, nextDate) => {
+    const t = todayISO();
+    let error;
+    if (it.kind === "Contact") {
+      ({ error } = await supabase.from("contacts").update({ follow_up_date: nextDate || null, last_contacted: t, updated_at: new Date().toISOString() }).eq("id", it.id));
+    } else {
+      const table = it.kind === "Buyer" ? "buyers" : "deals";
+      const { data: row, error: e1 } = await supabase.from(table).select("data").eq("id", it.id).maybeSingle();
+      if (e1 || !row) { notify?.(e1?.message || "Couldn't find that record."); return; }
+      const extra = it.kind === "Buyer" ? { lastContacted: t } : { lastFollowUp: t };
+      ({ error } = await supabase.from(table).update({ data: { ...row.data, followUpDate: nextDate || "", ...extra }, updated_at: new Date().toISOString() }).eq("id", it.id));
+    }
+    if (error) { notify?.(error.message || "Couldn't update."); return; }
+    setItems((list) => (nextDate ? list.map((x) => (x.kind === it.kind && x.id === it.id ? { ...x, date: nextDate } : x)).sort((a, z) => a.date.localeCompare(z.date))
+      : list.filter((x) => !(x.kind === it.kind && x.id === it.id))));
+    notify?.(nextDate ? `${it.title}: next follow-up ${shortDay(nextDate)}` : `${it.title}: follow-up done ✓`);
+  };
+
   if (!items) return null;
+  const t = todayISO();
+  const due = items.filter((x) => x.date <= t);
+  const soon = items.filter((x) => x.date > t);
+  const row = (it, isDue) => {
+    const fu = followUpStatus(it.date);
+    return (
+      <div key={it.kind + it.id} className={"todayRow" + (isDue ? "" : " soonRow")} onClick={() => onOpen(it.view, it.id)}>
+        <div className="todayTop">
+          <span className={"tag kind " + it.kind.toLowerCase()}>{it.kind}</span>
+          {fu && <div className={"followTag " + fu.cls}>● {fu.label}</div>}
+        </div>
+        <div className="todayMain">
+          <b>{it.title}</b>
+          {(it.sub || it.note) && <div className="rowSub">{[it.sub, it.note].filter(Boolean).join(" — ")}</div>}
+        </div>
+        <div className="todayActs">
+          <QuickActions phone={it.phone} email={it.email} small />
+          <FollowUpQuick compact onDone={() => act(it, null)} onNext={(x) => act(it, x)} />
+        </div>
+      </div>
+    );
+  };
   return (
     <div className="today">
       <div className="todayHead">
         <h2>Today</h2>
-        <span>{items.length === 0 ? "Nothing due" : `${items.length} follow-up${items.length === 1 ? "" : "s"} due`}</span>
+        <span>{due.length === 0 ? "Nothing due" : `${due.length} follow-up${due.length === 1 ? "" : "s"} due`}</span>
       </div>
-      {items.length === 0 && <div className="todayEmpty">You're all caught up. Follow-up dates you set on contacts, buyers and deals show up here the day they're due.</div>}
-      {items.map((it) => {
-        const fu = followUpStatus(it.date);
-        return (
-          <div key={it.kind + it.id} className="todayRow" onClick={() => onOpen(it.view, it.id)}>
-            <span className={"tag kind " + it.kind.toLowerCase()}>{it.kind}</span>
-            <div className="todayMain">
-              <b>{it.title}</b>
-              {(it.sub || it.note) && <div className="rowSub">{[it.sub, it.note].filter(Boolean).join(" — ")}</div>}
-            </div>
-            {fu && <div className={"followTag " + fu.cls}>● {fu.label}</div>}
-            <QuickActions phone={it.phone} email={it.email} small />
-          </div>
-        );
-      })}
+      {due.length === 0 && <div className="todayEmpty">You're all caught up. Follow-up dates you set on contacts, buyers and deals show up here the day they're due.</div>}
+      {due.map((it) => row(it, true))}
+      {soon.length > 0 && (
+        <>
+          <button className="soonToggle" onClick={() => setShowSoon(!showSoon)}>
+            {showSoon ? "▾" : "▸"} Coming up this week ({soon.length})
+          </button>
+          {showSoon && soon.map((it) => row(it, false))}
+        </>
+      )}
     </div>
   );
 }
@@ -2350,6 +2668,62 @@ table.rr tbody tr:last-child td{border-bottom:none}
   .fg2{grid-template-columns:1fr}
   .shGrid{grid-template-columns:1fr}
   .sheet{padding:26px}
+}
+/* ---- Oct 26: follow-up quick actions, lookup, street pick, board extras ---- */
+.todayRow{flex-direction:column;align-items:stretch;gap:6px;padding:12px 0}
+.todayTop{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.todayActs{display:flex;align-items:flex-start;gap:8px;flex-wrap:wrap;margin-top:2px}
+.todayRow.soonRow{opacity:.85}
+.todayRow .todayMain{flex:0 0 auto}
+.todayActs .qa{width:auto !important}
+.todayActs .fuq.compact{margin-top:0}
+.soonToggle{display:block;width:100%;text-align:left;background:none;border:none;border-top:1px solid ${LINE};padding:11px 0 4px;font-size:13px;font-weight:700;color:${INK};opacity:.65}
+.fuq{display:flex;flex-direction:column;gap:6px}
+.fuq.compact{margin-top:6px}
+.fuqBtns{display:flex;gap:6px;flex-wrap:wrap}
+.fuqBtns button{border-radius:20px;font-size:12.5px;font-weight:700;padding:6px 12px;line-height:1;border:1px solid ${LINE};background:#fff;color:${INK}}
+.fuq .fuqDone{background:${GREEN};border-color:${GREEN};color:#fff}
+.fuq .fuqDone:hover{filter:brightness(1.08)}
+.fuq .fuqNext[data-on="true"]{background:${INK};border-color:${INK};color:#fff}
+.fuqPick{display:flex;gap:6px;flex-wrap:wrap;align-items:center;background:#F6F4EE;border:1px solid ${LINE};border-radius:10px;padding:8px}
+.fuqPick button{border:1px solid ${LINE};background:#fff;border-radius:20px;padding:6px 10px;font-size:12.5px;font-weight:600;color:${INK}}
+.fuqPick button:hover{border-color:${INK}}
+.fuqDate{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:700;opacity:.8}
+.fuqDate input{width:150px;padding:5px 8px;font-size:14px}
+.fgroup .fuq{margin-top:10px}
+.boardCard .fuqBtns button{padding:5px 10px;font-size:12px}
+.boardCard .fuqPick{padding:6px}
+.boardSeller{font-size:12.5px;font-weight:600;margin-top:3px;color:${INK};opacity:.8}
+.boardSeller:before{content:"👤 ";opacity:.7}
+.boardBsf{font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:600;color:${BRASS};margin-top:5px;letter-spacing:.01em}
+.boardBsf.none{color:#A09C90;font-weight:500}
+.tag.seller{background:#EAF0FB;color:${BLUE}}
+.lookBox{margin:4px 0 12px;border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.45;border:1px solid ${LINE};background:#fff}
+.lookBox.busy{color:#6A6558;background:#F6F4EE}
+.lookBox.busy:before{content:"";display:inline-block;width:9px;height:9px;border-radius:50%;border:2px solid ${BLUE};border-right-color:transparent;margin-right:8px;animation:spin .8s linear infinite;vertical-align:-1px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.lookBox.warn{background:#FDF3E3;border-color:#F0D9AE;color:#7A5410}
+.lookBox.found{background:#F3F8F4;border-color:#CFE3D6}
+.lookHead{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:baseline}
+.lookHead b{font-size:13.5px;color:${GREEN}}
+.lookHead span{font-family:'IBM Plex Mono',monospace;font-size:11px;opacity:.6}
+.lookFacts{display:grid;grid-template-columns:1fr 1fr;gap:6px 14px;margin:8px 0 6px}
+.lookFacts span{font-size:13px;font-weight:600}
+.lookFacts label{display:block;font-family:'IBM Plex Mono',monospace;font-size:9.5px;letter-spacing:.12em;text-transform:uppercase;opacity:.5;font-weight:600}
+.lookOwner{font-size:12.5px;margin-top:4px}
+.lookLinks{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-top:8px}
+.lookLinks a{color:${BLUE};font-weight:700;font-size:13px;text-decoration:none}
+.lookLinks.solo{margin:-4px 0 12px}
+.lookAlt{margin-top:8px;font-size:12px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;opacity:.9}
+.lookNote{margin-top:8px;font-size:11.5px;opacity:.6}
+.lookDiff{margin-top:8px;font-size:12.5px;background:#FDF3E3;border:1px solid #F0D9AE;color:#7A5410;border-radius:8px;padding:6px 9px}
+.linkBtn.inline{display:inline;padding:0 0 0 4px;color:${BLUE};font-size:12.5px}
+.lookLinks .linkBtn.inline{padding:0}
+.streetPick{margin-top:12px}
+.streetPick .seg button{padding:9px 16px}
+@media (max-width:760px){
+  .lookFacts{grid-template-columns:1fr}
+  .fuqDate input{width:140px}
 }
 `;
 
