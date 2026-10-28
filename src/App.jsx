@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import Papa from "papaparse";
 import { supabase } from "./supabaseClient";
-import Contacts from "./Contacts";
+import Contacts, { contactMatches, matchingNote } from "./Contacts";
 import Team from "./Team";
 import { QuickActions, LastContactedTag, lastContacted, todayISO, autoContact, sellerFromDeal, personFromBuyer, FollowUpQuick, shortDay } from "./crmKit";
 
@@ -2136,6 +2136,7 @@ function Shell({ user }) {
             <>
               <header className="pageHead"><h1>Welcome back</h1></header>
               {!userName && <NamePrompt onSaved={setUserName} />}
+              <HomeSearch onOpen={go} />
               <TodayPanel onOpen={go} notify={notify} />
               <p className="homeIntro">Where do you want to work?</p>
               <div className="homeCards">
@@ -2204,6 +2205,98 @@ function Shell({ user }) {
         </main>
       </div>
     </>
+  );
+}
+
+/* ============================================================
+   HOME SEARCH — one box that looks through contacts (and their notes), buyers and deals
+   "albanian" finds every contact whose notes say albanian. "notes albanian" looks in notes only.
+   ============================================================ */
+const parseSearch = (q) => {
+  const t = (q || "").trim().toLowerCase();
+  const m = t.match(/^notes?\s*:?\s+(.+)$/) || t.match(/^notes?:(.+)$/);
+  return m ? { t: m[1].trim(), notesOnly: true } : { t, notesOnly: false };
+};
+// a short piece of the text around the match, with the match highlighted
+function Snip({ text, t }) {
+  const s = String(text || "");
+  const i = s.toLowerCase().indexOf(t);
+  if (i < 0 || !t) return <>{s.length > 120 ? s.slice(0, 117) + "…" : s}</>;
+  const from = Math.max(0, i - 45), to = Math.min(s.length, i + t.length + 60);
+  return <>{from > 0 ? "…" : ""}{s.slice(from, i)}<mark>{s.slice(i, i + t.length)}</mark>{s.slice(i + t.length, to)}{to < s.length ? "…" : ""}</>;
+}
+
+function HomeSearch({ onOpen }) {
+  const [q, setQ] = useState("");
+  const [data, setData] = useState(null);
+  const loading = useRef(false);
+  const load = async () => {
+    if (data || loading.current) return;
+    loading.current = true;
+    const [c, b, d] = await Promise.all([
+      supabase.from("contacts").select("id, name, phone, email, address, area, type, contact_notes(id, body, noted_at)"),
+      supabase.from("buyers").select("id, data"),
+      supabase.from("deals").select("id, data"),
+    ]);
+    setData({
+      contacts: (c.data || []).map(({ contact_notes, ...r }) => ({
+        ...r, notes: [...(contact_notes || [])].sort((x, z) => (z.noted_at || "").localeCompare(x.noted_at || "")),
+      })),
+      buyers: (b.data || []).map((r) => ({ ...(r.data || {}), id: r.id })),
+      deals: (d.data || []).map((r) => ({ ...(r.data || {}), id: r.id })),
+    });
+    loading.current = false;
+  };
+  useEffect(() => { if (q.trim().length >= 2) load(); }, [q]);
+
+  const { t, notesOnly } = parseSearch(q);
+  const active = t.length >= 2;
+  const results = useMemo(() => {
+    if (!active || !data) return [];
+    const has = (v) => String(v || "").toLowerCase().includes(t);
+    const out = [];
+    for (const k of data.contacts) {
+      if (!contactMatches(k, q)) continue;
+      const n = matchingNote(k, q);
+      out.push({ kind: "Contact", view: "contacts", id: k.id, title: k.name, sub: [k.phone, k.area, k.address].filter(Boolean).join(" · "), note: n?.body });
+    }
+    for (const x of data.buyers) {
+      const noteHit = has(x.notes) ? x.notes : "";
+      if (notesOnly ? !noteHit : !(noteHit || [x.name, x.company, x.phone, x.email].some(has))) continue;
+      out.push({ kind: "Buyer", view: "buyers", id: x.id, title: x.name || "Unnamed buyer", sub: [x.company, x.phone].filter(Boolean).join(" · "), note: noteHit });
+    }
+    for (const x of data.deals) {
+      const noteHit = [x.notes, x.followUpNotes].find(has) || "";
+      if (notesOnly ? !noteHit : !(noteHit || [x.address, x.neighborhood, x.zone, x.contactName, x.contactPhone, x.contactEmail].some(has))) continue;
+      out.push({ kind: "Deal", view: "deals", id: x.id, title: x.address || "Untitled deal", sub: [x.contactName, x.neighborhood].filter(Boolean).join(" · "), note: noteHit });
+    }
+    return out;
+  }, [data, q, t, notesOnly, active]);
+
+  return (
+    <div className="homeSearch">
+      <input className="search" placeholder="Search contacts, buyers, deals — names, phones, addresses, notes…"
+        value={q} onChange={(e) => setQ(e.target.value)} onFocus={load} />
+      {active && (
+        <div className="today hsResults">
+          <div className="todayHead">
+            <h2>Search</h2>
+            <span>{!data ? "Searching…" : `${results.length} result${results.length === 1 ? "" : "s"}`}</span>
+          </div>
+          {data && results.length === 0 && <div className="todayEmpty">Nothing matches “{q.trim()}”.</div>}
+          {results.map((it) => (
+            <div key={it.kind + it.id} className="todayRow" onClick={() => onOpen(it.view, it.id)}>
+              <div className="todayTop"><span className={"tag kind " + it.kind.toLowerCase()}>{it.kind}</span></div>
+              <div className="todayMain">
+                <b>{it.title}</b>
+                {it.sub && <div className="rowSub">{it.sub}</div>}
+                {it.note && <div className="hsSnip"><b>Note</b><Snip text={it.note} t={t} /></div>}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -2612,6 +2705,13 @@ table.rr tbody tr:last-child td{border-bottom:none}
 .todayRow .followTag{margin-top:0}
 .todayMain{flex:1 1 180px;min-width:0}
 .tag.kind{flex:0 0 auto;min-width:58px;text-align:center}
+.homeSearch{margin-bottom:18px}
+.homeSearch .search{max-width:none;width:100%}
+.hsResults{margin-top:10px;margin-bottom:0}
+.hsSnip{font-size:12.5px;opacity:.8;margin-top:4px;line-height:1.4}
+.hsSnip b{font-family:'IBM Plex Mono',monospace;font-weight:600;font-size:11px;opacity:.8;margin-right:6px}
+.hsSnip mark{background:#F6E7B8;color:inherit;padding:0 1px;border-radius:2px}
+.notesBox textarea{min-height:96px}
 .tag.kind.contact{background:#F2EEE0;color:#7A5F22;border:1px solid #DDD0AC}
 .tag.kind.buyer{background:#fff;color:${BLUE};border:1px solid ${BLUE}}
 .tag.kind.deal{background:${INK}}
