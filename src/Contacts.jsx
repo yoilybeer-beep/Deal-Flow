@@ -38,6 +38,25 @@ const blankContact = () => ({
   address: "", area: "", type: "owner", follow_up_date: "", last_contacted: "", is_public: false, notes: [],
 });
 
+// search: plain words match name, phone, email, address, area and every note.
+// Starting with "notes" (e.g. "notes albanian" or "notes: albanian") looks in notes only.
+export function contactMatches(c, query) {
+  let t = (query || "").trim().toLowerCase();
+  if (!t) return true;
+  const notesText = (c.notes || []).map((n) => n.body || "").join(" ").toLowerCase();
+  const m = t.match(/^notes?\s*:?\s+(.+)$/) || t.match(/^notes?:(.+)$/);
+  if (m) return notesText.includes(m[1].trim());
+  return [c.name, c.phone, c.email, c.address, c.area, notesText].join(" ").toLowerCase().includes(t);
+}
+// the first note that contains the search words, for showing why a contact came up
+export function matchingNote(c, query) {
+  let t = (query || "").trim().toLowerCase();
+  const m = t.match(/^notes?\s*:?\s+(.+)$/) || t.match(/^notes?:(.+)$/);
+  if (m) t = m[1].trim();
+  if (!t) return null;
+  return (c.notes || []).find((n) => (n.body || "").toLowerCase().includes(t)) || null;
+}
+
 const sortNotes = (notes) => [...(notes || [])].sort((a, b) => (b.noted_at || "").localeCompare(a.noted_at || ""));
 
 export default function Contacts({ notify, userId, userName, onGo, openId, onOpened }) {
@@ -102,15 +121,19 @@ export default function Contacts({ notify, userId, userName, onGo, openId, onOpe
       if (area !== "All" && c.area !== area) return false;
       if (type !== "All" && c.type !== type) return false;
       if (dueOnly) { const f = followUp(c.follow_up_date); if (!f || f.days > 0) return false; }
-      return !t || [c.name, c.phone, c.email, c.address, ...(c.notes || []).map((n) => n.body)].join(" ").toLowerCase().includes(t);
+      return contactMatches(c, t);
     });
   }, [rows, q, area, type, dueOnly]);
 
   const dueCount = rows.filter((c) => { const f = followUp(c.follow_up_date); return f && f.days <= 0; }).length;
 
-  const save = async () => {
+  // draft = whatever is typed in the Notes box when Save is hit; it saves with the contact
+  const save = async (draft) => {
     if (!form.name.trim()) return;
-    const { notes, contact_notes, ...rest } = form;
+    const { notes: savedNotes, contact_notes, ...rest } = form;
+    const notes = draft && draft.body
+      ? sortNotes([{ id: "tmp" + Date.now(), body: draft.body, noted_at: draft.noted_at, author_name: userName, _pending: true }, ...(savedNotes || [])])
+      : savedNotes;
     const isNew = !rows.some((r) => r.id === form.id);
     // a note typed before saving counts as contact on that date
     const pendingLatest = (notes || []).filter((n) => n._pending).map((n) => n.noted_at.slice(0, 10)).sort().pop();
@@ -120,15 +143,17 @@ export default function Contacts({ notify, userId, userName, onGo, openId, onOpe
     if (error) { notify?.(error.message || "Save failed."); return; }
     // notes typed before a new contact was saved go in after the contact row exists
     const pending = (notes || []).filter((n) => n._pending);
+    let nerr = null;
     if (pending.length) {
-      await supabase.from("contact_notes").insert(pending.map((n) => ({
-        contact_id: rec.id, owner_id: userId, author_name: userName, body: n.body, noted_at: n.noted_at,
-      })));
+      ({ error: nerr } = await supabase.from("contact_notes").insert(pending.map((n) => ({
+        contact_id: rec.id, owner_id: userId, author_name: userName, body: n.body, noted_at: new Date(n.noted_at).toISOString(),
+      }))));
+      if (nerr) { notify?.("Contact saved, but the note didn't save: " + (nerr.message || "try again.")); }
     }
-    const saved = { ...rec, notes: sortNotes((notes || []).map(({ _pending, ...n }) => n)) };
+    const saved = { ...rec, notes: sortNotes((notes || []).filter((n) => !(nerr && n._pending)).map(({ _pending, ...n }) => n)) };
     setRows(isNew ? [saved, ...rows] : rows.map((r) => (r.id === saved.id ? saved : r)));
     setForm(null);
-    notify?.("Contact saved.");
+    if (!nerr) notify?.(pending.length ? "Contact and note saved." : "Contact saved.");
   };
 
   const remove = async (id) => {
@@ -262,6 +287,11 @@ function ContactForm({ c, setC, onSave, onCancel, onDelete, isNew, mine, userId,
   const [noteText, setNoteText] = useState("");
   const [noteDate, setNoteDate] = useState(todayISO());
   const fu = followUp(c.follow_up_date);
+  // Save contact also saves whatever is typed in the Notes box (no need to tap "Add note" first)
+  const saveAll = () => {
+    const body = noteText.trim();
+    onSave(body ? { body, noted_at: noteDate + "T" + new Date().toTimeString().slice(0, 8) } : null);
+  };
 
   const addNote = async () => {
     const body = noteText.trim();
@@ -292,7 +322,7 @@ function ContactForm({ c, setC, onSave, onCancel, onDelete, isNew, mine, userId,
         <div style={{ display: "flex", gap: 8 }}>
           {!isNew && mine && <button className="danger" onClick={() => (arm ? onDelete() : setArm(true))}>{arm ? "Tap again to delete" : "Delete"}</button>}
           <button className="ghost" onClick={onCancel}>{mine ? "Cancel" : "Back"}</button>
-          {mine && <button className="primary" onClick={onSave} disabled={!c.name.trim()}>Save contact</button>}
+          {mine && <button className="primary" onClick={saveAll} disabled={!c.name.trim()}>Save contact</button>}
         </div>
       </header>
       <div className="formCols">
@@ -354,8 +384,8 @@ function ContactForm({ c, setC, onSave, onCancel, onDelete, isNew, mine, userId,
             </div>
           )}
         </div>
-        <div className="formSide">
-          {!isNew && mine && (
+        {!isNew && mine && <div className="formSide">
+          {(
             <div className="fgroup">
               <div className="ftitle">Convert</div>
               <div className="convertRow">
@@ -369,28 +399,31 @@ function ContactForm({ c, setC, onSave, onCancel, onDelete, isNew, mine, userId,
               <div className="hintline">Buyer copies name, phone, email, area and notes into Buyers. Seller opens a deal on the Deal Desk with this address and {c.name ? c.name.split(" ")[0] : "the contact"} as the seller.</div>
             </div>
           )}
-          <div className="fgroup">
-            <div className="ftitle">Notes · call log</div>
-            <div className="noteAdd">
-              <textarea rows={3} value={noteText} onChange={(e) => setNoteText(e.target.value)} placeholder="What happened on this call…" />
-              <div className="noteAddRow">
-                <input type="date" value={noteDate} onChange={(e) => setNoteDate(e.target.value)} />
-                <button className="primary" onClick={addNote} disabled={!noteText.trim()}>Add note</button>
+        </div>}
+      </div>
+      <div className="fgroup notesBox">
+        <div className="ftitle">Notes</div>
+        <div className="noteAdd">
+            <textarea rows={4} value={noteText} onChange={(e) => setNoteText(e.target.value)}
+              placeholder="Anything to remember — language, what they own, what they're looking for, how the call went…" />
+            <div className="noteAddRow">
+              <input type="date" value={noteDate} onChange={(e) => setNoteDate(e.target.value)} />
+              {!isNew && <button className="ghost" onClick={addNote} disabled={!noteText.trim()}>Add note</button>}
+              {mine && <button className="primary" onClick={saveAll} disabled={!c.name.trim()}>Save contact</button>}
+            </div>
+            <div className="hintline">{mine ? "What you type here saves with the contact, and the search finds it." : "Tap Add note to save it."}</div>
+          </div>
+        <div className="noteLog">
+          {(c.notes || []).length === 0 && <div className="hintline">No notes yet.</div>}
+          {(c.notes || []).map((n) => (
+            <div key={n.id} className="noteItem">
+              <div className="noteDate">{shortDate(n.noted_at)}</div>
+              <div style={{ flex: 1, whiteSpace: "pre-wrap" }}>
+                {n.body}
+                {n.author_name && <div className="noteWho">{n.author_name}{n._pending ? " · saves with the contact" : ""}</div>}
               </div>
             </div>
-            <div className="noteLog">
-              {(c.notes || []).length === 0 && <div className="hintline">No notes yet. Each call gets its own dated entry.</div>}
-              {(c.notes || []).map((n) => (
-                <div key={n.id} className="noteItem">
-                  <div className="noteDate">{shortDate(n.noted_at)}</div>
-                  <div style={{ flex: 1 }}>
-                    {n.body}
-                    {n.author_name && <div className="noteWho">{n.author_name}{n._pending ? " · saves with the contact" : ""}</div>}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
+          ))}
         </div>
       </div>
     </>
