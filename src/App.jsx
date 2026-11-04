@@ -311,7 +311,7 @@ function blankModel(borough = "") {
     retailSF: 0, retailPSF: 50, commVacancyPct: 10, retailExpPct: 10, commCapRate: 6.0,
     parkingSpaces: 0, parkingRent: 200, otherIncomeYr: 0,
     vacancyPct: 5, opexPerUnit: 6000, mgmtPct: 3, propertyTaxAnnual: 0, exitCapRatePct: 5.5,
-    permLoanPct: 65, permLoanAmt: 0, permRatePct: 6.5, permAmortYrs: 30,
+    permLoanPct: 90, permLoanAmt: 0, permRatePct: 6.5, permAmortYrs: 30,
     marketSellPSF: 1100, affordableSellPSF: 500, sellingCostPct: 6,
     isPublic: false, updated: new Date().toISOString().slice(0, 10),
   };
@@ -369,6 +369,7 @@ function upgradeModel(raw) {
   const P = PROGRAMS[raw.program] || PROGRAMS.market;
   m.affMode = P.mode; m.affReqPct = P.pct;
   m.structure = "sale"; m.keyMoney = 0; m.groundRentYr = 0;
+  if (raw.permLoanPct == null) m.permLoanPct = 65;  // keep the loan old models were upgraded with
   delete m.mkt; delete m.aff; delete m.comm;
   return m;
 }
@@ -585,7 +586,8 @@ function runCalc(m) {
   const cfAmort = NOI - dsAmort, cfIO = NOI - dsIO;
   const dscr = dsAmort > 0 ? NOI / dsAmort : 0;
   const dscrIO = dsIO > 0 ? NOI / dsIO : 0;
-  const equityIn = netCost - permLoan;
+  const equityIn = netCost - permLoan;               // cash required = all-in − loan
+  const cashPct = netCost > 0 ? equityIn / netCost * 100 : 0;
   const coc = equityIn > 0 ? cfAmort / equityIn * 100 : 0;
   const debtYield = permLoan > 0 ? NOI / permLoan * 100 : 0;
   const constant = permLoan > 0 ? dsAmort / permLoan : 0;
@@ -614,7 +616,7 @@ function runCalc(m) {
     price, closing, airCost, otherAcq, totalAcq, hardBase, contingency, totalHard, totalSoft,
     constrLoan, cInterest, cFees, cTaxes, cInsurance, cGround, totalCarry, constrSubtotal, TPC, TDC, credits, netCost, per,
     cap, exitValue, equityCreated, yieldOnCost, yieldOnNet,
-    permLoan, dsAmort, dsIO, cfAmort, cfIO, dscr, dscrIO, equityIn, coc, debtYield, maxLoan125,
+    permLoan, dsAmort, dsIO, cfAmort, cfIO, dscr, dscrIO, equityIn, cashPct, coc, debtYield, maxLoan125,
     sellGross, sellCosts, sellNet, retailNOI, retailValue, condoProfit, condoMargin, condoMarginRev,
     profit, margin,
     avgRentUnit: totalUnits > 0 ? resiM / totalUnits : 0,
@@ -1032,7 +1034,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
           {rental && (
             <Sec n="07" t="Permanent Loan & Cash Flow" open>
               <div className="fg2">
-                <F label="Loan" hint="% of net cost">{num("permLoanPct")}</F>
+                <F label="Loan" hint="% of all-in · cash = rest">{num("permLoanPct")}</F>
                 <F label="Or loan amount" hint="$ · 0 = use %">{num("permLoanAmt")}</F>
                 <F label="Rate" hint="%">{num("permRatePct", "0.125")}</F>
                 <F label="Amortization" hint="years">{num("permAmortYrs")}</F>
@@ -1047,7 +1049,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
                 </table>
               </div>
               <div className="derived">
-                Loan {money(c.permLoan)} · equity in {money(c.equityIn)} · cash-on-cash {pct(c.coc)} · debt yield {pct(c.debtYield)}
+                Loan {money(c.permLoan)} · cash required {money(c.equityIn)} ({pct(c.cashPct)}) · cash-on-cash {pct(c.coc)} · debt yield {pct(c.debtYield)}
                 <br />Max loan at 1.25x DSCR ≈ {money(c.maxLoan125)}
               </div>
             </Sec>
@@ -1108,6 +1110,9 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
                 <Row l="Expenses" v={money(c.opexTotal)} />
                 <Row l="Net operating income" v={money(c.NOI)} />
                 <Row l={`Value @ ${N(m.exitCapRatePct).toFixed(2)}% cap`} v={money(c.exitValue)} total />
+                <div className="divLabel">Financing <i>total · % of cost</i></div>
+                <Row l="Loan" v={money(c.permLoan)} s={pct(100 - c.cashPct)} />
+                <Row l="Cash required" v={money(c.equityIn)} s={pct(c.cashPct) + (c.totalUnits ? " · " + kMoney(c.equityIn / c.totalUnits) + "/unit" : "")} total />
               </>
             ) : (
               <>
@@ -1475,8 +1480,8 @@ body{background:#f2efe6;margin:0;padding:24px;}
                 <SR l="Value / BSF · / unit" v={`${psf(c.per(c.exitValue).bsf)} · ${c.totalUnits ? kMoney(c.per(c.exitValue).unit) : "—"}`} />
                 <SR l={c.credits > 0 ? "Net project cost" : "Total project cost"} v={money(c.netCost)} />
                 <SR l="Equity created" v={sMoney(c.equityCreated)} />
-                <SR l="Permanent loan" v={`${money(c.permLoan)} @ ${N(m.permRatePct)}%, ${N(m.permAmortYrs)} yr`} />
-                <SR l="Equity required" v={money(c.equityIn)} />
+                <SR l="Loan" v={`${money(c.permLoan)} (${pct(100 - c.cashPct)} of cost) @ ${N(m.permRatePct)}%, ${N(m.permAmortYrs)} yr`} />
+                <SR l="CASH REQUIRED" v={`${money(c.equityIn)} · ${pct(c.cashPct)} of cost${c.totalUnits ? " · " + kMoney(c.equityIn / c.totalUnits) + "/unit" : ""}`} />
                 <SR l="Debt service (amort. / IO)" v={`${money(c.dsAmort)} / ${money(c.dsIO)}`} />
                 <SR l="Cash flow after debt (amort. / IO)" v={`${sMoney(c.cfAmort)} / ${sMoney(c.cfIO)}`} />
                 <SR l="DSCR (amort. / IO)" v={`${x2(c.dscr)} / ${x2(c.dscrIO)}`} />
@@ -2981,13 +2986,13 @@ function NamePrompt({ onSaved }) {
    STYLES
    ============================================================ */
 const CSS = `
-@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800&family=Source+Serif+4:wght@600;700&family=IBM+Plex+Mono:wght@500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 *{box-sizing:border-box}
-body{margin:0;background:${PAPER};color:${INK};font-family:'Archivo',-apple-system,'Segoe UI',sans-serif;-webkit-font-smoothing:antialiased}
+body{margin:0;background:${PAPER};color:${INK};font-family:'Inter',-apple-system,'Segoe UI',sans-serif;-webkit-font-smoothing:antialiased;font-variant-numeric:tabular-nums lining-nums;font-feature-settings:"tnum" 1,"lnum" 1,"zero" 0}
 button{font-family:inherit;cursor:pointer}
-input,select,textarea{font-family:inherit;font-size:16px;width:100%;padding:9px 11px;border:1px solid ${LINE};border-radius:7px;background:#fff;color:${INK};outline:none}
+input,select,textarea{font-family:inherit;font-variant-numeric:tabular-nums lining-nums;font-feature-settings:"tnum" 1,"lnum" 1,"zero" 0;font-size:16px;width:100%;padding:9px 11px;border:1px solid ${LINE};border-radius:7px;background:#fff;color:${INK};outline:none}
 input:focus,select:focus,textarea:focus{border-color:${BLUE};box-shadow:0 0 0 3px rgba(36,86,200,.12)}
-.center{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;background:${PAPER};color:${INK};font-family:'Archivo',-apple-system,'Segoe UI',sans-serif}
+.center{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;background:${PAPER};color:${INK};font-family:'Inter',-apple-system,'Segoe UI',sans-serif}
 .authCard{background:#fff;border:1px solid ${LINE};border-radius:14px;padding:30px 28px;width:370px;max-width:92vw;box-shadow:0 10px 34px rgba(16,27,45,.10)}
 .authCard .field{margin-bottom:12px}
 .appShell{display:flex;min-height:100vh}
@@ -3022,8 +3027,8 @@ main{flex:1;padding:28px 32px 60px;max-width:1180px;min-width:0}
 .homeCards{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px}
 .homeCard{background:#fff;border:1px solid ${LINE};border-radius:12px;padding:22px;cursor:pointer;transition:.15s}
 .homeCard:hover{border-color:${BLUE};box-shadow:0 6px 22px rgba(16,27,45,.09);transform:translateY(-2px)}
-.hcTag{font-family:'IBM Plex Mono',monospace;font-size:11px;color:#9C7A2E;letter-spacing:.14em}
-.homeCard h2{font-family:'Source Serif 4',serif;font-size:22px;margin:6px 0 8px}
+.hcTag{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:11px;color:#9C7A2E;letter-spacing:.14em}
+.homeCard h2{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:22px;margin:6px 0 8px}
 .homeCard p{margin:0 0 14px;font-size:13.5px;line-height:1.55;opacity:.7}
 .hcGo{font-size:13px;font-weight:700;color:${BLUE}}
 .homeNote{margin-top:22px;background:#EEF3E6;border:1px solid #CBD8B4;border-radius:9px;padding:12px 16px;font-size:13.5px;line-height:1.5}
@@ -3049,13 +3054,13 @@ main{flex:1;padding:28px 32px 60px;max-width:1180px;min-width:0}
 .tag.type{background:#F2EEE0;color:#7A5F22;border:1px solid #DDD0AC}
 .tag.area{background:#fff;color:${INK};border:1px solid ${INK}}
 .lastNote{font-size:12.5px;opacity:.7;margin-top:4px;line-height:1.4;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
-.lastNote b{font-family:'IBM Plex Mono',monospace;font-weight:600;font-size:11px;opacity:.8;margin-right:6px}
+.lastNote b{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-weight:600;font-size:11px;opacity:.8;margin-right:6px}
 .noteAdd{display:flex;flex-direction:column;gap:8px}
 .noteAddRow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .noteAddRow input[type=date]{width:auto;flex:0 0 170px}
 .noteLog{margin-top:14px;display:flex;flex-direction:column}
 .noteItem{display:flex;gap:12px;padding:10px 0;border-top:1px solid ${LINE};font-size:14px;line-height:1.45}
-.noteDate{font-family:'IBM Plex Mono',monospace;font-size:11.5px;font-weight:600;color:#9C7A2E;flex:0 0 78px;padding-top:2px}
+.noteDate{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:11.5px;font-weight:600;color:#9C7A2E;flex:0 0 78px;padding-top:2px}
 .noteWho{font-size:11px;opacity:.5;margin-top:3px}
 .convertRow{display:flex;flex-direction:column;gap:8px}
 .convertRow .ghost{text-align:left;background:#fff}
@@ -3126,14 +3131,14 @@ main{flex:1;padding:28px 32px 60px;max-width:1180px;min-width:0}
 .zpanelTitle{font-size:11px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;opacity:.7;margin-bottom:12px}
 .zgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .zcell label{display:block;font-size:10px;text-transform:uppercase;letter-spacing:.08em;opacity:.55;margin-bottom:3px}
-.znum{font-family:'IBM Plex Mono',monospace;font-size:18px;font-weight:600}
+.znum{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:18px;font-weight:600}
 .zcell.big .znum{font-size:24px}
 .znum.brass{color:#D6B45C}
 .znum small{font-size:12px;opacity:.6}
 .zfoot{margin-top:12px;font-size:11px;opacity:.5;line-height:1.4}
 .matchRow{display:flex;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px solid rgba(255,255,255,.08);font-size:13px}
 .matchRow span{opacity:.6}
-.uw .eyebrow{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.18em;color:#9C7A2E;text-transform:uppercase}
+.uw .eyebrow{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:11px;letter-spacing:.18em;color:#9C7A2E;text-transform:uppercase}
 .dealline{display:flex;align-items:center;gap:8px;margin-top:4px}
 .dealline span{font-size:12px;opacity:.55;min-width:48px}
 .dealline input{font-size:14px;border:none;border-bottom:1px dashed ${LINE};border-radius:0;padding:3px 0;background:transparent;max-width:280px}
@@ -3144,7 +3149,7 @@ main{flex:1;padding:28px 32px 60px;max-width:1180px;min-width:0}
 .savedChip b{opacity:.4;font-size:11px}
 .savedChip b:hover{color:#a33;opacity:1}
 .segRow{display:flex;gap:22px;flex-wrap:wrap;margin-bottom:20px}
-.segLabel{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;opacity:.5;margin-bottom:6px}
+.segLabel{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:10px;letter-spacing:.14em;text-transform:uppercase;opacity:.5;margin-bottom:6px}
 .seg{display:flex;border:1px solid ${LINE};border-radius:7px;overflow:hidden;background:#fff}
 .seg button{border:none;border-right:1px solid ${LINE};background:none;padding:8px 15px;font-size:13.5px;font-weight:600;color:${INK};opacity:.6}
 .seg button:last-child{border-right:none}
@@ -3152,45 +3157,45 @@ main{flex:1;padding:28px 32px 60px;max-width:1180px;min-width:0}
 .uwGrid{display:grid;grid-template-columns:1fr 350px;gap:24px;align-items:start}
 .sec{background:#fff;border:1px solid ${LINE};border-radius:10px;margin-bottom:12px;overflow:hidden}
 .secHead{display:flex;align-items:center;gap:12px;padding:14px 18px;cursor:pointer;user-select:none}
-.secNum{font-family:'IBM Plex Mono',monospace;font-size:11px;color:#9C7A2E;border:1px solid ${LINE};border-radius:50%;width:24px;height:24px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
-.secTitle{font-family:'Source Serif 4',serif;font-size:17px;font-weight:700;flex:1}
+.secNum{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:11px;color:#9C7A2E;border:1px solid ${LINE};border-radius:50%;width:24px;height:24px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.secTitle{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:17px;font-weight:700;flex:1}
 .secChev{opacity:.4;font-size:11px;transition:.2s}
 .secBody{padding:4px 18px 18px;border-top:1px solid ${LINE}}
 .fg2{display:grid;grid-template-columns:1fr 1fr;gap:12px 16px;margin-top:12px}
 .fg1{display:grid;grid-template-columns:1fr;margin-top:12px}
 .uwField label{display:flex;justify-content:space-between;gap:8px;font-size:12px;font-weight:600;opacity:.8;margin-bottom:4px}
 .uwField label em{font-style:normal;font-weight:400;opacity:.6;font-size:10.5px}
-.uwField input,.uwField select{font-family:'IBM Plex Mono',monospace;font-size:13.5px}
-.derived{font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:${BLUE};margin-top:12px;padding-top:12px;border-top:1px dashed ${LINE};line-height:1.5}
+.uwField input,.uwField select{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:14px;font-weight:500}
+.derived{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:11.5px;color:${BLUE};margin-top:12px;padding-top:12px;border-top:1px dashed ${LINE};line-height:1.5}
 .derived.brassText{color:#9C7A2E}
-.rrHead{display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap;font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#9C7A2E;margin:14px 0 8px}
-.rrHead em{font-style:normal;font-family:'Archivo',sans-serif;font-size:11px;letter-spacing:0;text-transform:none;opacity:.55;color:${INK}}
+.rrHead{display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap;font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#9C7A2E;margin:14px 0 8px}
+.rrHead em{font-style:normal;font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:11px;letter-spacing:0;text-transform:none;opacity:.55;color:${INK}}
 .tableWrap{overflow-x:auto;border:1px solid ${LINE};border-radius:8px}
 table.rr{width:100%;border-collapse:collapse;font-size:12.5px;min-width:420px}
 table.rr th,table.rr td{padding:6px;text-align:center;border-bottom:1px solid ${LINE}}
-table.rr thead th{font-family:'IBM Plex Mono',monospace;font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;opacity:.55;font-weight:500;background:#F6F5F1}
+table.rr thead th{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;opacity:.55;font-weight:500;background:#F6F5F1}
 table.rr td:first-child,table.rr th:first-child{text-align:left;padding-left:10px;white-space:nowrap;opacity:.8}
-table.rr input{font-family:'IBM Plex Mono',monospace;font-size:12px;padding:5px 4px;text-align:center;min-width:56px}
+table.rr input{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:12px;padding:5px 4px;text-align:center;min-width:56px}
 table.rr tbody tr:last-child td{border-bottom:none}
 .subnote{font-size:11.5px;opacity:.55;margin-top:8px;line-height:1.5}
 .uwSum{position:sticky;top:20px;border:1px solid #9C7A2E;border-radius:10px;background:${INK};color:#EDEDE8;overflow:hidden}
-.sumHead{display:flex;justify-content:space-between;align-items:baseline;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,.12);font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;opacity:.75}
-.divLabel{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#D6B45C;margin:16px 0 4px}
+.sumHead{display:flex;justify-content:space-between;align-items:baseline;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,.12);font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:10px;letter-spacing:.14em;text-transform:uppercase;opacity:.75}
+.divLabel{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#D6B45C;margin:16px 0 4px}
 .ledger{display:flex;justify-content:space-between;align-items:baseline;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.08);font-size:13px}
 .ledger span{opacity:.7}
-.ledger b{font-family:'IBM Plex Mono',monospace;font-weight:500}
+.ledger b{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-weight:600}
 .ledger.total{border-bottom:none;border-top:1px solid rgba(255,255,255,.2);margin-top:4px;padding-top:11px}
-.ledger.total span{font-family:'Source Serif 4',serif;font-size:15px;opacity:1;font-weight:600}
+.ledger.total span{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:15px;opacity:1;font-weight:600}
 .ledger.total b{font-size:16px;font-weight:600;color:#D6B45C}
 .profit{margin-top:16px;padding:16px;border-radius:8px;text-align:center;background:rgba(132,180,130,.1);border:1px solid #84B482}
 .profit.neg{background:rgba(196,119,100,.1);border-color:#C47764}
 .profit .pl{font-size:11px;text-transform:uppercase;letter-spacing:.1em;opacity:.7}
-.profit .pv{font-family:'Source Serif 4',serif;font-size:29px;font-weight:700;color:#84B482;margin-top:4px}
+.profit .pv{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:29px;font-weight:700;color:#84B482;margin-top:4px}
 .profit.neg .pv{color:#C47764}
 .mcards{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:16px}
 .mcard{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:11px}
 .ml{font-size:10px;text-transform:uppercase;letter-spacing:.08em;opacity:.55}
-.mv{font-family:'IBM Plex Mono',monospace;font-size:18px;margin-top:3px}
+.mv{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:18px;font-weight:600;margin-top:3px}
 .mv[data-good="true"]{color:#84B482}
 .mv[data-good="false"]{color:#C47764}
 .foot{margin-top:28px;font-size:11.5px;opacity:.5;text-align:center}
@@ -3199,13 +3204,13 @@ table.rr tbody tr:last-child td{border-bottom:none}
 .modalHead{display:flex;justify-content:space-between;align-items:center;font-size:12px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;color:${BLUE};margin-bottom:14px}
 .modalX{background:none;border:none;font-size:24px;line-height:1;opacity:.5}
 .sharePhoto{width:100%;height:170px;object-fit:cover;border-radius:9px;margin-bottom:12px;display:block}
-.shareText{font-family:'IBM Plex Mono',monospace;font-size:13px;line-height:1.55;resize:vertical}
+.shareText{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:13px;line-height:1.55;resize:vertical}
 .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:${INK};color:#fff;padding:12px 18px;border-radius:10px;font-size:13px;z-index:60;box-shadow:0 6px 24px rgba(0,0,0,.25);max-width:90vw;text-align:center}
 .sheet{background:#fffefb;color:#1c1a15;padding:48px;border-radius:5px;box-shadow:0 30px 80px rgba(0,0,0,.5)}
 .shTop{display:flex;justify-content:space-between;gap:16px;border-bottom:2px solid #c9a267;padding-bottom:18px;margin-bottom:26px}
 .shLogo{height:56px;width:auto;display:block;margin-bottom:14px}
 .shBrand{font-size:12px;font-weight:700;letter-spacing:.1em;color:#8a6f45;text-transform:uppercase}
-.shTitle{font-family:'Source Serif 4',serif;font-size:32px;font-weight:700;margin:6px 0 4px;line-height:1.15}
+.shTitle{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:32px;font-weight:700;margin:6px 0 4px;line-height:1.15}
 .shSub{font-size:14px;color:#6a6558}
 .shDate{font-size:13px;color:#8a8577;white-space:nowrap}
 .shSec{margin-bottom:26px}
@@ -3213,14 +3218,14 @@ table.rr tbody tr:last-child td{border-bottom:none}
 .shGrid{display:grid;grid-template-columns:1fr 1fr;gap:6px 30px}
 .shRow{display:flex;justify-content:space-between;align-items:baseline;padding:6px 0;border-bottom:1px dotted #ddd6c4;font-size:14px}
 .shRow span{color:#5a5648}
-.shRow b{font-weight:700}
+.shRow b{font-weight:600}
 .shTable{width:100%;border-collapse:collapse;font-size:14px}
 .shTable th,.shTable td{padding:8px;text-align:center;border-bottom:1px dotted #ddd6c4}
 .shTable thead th{font-size:11px;font-weight:700;color:#8a6f45;text-transform:uppercase;letter-spacing:.05em}
 .shTable td:first-child,.shTable th:first-child{text-align:left;color:#5a5648}
 .shHl{background:#f5efdf;border:1px solid #ddd0ac;border-radius:5px;padding:18px 22px;margin-top:12px;display:flex;justify-content:space-between;align-items:center}
 .shHl span{font-size:12px;font-weight:700;color:#6a6558;text-transform:uppercase;letter-spacing:.07em}
-.shHl b{font-family:'Source Serif 4',serif;font-size:32px;color:#7a5a24}
+.shHl b{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:32px;color:#7a5a24}
 .shFoot{font-size:11.5px;color:#8a8577;line-height:1.7;margin-top:26px;border-top:1px solid #ddd6c4;padding-top:14px}
 .sheetActions{display:flex;gap:8px;justify-content:flex-end;padding:14px 0;flex-wrap:wrap}
 .sheetActions .ghost{background:#fff}
@@ -3260,7 +3265,7 @@ table.rr tbody tr:last-child td{border-bottom:none}
 .homeSearch .search{max-width:none;width:100%}
 .hsResults{margin-top:10px;margin-bottom:0}
 .hsSnip{font-size:12.5px;opacity:.8;margin-top:4px;line-height:1.4}
-.hsSnip b{font-family:'IBM Plex Mono',monospace;font-weight:600;font-size:11px;opacity:.8;margin-right:6px}
+.hsSnip b{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-weight:600;font-size:11px;opacity:.8;margin-right:6px}
 .hsSnip mark{background:#F6E7B8;color:inherit;padding:0 1px;border-radius:2px}
 .notesBox textarea{min-height:96px}
 .tag.kind.contact{background:#F2EEE0;color:#7A5F22;border:1px solid #DDD0AC}
@@ -3346,7 +3351,7 @@ table.rr tbody tr:last-child td{border-bottom:none}
 .boardCard .fuqPick{padding:6px}
 .boardSeller{font-size:12.5px;font-weight:600;margin-top:3px;color:${INK};opacity:.8}
 .boardSeller:before{content:"👤 ";opacity:.7}
-.boardBsf{font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:600;color:${BRASS};margin-top:5px;letter-spacing:.01em}
+.boardBsf{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:11px;font-weight:600;color:${BRASS};margin-top:5px;letter-spacing:.01em}
 .boardBsf.none{color:#A09C90;font-weight:500}
 .tag.seller{background:#EAF0FB;color:${BLUE}}
 .lookBox{margin:4px 0 12px;border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.45;border:1px solid ${LINE};background:#fff}
@@ -3357,10 +3362,10 @@ table.rr tbody tr:last-child td{border-bottom:none}
 .lookBox.found{background:#F3F8F4;border-color:#CFE3D6}
 .lookHead{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:baseline}
 .lookHead b{font-size:13.5px;color:${GREEN}}
-.lookHead span{font-family:'IBM Plex Mono',monospace;font-size:11px;opacity:.6}
+.lookHead span{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:11px;opacity:.6}
 .lookFacts{display:grid;grid-template-columns:1fr 1fr;gap:6px 14px;margin:8px 0 6px}
 .lookFacts span{font-size:13px;font-weight:600}
-.lookFacts label{display:block;font-family:'IBM Plex Mono',monospace;font-size:9.5px;letter-spacing:.12em;text-transform:uppercase;opacity:.5;font-weight:600}
+.lookFacts label{display:block;font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:9.5px;letter-spacing:.12em;text-transform:uppercase;opacity:.5;font-weight:600}
 .lookOwner{font-size:12.5px;margin-top:4px}
 .lookLinks{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-top:8px}
 .lookLinks a{color:${BLUE};font-weight:700;font-size:13px;text-decoration:none}
@@ -3380,12 +3385,12 @@ table.rr tbody tr:last-child td{border-bottom:none}
 /* ---- underwriting v2 ---- */
 .uwGrid>*{min-width:0}
 .mini.tall{padding:7px 12px}
-.mono{font-family:'IBM Plex Mono',monospace;font-size:12px}
+.mono{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:12px;font-weight:500}
 table.rr td.bad{color:${RED};font-weight:700}
-table.rr tr.tot td{font-weight:700;background:#F6F5F1;font-family:'IBM Plex Mono',monospace;font-size:11.5px}
-table.rr.num td{font-family:'IBM Plex Mono',monospace;font-size:12px}
+table.rr tr.tot td{font-weight:700;background:#F6F5F1;font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:11.5px}
+table.rr.num td{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:12px;font-weight:500}
 table.bud{min-width:560px}
-table.bud td{text-align:right;font-family:'IBM Plex Mono',monospace;font-size:11.5px;white-space:nowrap}
+table.bud td{text-align:right;font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:12px;font-weight:500;white-space:nowrap}
 table.bud td:first-child{text-align:left;font-family:inherit;white-space:normal;font-size:12.5px;opacity:1}
 table.bud th:not(:first-child){text-align:right}
 table.bud tr.sub td{opacity:.6;font-size:11px}
@@ -3393,15 +3398,15 @@ table.bud tr.sub td:first-child{padding-left:22px;font-size:11.5px}
 table.bud tr.head td{font-weight:700}
 table.bud tr.sub2 td{font-weight:700;background:#F6F5F1}
 table.bud tr.tot td{font-weight:800;border-top:2px solid ${INK};background:#F1EEE4}
-table.sens td{font-family:'IBM Plex Mono',monospace;font-size:11.5px;line-height:1.25}
+table.sens td{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:12px;font-weight:500;line-height:1.25}
 table.sens td small{display:block;opacity:.55;font-size:10px}
 table.sens td.neg{color:${RED}}
 table.sens td.base{outline:2px solid #9C7A2E;outline-offset:-2px;font-weight:700}
-.amiSel{width:auto;padding:4px 8px;font-size:12px;font-family:'IBM Plex Mono',monospace}
+.amiSel{width:auto;padding:4px 8px;font-size:12px;font-family:'Inter',-apple-system,'Segoe UI',sans-serif}
 .chk{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:14px}
 .chk>div{border:1px solid ${LINE};border-radius:8px;padding:9px 10px;background:#FBFAF7}
 .chk span{display:block;font-size:10px;text-transform:uppercase;letter-spacing:.08em;opacity:.55}
-.chk b{display:block;font-family:'IBM Plex Mono',monospace;font-size:15px;margin-top:2px}
+.chk b{display:block;font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:15px;font-weight:600;margin-top:2px}
 .chk em{display:block;font-style:normal;font-size:10.5px;opacity:.6;margin-top:2px}
 .chk>div.ok{border-color:#84B482;background:rgba(132,180,130,.08)}
 .chk>div.ok b{color:${GREEN}}
@@ -3413,7 +3418,7 @@ table.sens td.base{outline:2px solid #9C7A2E;outline-offset:-2px;font-weight:700
 .shKpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:-6px 0 26px}
 .shKpis>div{border:1px solid #ddd0ac;background:#faf6ea;border-radius:5px;padding:12px 14px}
 .shKpis span{display:block;font-size:10.5px;font-weight:700;letter-spacing:.07em;color:#8a6f45;text-transform:uppercase}
-.shKpis b{display:block;font-family:'Source Serif 4',serif;font-size:24px;color:#1c1a15;margin-top:4px}
+.shKpis b{display:block;font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:24px;color:#1c1a15;margin-top:4px}
 .shKpis b.neg{color:#A8453A}
 .shKpis em{display:block;font-style:normal;font-size:11.5px;color:#6a6558;margin-top:2px}
 .shWrap{overflow-x:auto}
@@ -3454,6 +3459,7 @@ table.sens td.base{outline:2px solid #9C7A2E;outline-offset:-2px;font-weight:700
   .shTable tr,.shRow,.shKpis{break-inside:avoid}
   .shH{break-after:avoid}
   .shWrap{overflow:visible}
+  #uw-sheet,#uw-sheet *{font-variant-numeric:tabular-nums lining-nums;font-feature-settings:"tnum" 1,"lnum" 1,"zero" 0}
 }
 `;
 
