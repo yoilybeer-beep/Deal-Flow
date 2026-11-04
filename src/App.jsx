@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { createPortal } from "react-dom";
-import { HPD_RENTS, HPD_RENT_SRC, HPD_RENT_LABEL, PROGRAMS, BORO_COSTS, DEFAULT_COSTS, UNIT_SF, MKT_RENTS } from "./uwConstants";
+import { HPD_RENTS, HPD_RENT_SRC, HPD_RENT_LABEL, DEFAULT_AMI, RENT_DEDUCTION, RENT_DEDUCTION_LABEL, PROGRAMS, BORO_COSTS, DEFAULT_COSTS, UNIT_SF, MKT_RENTS } from "./uwConstants";
 import Papa from "papaparse";
 import { supabase } from "./supabaseClient";
 import Contacts, { contactMatches, matchingNote } from "./Contacts";
@@ -288,7 +288,7 @@ const REQ_MODES = [["sf", "% of resi floor area"], ["units", "% of units"], ["ua
 
 const costsFor = (boro) => BORO_COSTS[boro] || DEFAULT_COSTS;
 const typeMap = (fn) => Object.fromEntries(UNIT_TYPES.map(([t]) => [t, fn(t)]));
-const newTier = (ami = 60) => ({ ami, units: typeMap(() => 0), rents: hpdRents(ami) });
+const newTier = (ami = DEFAULT_AMI) => ({ ami, units: typeMap(() => 0), rents: hpdRents(ami) });
 
 function blankModel(borough = "") {
   const bc = costsFor(borough);
@@ -301,7 +301,7 @@ function blankModel(borough = "") {
     lotSF: 5000, far: 4.0, bonusFar: 0, airRightsSF: 0, airRightsPSF: 0,
     mix: typeMap((t) => ({ sf: UNIT_SF[t], units: units[t], rent: MKT_RENTS[t] })),
     addonPct: 25, gsfOverride: 0, otherGSF: 0,
-    affMode: "none", affReqPct: 0, tiers: [newTier(60)], utilAllow: typeMap(() => 0),
+    affMode: "none", affReqPct: 0, tiers: [newTier(DEFAULT_AMI)], utilAllow: typeMap((t) => RENT_DEDUCTION[t] ?? 0),
     floors: [], massReserveSF: 0,
     purchasePrice: 3000000, keyMoney: 0, groundRentYr: 0, groundRentFreeMonths: 0,
     closingCostPct: 3, otherAcqCosts: 50000, creditsAmt: 0, creditsLabel: "Brownfield / other credits",
@@ -359,7 +359,8 @@ function upgradeModel(raw) {
   const rawNet = UNIT_TYPES.reduce((s, [t]) => s + UNIT_SF[t] * units[t], 0);
   const f = oldNet > 0 && rawNet > 0 ? oldNet / rawNet : 1;
   m.mix = typeMap((t) => ({ sf: Math.round(UNIT_SF[t] * f), units: units[t], rent: rents[t] }));
-  m.tiers = tiers.length ? tiers : [newTier(60)];
+  m.tiers = tiers.length ? tiers : [newTier(DEFAULT_AMI)];
+  if (tiers.length) m.utilAllow = typeMap(() => 0);  // old affordable rents were entered as collected rents: keep them as-is
   m.gsfOverride = N(raw.actualBuildingSF);           // keeps the old cost basis exactly
   m.retailSF = commSF; m.retailPSF = commSF > 0 ? Math.round(commGross / commSF) : 50; m.retailExpPct = 0;
   m.opexPerUnit = 0; m.mgmtPct = N(raw.opexPct);      // v1 opex was a % of EGI
@@ -905,13 +906,14 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
                 </div>
                 <div className="tableWrap">
                   <table className="rr">
-                    <thead><tr><th>Type</th><th>Aff. units</th><th>Max gross rent</th><th>Net vs market</th></tr></thead>
+                    <thead><tr><th>Type</th><th>Aff. units</th><th>HPD max</th><th>Net (your basis)</th><th>vs market</th></tr></thead>
                     <tbody>
                       {UNIT_TYPES.map(([t, label]) => (
                         <tr key={t}>
                           <td>{label}</td>
                           <td><input type="number" inputMode="decimal" value={tr.units[t]} onChange={(e) => setTierU(i, t, e.target.value)} /></td>
                           <td><input type="number" inputMode="decimal" value={tr.rents[t]} onChange={(e) => setTierR(i, t, e.target.value)} /></td>
+                          <td className="mono">{money(N(tr.rents[t]) - N(m.utilAllow?.[t]))}</td>
                           <td className="mono">{N(m.mix[t].rent) ? "-" + money(N(m.mix[t].rent) - N(tr.rents[t]) + N(m.utilAllow?.[t])) : "—"}</td>
                         </tr>
                       ))}
@@ -920,7 +922,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
                 </div>
               </div>
             ))}
-            <div className="rrHead" style={{ marginTop: 14 }}><span>Utility allowance</span><em>$ / mo, subtracted from gross rent · 0 = tenant pays none</em></div>
+            <div className="rrHead" style={{ marginTop: 14 }}><span>{RENT_DEDUCTION_LABEL}</span><em>$ / mo off HPD max (utility allowance etc.) · net = HPD max − deduction</em></div>
             <div className="tableWrap">
               <table className="rr">
                 <thead><tr>{UNIT_TYPES.map(([t]) => <th key={t}>{UT_SHORT[t]}</th>)}</tr></thead>
@@ -934,7 +936,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
               {m.tiers.length < 3 && <button className="mini tall" onClick={addTier}>+ AMI tier</button>}
               <button className="mini tall" onClick={() => setM((p) => ({ ...p, tiers: p.tiers.map((t) => ({ ...t, rents: hpdRents(N(t.ami)) })) }))}>Reset rents to HPD</button>
             </div>
-            <div className="subnote">Rents default to {HPD_RENT_SRC}. Edit any rent to match the term sheet.</div>
+            <div className="subnote">Rents default to {HPD_RENT_SRC}, less the deduction row (default {DEFAULT_AMI}% AMI net: {UNIT_TYPES.map(([t]) => money((HPD_RENTS[DEFAULT_AMI]?.[t] || 0) - (RENT_DEDUCTION[t] || 0))).join(" / ")}). Edit any rent to match the term sheet.</div>
             <div className="chk">
               <div><span>Required</span><b>{m.affMode === "none" ? "—" : m.affMode === "units" ? `${c.affReqUnits} units` : `${fmt(c.affReqSF)} SF`}</b>
                 <em>{m.affMode === "units" ? `≈ ${fmt(c.affReqSF)} SF` : m.affMode === "none" ? "no set-aside" : `${c.resiNetSF ? pct(c.affReqSF / c.resiNetSF * 100) : "—"} of resi net SF`}</em></div>
@@ -1403,7 +1405,7 @@ body{background:#f2efe6;margin:0;padding:24px;}
             {affRows.length > 0 && (
               <div className="shWrap" style={{ marginTop: 10 }}>
                 <table className="shTable">
-                  <thead><tr><th>Type</th><th>Units</th><th>AMI</th><th>Gross rent</th><th>Utility allow.</th><th>Net rent</th><th>Market rent</th><th>Lost / yr</th></tr></thead>
+                  <thead><tr><th>Type</th><th>Units</th><th>AMI</th><th>HPD max</th><th>Deduction</th><th>Net rent</th><th>Market rent</th><th>Lost / yr</th></tr></thead>
                   <tbody>
                     {affRows.flatMap((r) => r.parts.map((p, k) => (
                       <tr key={r.type + k}><td>{r.label}</td><td>{p.u}</td><td>{p.ami}%</td><td>{money(p.r)}</td><td>{p.ua ? "-" + money(p.ua) : "—"}</td><td>{money(p.net)}</td><td>{money(r.rent)}</td><td>{money(p.u * (r.rent - p.net) * 12)}</td></tr>
@@ -1412,7 +1414,7 @@ body{background:#f2efe6;margin:0;padding:24px;}
                 </table>
               </div>
             )}
-            <div className="shSrc">Affordable rents: {HPD_RENT_SRC}. Net rent = gross rent − utility allowance.</div>
+            <div className="shSrc">Affordable rents: {HPD_RENT_SRC}. Net rent (your basis) = HPD max − deduction.</div>
           </div>
 
           <div className="shSec">
