@@ -23,6 +23,13 @@ export const HPD_RENTS = {
   165: { studio: 4678, "1br": 5011, "2br": 6014, "3br": 6950 },
 };
 
+/* Default deduction from HPD max gross rent, $/mo per unit type (J Realty Group's basis).
+   At 60% AMI this gives net rents Studio 1383 / 1BR 1744 / 2BR 2070 / 3BR 2371; other AMI
+   tiers use HPD max minus the same deduction. Editable per model. */
+export const DEFAULT_AMI = 60;
+export const RENT_DEDUCTION_LABEL = "Deduction (your basis)";
+export const RENT_DEDUCTION = { studio: 318, "1br": 78, "2br": 117, "3br": 156 };
+
 /* Set-aside rules (editable in the model; verify against the current rules before circulating) */
 export const PROGRAMS = {
   market: { mode: "none", pct: 0, ami: 60, avg: null, label: "Free market — no affordable set-aside." },
