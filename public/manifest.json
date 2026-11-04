@@ -1,12 +1,12 @@
 {
-  "name": "J Realty Group Deal Desk",
+  "name": "J Stone Realty Group Deal Desk",
     "short_name": "Deal Desk",
       "start_url": "/",
         "display": "standalone",
           "background_color": "#FAFAF7",
             "theme_color": "#101B2D",
               "icons": [
-                  { "src": "/icon.svg", "sizes": "512x512", "type": "image/svg+xml", "purpose": "any maskable" }
+                  { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
                     ]
                     }
                     

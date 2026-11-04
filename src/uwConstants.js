@@ -23,7 +23,7 @@ export const HPD_RENTS = {
   165: { studio: 4678, "1br": 5011, "2br": 6014, "3br": 6950 },
 };
 
-/* Default deduction from HPD max gross rent, $/mo per unit type (J Realty Group's basis).
+/* Default deduction from HPD max gross rent, $/mo per unit type (J Stone Realty Group's basis).
    At 60% AMI this gives net rents Studio 1383 / 1BR 1744 / 2BR 2070 / 3BR 2371; other AMI
    tiers use HPD max minus the same deduction. Editable per model. */
 export const DEFAULT_AMI = 60;
@@ -41,7 +41,7 @@ export const PROGRAMS = {
     label: "MIH Option 1 (DCP): 25% of residential floor area at avg 60% AMI (10% at 40% AMI)." },
 };
 
-/* Cost defaults by borough — hard $/gross SF and soft % of hard. Bronx = J Realty Group's standard ($230 hard, soft 15% of hard); other boroughs are starting points. */
+/* Cost defaults by borough — hard $/gross SF and soft % of hard. Bronx = J Stone Realty Group's standard ($230 hard, soft 15% of hard); other boroughs are starting points. */
 export const BORO_COSTS = {
   Bronx: { hard: 230, soft: 15 },
   Brooklyn: { hard: 275, soft: 15 },

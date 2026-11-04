@@ -133,7 +133,7 @@ export default function Team({ userId, notify }) {
                 Invites aren't set up yet. The invite email needs one server setting switched on first — nothing was sent and nobody was added.
               </div>
             )}
-            <div className="hintline">They get an email from J Realty Group with a link to set a password. Nobody else can sign up. Remove someone and their access ends immediately.</div>
+            <div className="hintline">They get an email from J Stone Realty Group with a link to set a password. Nobody else can sign up. Remove someone and their access ends immediately.</div>
           </div>
         </div>
       </div>
