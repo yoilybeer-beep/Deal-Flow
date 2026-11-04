@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
+import { createPortal } from "react-dom";
+import { HPD_RENTS, HPD_RENT_SRC, HPD_RENT_LABEL, PROGRAMS, BORO_COSTS, DEFAULT_COSTS, UNIT_SF, MKT_RENTS } from "./uwConstants";
 import Papa from "papaparse";
 import { supabase } from "./supabaseClient";
 import Contacts, { contactMatches, matchingNote } from "./Contacts";
@@ -266,7 +268,9 @@ const GREEN = '#2E7D5B';
 const RED = '#A8453A';
 
 /* ============================================================
-   DEVELOPMENT UNDERWRITING
+   DEVELOPMENT UNDERWRITING  (v2 — Sale / Ground-lease, unit mix,
+   affordable set-aside, hard / soft / carrying, NOI, debt, exit)
+   Everything lives in the model JSON; v1 models are upgraded on load.
    ============================================================ */
 const UNIT_TYPES = [
   ["studio", "Studio"],
@@ -274,72 +278,103 @@ const UNIT_TYPES = [
   ["2br", "2 Bedroom"],
   ["3br", "3 Bedroom"],
 ];
-const AMI_BANDS = ["80", "60", "40"];
+const UT_SHORT = { studio: "Studio", "1br": "1 BR", "2br": "2 BR", "3br": "3 BR" };
+const AMI_BANDS = ["80", "60", "40"];   // v1 layout, read only when upgrading old models
 
-const PROGRAM_PRESETS = {
-  market: {
-    affordablePct: 0,
-    market: { studio: 6, "1br": 16, "2br": 12, "3br": 6 },
-    aff: { 80: { studio:0,"1br":0,"2br":0,"3br":0 }, 60: { studio:0,"1br":0,"2br":0,"3br":0 }, 40: { studio:0,"1br":0,"2br":0,"3br":0 } },
-    note: "Market program — no set-aside applied",
-  },
-  "485x": {
-    affordablePct: 20,
-    market: { studio: 5, "1br": 13, "2br": 10, "3br": 4 },
-    aff: { 80: { studio:1,"1br":3,"2br":2,"3br":2 }, 60: { studio:0,"1br":0,"2br":0,"3br":0 }, 40: { studio:0,"1br":0,"2br":0,"3br":0 } },
-    note: "485-x — single AMI band shown; verify local option",
-  },
-  uap: {
-    affordablePct: 20,
-    market: { studio: 5, "1br": 13, "2br": 10, "3br": 4 },
-    aff: { 80: { studio:1,"1br":2,"2br":1,"3br":1 }, 60: { studio:0,"1br":0,"2br":0,"3br":0 }, 40: { studio:0,"1br":1,"2br":1,"3br":1 } },
-    note: "UAP — blended avg ~60% AMI across bands",
-  },
-  mih: {
-    affordablePct: 25,
-    market: { studio: 4, "1br": 12, "2br": 9, "3br": 5 },
-    aff: { 80: { studio:1,"1br":2,"2br":1,"3br":1 }, 60: { studio:0,"1br":0,"2br":0,"3br":0 }, 40: { studio:1,"1br":2,"2br":1,"3br":1 } },
-    note: "MIH Option 1 — blended avg ~60% AMI across bands",
-  },
-};
-const AFF_RENTS = {
-  studio: { 80: 2269, 60: 1701, 40: 1134 },
-  "1br":  { 80: 2430, 60: 1822, 40: 1215 },
-  "2br":  { 80: 2917, 60: 2187, 40: 1458 },
-  "3br":  { 80: 3369, 60: 2527, 40: 1685 },
-};
-const MKT_RENTS = { studio: 2600, "1br": 3200, "2br": 4200, "3br": 5200 };
+const AMI_LEVELS = Object.keys(HPD_RENTS).map(Number);
+const hpdRents = (ami) => ({ ...(HPD_RENTS[ami] || HPD_RENTS[60]) });
 
-function blankModel() {
-  const mkt = {}, aff = {};
-  UNIT_TYPES.forEach(([t]) => {
-    mkt[t] = { u: PROGRAM_PRESETS.market.market[t], r: MKT_RENTS[t] };
-    aff[t] = {};
-    AMI_BANDS.forEach((b) => { aff[t][b] = { u: 0, r: AFF_RENTS[t][b] }; });
-  });
+const REQ_MODES = [["sf", "% of resi floor area"], ["units", "% of units"], ["uap", "UAP bonus floor area"], ["none", "None"]];
+
+const costsFor = (boro) => BORO_COSTS[boro] || DEFAULT_COSTS;
+const typeMap = (fn) => Object.fromEntries(UNIT_TYPES.map(([t]) => [t, fn(t)]));
+const newTier = (ami = 60) => ({ ami, units: typeMap(() => 0), rents: hpdRents(ami) });
+
+function blankModel(borough = "") {
+  const bc = costsFor(borough);
+  const units = { studio: 4, "1br": 12, "2br": 7, "3br": 2 };
   return {
-    id: uid(), dealId: null,
-    dealName: "Untitled Site", marketArea: "",
-    dealType: "rental", program: "market",
+    v: 2, id: uid(), dealId: null,
+    dealName: "Untitled Site", marketArea: "", borough,
+    structure: "sale", dealType: "rental", program: "market",
     district: "", street: "narrow", devPath: "aor", overlay: "",
-    lotSF: 5000, far: 4.0, bonusFar: 0, efficiency: 83, actualBuildingSF: 20000,
-    purchasePrice: 3000000, closingCostPct: 3, otherAcqCosts: 50000,
-    hardCostPerBSF: 350, hardContingencyPct: 5, softCostPct: 20,
-    ltcPct: 65, interestRatePct: 9.0, constructionMonths: 24,
-    originationFeePct: 1.0, avgOutstandingPct: 60,
-    totalUnits: 40, affordablePct: 0, targetTotalUnits: 0,
-    mkt, aff,
-    comm: [ {sf:0,rent:50},{sf:0,rent:50},{sf:0,rent:50},{sf:0,rent:50} ],
-    commVacancyPct: 10, commCapRate: 6.0,
-    vacancyPct: 5, opexPct: 38, propertyTaxAnnual: 0, exitCapRatePct: 5.25,
-    marketSellPSF: 1400, affordableSellPSF: 700, sellingCostPct: 6, isPublic: false,
-    updated: new Date().toISOString().slice(0, 10),
+    lotSF: 5000, far: 4.0, bonusFar: 0, airRightsSF: 0, airRightsPSF: 0,
+    mix: typeMap((t) => ({ sf: UNIT_SF[t], units: units[t], rent: MKT_RENTS[t] })),
+    addonPct: 25, gsfOverride: 0, otherGSF: 0,
+    affMode: "none", affReqPct: 0, tiers: [newTier(60)], utilAllow: typeMap(() => 0),
+    floors: [], massReserveSF: 0,
+    purchasePrice: 3000000, keyMoney: 0, groundRentYr: 0, groundRentFreeMonths: 0,
+    closingCostPct: 3, otherAcqCosts: 50000, creditsAmt: 0, creditsLabel: "Brownfield / other credits",
+    hardCostPerBSF: bc.hard, hardContingencyPct: 0, softCostPct: bc.soft,
+    constructionMonths: 24, ltcPct: 65, interestRatePct: 9.0, avgOutstandingPct: 60, originationFeePct: 1.0,
+    cTaxesYr: 30000, cInsurancePct: 1.5,
+    retailSF: 0, retailPSF: 50, commVacancyPct: 10, retailExpPct: 10, commCapRate: 6.0,
+    parkingSpaces: 0, parkingRent: 200, otherIncomeYr: 0,
+    vacancyPct: 5, opexPerUnit: 6000, mgmtPct: 3, propertyTaxAnnual: 0, exitCapRatePct: 5.5,
+    permLoanPct: 65, permLoanAmt: 0, permRatePct: 6.5, permAmortYrs: 30,
+    marketSellPSF: 1100, affordableSellPSF: 500, sellingCostPct: 6,
+    isPublic: false, updated: new Date().toISOString().slice(0, 10),
   };
+}
+
+/* ---------- load any saved model (v1 or v2) into the v2 shape ---------- */
+function upgradeModel(raw) {
+  if (!raw) return blankModel();
+  const base = blankModel(raw.borough || "");
+  if (N(raw.v) >= 2) {
+    const tiers = Array.isArray(raw.tiers) && raw.tiers.length ? raw.tiers.map((t) => ({
+      ami: N(t.ami) || 60, units: { ...typeMap(() => 0), ...(t.units || {}) }, rents: { ...hpdRents(N(t.ami) || 60), ...(t.rents || {}) },
+    })) : base.tiers;
+    const mix = typeMap((t) => ({ ...base.mix[t], ...((raw.mix || {})[t] || {}) }));
+    return { ...base, ...raw, mix, tiers, utilAllow: { ...base.utilAllow, ...(raw.utilAllow || {}) }, floors: Array.isArray(raw.floors) ? raw.floors : [] };
+  }
+  // v1 → v2: keep every number that drove the old result (building SF, costs, opex %, rents)
+  const m = { ...base, ...raw, v: 2, id: raw.id || base.id };
+  const comm = Array.isArray(raw.comm) ? raw.comm : [];
+  const commSF = comm.reduce((s, c) => s + N(c.sf), 0);
+  const commGross = comm.reduce((s, c) => s + N(c.sf) * N(c.rent), 0);
+  const oldNet = Math.max(0, N(raw.actualBuildingSF) - commSF) * N(raw.efficiency ?? 83) / 100;
+  const units = typeMap(() => 0), rents = typeMap((t) => MKT_RENTS[t]);
+  const tiers = [];
+  if (raw.dealType === "condo") {
+    const tot = Math.round(N(raw.totalUnits)), aff = Math.round(tot * N(raw.affordablePct) / 100);
+    units["1br"] = tot;
+    if (aff > 0) { const tr = newTier(60); tr.units["1br"] = aff; tiers.push(tr); }
+  } else {
+    UNIT_TYPES.forEach(([t]) => {
+      const mk = (raw.mkt || {})[t] || {};
+      units[t] += N(mk.u); if (N(mk.r) > 0) rents[t] = N(mk.r);
+    });
+    AMI_BANDS.forEach((b) => {
+      const tr = { ami: Number(b), units: typeMap(() => 0), rents: hpdRents(Number(b)) };
+      let any = 0;
+      UNIT_TYPES.forEach(([t]) => {
+        const a = ((raw.aff || {})[t] || {})[b] || {};
+        tr.units[t] = N(a.u); any += N(a.u); units[t] += N(a.u);
+        if (N(a.r) > 0) tr.rents[t] = N(a.r);
+      });
+      if (any > 0) tiers.push(tr);
+    });
+  }
+  const rawNet = UNIT_TYPES.reduce((s, [t]) => s + UNIT_SF[t] * units[t], 0);
+  const f = oldNet > 0 && rawNet > 0 ? oldNet / rawNet : 1;
+  m.mix = typeMap((t) => ({ sf: Math.round(UNIT_SF[t] * f), units: units[t], rent: rents[t] }));
+  m.tiers = tiers.length ? tiers : [newTier(60)];
+  m.gsfOverride = N(raw.actualBuildingSF);           // keeps the old cost basis exactly
+  m.retailSF = commSF; m.retailPSF = commSF > 0 ? Math.round(commGross / commSF) : 50; m.retailExpPct = 0;
+  m.opexPerUnit = 0; m.mgmtPct = N(raw.opexPct);      // v1 opex was a % of EGI
+  m.cTaxesYr = 0; m.cInsurancePct = 0;                // v1 had no construction taxes / insurance
+  m.hardContingencyPct = N(raw.hardContingencyPct);
+  const P = PROGRAMS[raw.program] || PROGRAMS.market;
+  m.affMode = P.mode; m.affReqPct = P.pct;
+  m.structure = "sale"; m.keyMoney = 0; m.groundRentYr = 0;
+  delete m.mkt; delete m.aff; delete m.comm;
+  return m;
 }
 
 /* ---------- prefill a model from a Deal Desk deal ---------- */
 function modelFromDeal(deal) {
-  const m = blankModel();
+  const m = blankModel(deal.borough || "");
   const district = resolveDistrict(deal.zone) || "";
   const uapPath = deal.devPath === "uap";
   m.dealId = deal.id;
@@ -350,117 +385,295 @@ function modelFromDeal(deal) {
   m.devPath = uapPath ? "uap" : "aor";
   m.lotSF = N(deal.lotArea) || 0;
   m.purchasePrice = N(deal.askingPrice) || 0;
+  m.cTaxesYr = Math.round(m.purchasePrice * 0.01);
   const v = district ? farFor(district, m.street) : null;
   if (v) {
     m.far = v.aor;
     m.bonusFar = uapPath && v.uap ? v.uap : 0;
-    const eff = uapPath && v.uap ? v.uap : v.aor;
-    m.actualBuildingSF = Math.round(m.lotSF * eff);
-    if (uapPath) m.program = "uap";
+    if (uapPath) { m.program = "uap"; m.affMode = "uap"; }
   } else if (deal.customFar) {
     m.far = N(deal.customFar);
-    m.actualBuildingSF = Math.round(m.lotSF * N(deal.customFar));
   }
-  if (N(deal.buildableSf) > 0) m.actualBuildingSF = Math.round(N(deal.buildableSf));   // his own buildable number wins
-  return m;
+  const target = N(deal.buildableSf) > 0 ? N(deal.buildableSf) : m.lotSF * (N(m.bonusFar) > 0 ? N(m.bonusFar) : N(m.far));
+  if (N(deal.buildableSf) > 0 && m.lotSF > 0) {           // his own buildable number wins
+    const f = Math.round(N(deal.buildableSf) / m.lotSF * 100) / 100;
+    if (uapPath && v) m.bonusFar = f; else { m.far = f; m.bonusFar = 0; }
+  }
+  return fitMix(m, target);
 }
 
-/* ---------- the model math ---------- */
+/* scale the unit counts so resi gross + retail ≈ the target buildable SF */
+function fitMix(m, targetBSF) {
+  const target = N(targetBSF) - N(m.retailSF);
+  if (target <= 0) return m;
+  const mix = { ...m.mix };
+  let net = UNIT_TYPES.reduce((s, [t]) => s + N(mix[t].sf) * N(mix[t].units), 0);
+  if (net <= 0) {
+    const d = { studio: 4, "1br": 12, "2br": 7, "3br": 2 };
+    UNIT_TYPES.forEach(([t]) => { mix[t] = { ...mix[t], units: d[t], sf: N(mix[t].sf) || UNIT_SF[t] }; });
+    net = UNIT_TYPES.reduce((s, [t]) => s + N(mix[t].sf) * N(mix[t].units), 0);
+  }
+  const goalNet = target / (1 + N(m.addonPct) / 100);
+  const f = goalNet / net;
+  UNIT_TYPES.forEach(([t]) => { mix[t] = { ...mix[t], units: Math.max(0, Math.floor(N(mix[t].units) * f)) }; });
+  // top up one unit at a time (largest type that still fits) without going over the envelope
+  const netOf = () => UNIT_TYPES.reduce((s, [t]) => s + N(mix[t].sf) * N(mix[t].units), 0);
+  for (let g = 0; g < 200; g++) {
+    const room = goalNet - netOf();
+    const fit = UNIT_TYPES.map(([t]) => t).filter((t) => N(mix[t].sf) > 0 && N(mix[t].sf) <= room);
+    if (!fit.length) break;
+    const t = fit.reduce((best, x) => (N(mix[x].units) * N(mix[best].sf) < N(mix[best].units) * N(mix[x].sf) ? x : best), fit[0]);
+    mix[t] = { ...mix[t], units: N(mix[t].units) + 1 };
+  }
+  return { ...m, mix };
+}
+
+/* ---------- affordable units needed to meet the requirement (fills tier 1) ---------- */
+function autoAffordable(m) {
+  const c = runCalc(m);
+  const tiers = m.tiers.map((t) => ({ ...t, units: { ...t.units } }));
+  const t0 = tiers[0];
+  const others = (t) => tiers.slice(1).reduce((s, x) => s + N(x.units[t]), 0);
+  UNIT_TYPES.forEach(([t]) => { t0.units[t] = 0; });
+  const need = () => {
+    const cc = runCalc({ ...m, tiers });
+    return c.affMode === "units" ? cc.affReqUnits - cc.affUnits : cc.affReqSF - cc.affSF;
+  };
+  if (c.affMode === "none") return { ...m, tiers };
+  // proportional first pass (keeps the bedroom mix proportional), then top up
+  const share = c.affMode === "units"
+    ? (c.totalUnits > 0 ? c.affReqUnits / c.totalUnits : 0)
+    : (c.resiNetSF > 0 ? c.affReqSF / c.resiNetSF : 0);
+  UNIT_TYPES.forEach(([t]) => {
+    const room = Math.max(0, N(m.mix[t].units) - others(t));
+    t0.units[t] = Math.min(room, Math.floor(N(m.mix[t].units) * share));
+  });
+  for (let guard = 0; guard < 400 && need() > 0; guard++) {
+    // add one unit to the type with the lowest affordable share (keeps the bedroom mix proportional)
+    let best = null, bestShare = Infinity;
+    UNIT_TYPES.forEach(([t]) => {
+      const u = N(m.mix[t].units), room = u - others(t) - t0.units[t];
+      const sh = u > 0 ? (others(t) + t0.units[t] + 1) / u : Infinity;
+      if (room > 0 && sh < bestShare) { bestShare = sh; best = t; }
+    });
+    if (!best) break;
+    t0.units[best] += 1;
+  }
+  return { ...m, tiers };
+}
+
+const pmtYr = (loan, ratePct, years) => {
+  const r = N(ratePct) / 100 / 12, n = N(years) * 12;
+  if (loan <= 0 || n <= 0) return 0;
+  if (r === 0) return loan / n * 12;
+  return loan * r / (1 - Math.pow(1 + r, -n)) * 12;
+};
+
+/* ---------- the model math (one set of numbers for screen + report) ---------- */
 function runCalc(m) {
-  const effFAR = N(m.bonusFar) > 0 ? N(m.bonusFar) : N(m.far);
+  const lease = m.structure === "lease";
+  const rental = m.dealType !== "condo";
   const lotSF = N(m.lotSF);
-  const buildableSF = lotSF * effFAR;
-  const actualBuildingSF = N(m.actualBuildingSF);
-
-  let commTotalSF = 0, commGross = 0;
-  m.comm.forEach((c) => { commTotalSF += N(c.sf); commGross += N(c.sf) * N(c.rent); });
-  const commEGI = commGross * (1 - N(m.commVacancyPct) / 100);
-  const residentialSF = Math.max(0, actualBuildingSF - commTotalSF);
-  const netSF = residentialSF * N(m.efficiency) / 100;
-
-  const rawFactor = buildableSF / 680;
+  const baseFAR = N(m.far);
+  const effFAR = N(m.bonusFar) > 0 ? N(m.bonusFar) : baseFAR;
+  const baseBSF = lotSF * baseFAR;
+  const zoningBSF = lotSF * effFAR;
+  const bonusBSF = Math.max(0, zoningBSF - baseBSF);
+  const airSF = N(m.airRightsSF);
+  const totalBSF = zoningBSF + airSF;
+  const rawFactor = totalBSF / 680;
   const maxUnitsByZoning = Math.floor(rawFactor) + (rawFactor - Math.floor(rawFactor) >= 0.75 ? 1 : 0);
 
-  const totalAcq = N(m.purchasePrice) + N(m.purchasePrice) * N(m.closingCostPct) / 100 + N(m.otherAcqCosts);
-  const totalHard = actualBuildingSF * N(m.hardCostPerBSF) * (1 + N(m.hardContingencyPct) / 100);
-  const totalSoft = totalHard * N(m.softCostPct) / 100;
-  const loan = N(m.ltcPct) / 100 * (totalAcq + totalHard + totalSoft);
-  const interestReserve = loan * N(m.interestRatePct) / 100 * (N(m.constructionMonths) / 12) * N(m.avgOutstandingPct) / 100;
-  const origFee = loan * N(m.originationFeePct) / 100;
-  const totalFin = interestReserve + origFee;
-  const TDC = totalAcq + totalHard + totalSoft + totalFin;
-
-  let totalUnits, marketUnits, affordableUnits, gpi = 0, rentRoll = [];
-  if (m.dealType === "rental") {
-    let mu = 0, au = 0;
-    UNIT_TYPES.forEach(([t]) => {
-      const cm = m.mkt[t];
-      mu += N(cm.u); gpi += N(cm.u) * N(cm.r) * 12;
-      const bands = {};
-      AMI_BANDS.forEach((b) => {
-        const ca = m.aff[t][b];
-        au += N(ca.u); gpi += N(ca.u) * N(ca.r) * 12;
-        if (N(ca.u) > 0) bands[b] = { u: N(ca.u), r: N(ca.r) };
-      });
-      rentRoll.push({ type: t, mu: N(cm.u), mr: N(cm.r), bands });
+  // unit mix + affordable tiers
+  const tiers = Array.isArray(m.tiers) ? m.tiers : [];
+  const rows = UNIT_TYPES.map(([t, label]) => {
+    const x = (m.mix || {})[t] || {};
+    const sf = N(x.sf), units = N(x.units), rent = N(x.rent);
+    let affU = 0, affRentM = 0, lostM = 0;
+    const parts = [];
+    const ua = N((m.utilAllow || {})[t]);   // utility allowance: max gross rent − allowance = rent collected
+    tiers.forEach((tr) => {
+      const u = N(tr.units?.[t]), r = N(tr.rents?.[t]), net = r - ua;
+      if (u > 0) { affU += u; affRentM += u * net; lostM += u * (rent - net); parts.push({ u, r, net, ua, ami: N(tr.ami) }); }
     });
-    marketUnits = mu; affordableUnits = au; totalUnits = mu + au;
-  } else {
-    totalUnits = N(m.totalUnits);
-    affordableUnits = totalUnits * N(m.affordablePct) / 100;
-    marketUnits = totalUnits - affordableUnits;
-  }
-  const avgUnitSF = totalUnits > 0 ? netSF / totalUnits : 0;
+    const mktU = Math.max(0, units - affU);
+    return { type: t, label, sf, units, rent, affU, mktU, parts, over: affU > units,
+      netSF: sf * units, affSF: sf * Math.min(affU, units), mktSF: sf * mktU, mktRentM: mktU * rent, affRentM, lostM };
+  });
+  const sum = (k) => rows.reduce((s, r) => s + r[k], 0);
+  const totalUnits = sum("units"), affUnits = sum("affU"), marketUnits = sum("mktU");
+  const resiNetSF = sum("netSF"), affSF = sum("affSF"), mktSF = sum("mktSF");
+  const addon = N(m.addonPct) / 100;
+  const resiGSF = resiNetSF * (1 + addon);
+  const retailSF = N(m.retailSF);
+  const zfaUsed = resiGSF + retailSF;
+  const computedGSF = zfaUsed + N(m.otherGSF);
+  const GSF = N(m.gsfOverride) > 0 ? N(m.gsfOverride) : computedGSF;
+  const bsfLeft = totalBSF - zfaUsed;
+  const overAlloc = rows.some((r) => r.over);
 
-  const out = {
-    effFAR, lotSF, buildableSF, actualBuildingSF, maxUnitsByZoning, netSF,
-    commTotalSF, commGross, commEGI, residentialSF,
-    totalAcq, totalHard, totalSoft, totalFin, TDC,
-    totalUnits, marketUnits, affordableUnits, avgUnitSF, rentRoll,
+  // affordable requirement
+  const affMode = m.affMode || "none";
+  let affReqSF = 0, affReqUnits = 0;
+  if (affMode === "sf") affReqSF = resiNetSF * N(m.affReqPct) / 100;
+  if (affMode === "uap") affReqSF = (1 + addon) > 0 ? bonusBSF / (1 + addon) : 0;   // bonus floor area, on a net basis
+  if (affMode === "units") { affReqUnits = Math.ceil(totalUnits * N(m.affReqPct) / 100 - 1e-9); affReqSF = totalUnits > 0 ? resiNetSF * affReqUnits / totalUnits : 0; }
+  const affSurplusSF = affSF - affReqSF;
+  const affSurplusUnits = affUnits - affReqUnits;
+  const affMet = affMode === "none" ? true : affMode === "units" ? affSurplusUnits >= 0 : affSurplusSF >= -0.5;
+  const affAvgAmi = affUnits > 0 ? tiers.reduce((s, tr) => s + UNIT_TYPES.reduce((a, [t]) => a + N(tr.units?.[t]), 0) * N(tr.ami), 0) / affUnits : 0;
+
+  // income
+  const mktResiM = sum("mktRentM"), affResiM = sum("affRentM"), resiM = mktResiM + affResiM;
+  const lostM = sum("lostM");
+  const retailYr = retailSF * N(m.retailPSF);
+  const parkingM = N(m.parkingSpaces) * N(m.parkingRent);
+  const otherYr = N(m.otherIncomeYr);
+  const resiYr = resiM * 12;
+  const GPI = resiYr + parkingM * 12 + otherYr + retailYr;
+  const resiVac = (resiYr + parkingM * 12 + otherYr) * N(m.vacancyPct) / 100;
+  const retailVac = retailYr * N(m.commVacancyPct) / 100;
+  const vacancy = resiVac + retailVac;
+  const EGI = GPI - vacancy;
+  const exResi = N(m.opexPerUnit) * totalUnits;
+  const exMgmt = EGI * N(m.mgmtPct) / 100;
+  const exRetail = retailYr * N(m.retailExpPct) / 100;
+  const exTax = N(m.propertyTaxAnnual);
+  const exGround = lease ? N(m.groundRentYr) : 0;
+  const opexTotal = exResi + exMgmt + exRetail + exTax + exGround;
+  const NOI = EGI - opexTotal;
+
+  // cost
+  const price = lease ? N(m.keyMoney) : N(m.purchasePrice);
+  const closing = price * N(m.closingCostPct) / 100;
+  const airCost = airSF * N(m.airRightsPSF);
+  const otherAcq = N(m.otherAcqCosts);
+  const totalAcq = price + closing + otherAcq + airCost;
+  const hardBase = GSF * N(m.hardCostPerBSF);
+  const contingency = hardBase * N(m.hardContingencyPct) / 100;
+  const totalHard = hardBase + contingency;
+  const totalSoft = totalHard * N(m.softCostPct) / 100;
+  const months = N(m.constructionMonths);
+  const constrLoan = N(m.ltcPct) / 100 * (totalAcq + totalHard + totalSoft);
+  const cInterest = constrLoan * N(m.interestRatePct) / 100 * (months / 12) * N(m.avgOutstandingPct) / 100;
+  const cFees = constrLoan * N(m.originationFeePct) / 100;
+  const cTaxes = N(m.cTaxesYr) * months / 12;
+  const cInsurance = totalHard * N(m.cInsurancePct) / 100;
+  const cGround = lease ? N(m.groundRentYr) * Math.max(0, months - N(m.groundRentFreeMonths)) / 12 : 0;
+  const totalCarry = cInterest + cFees + cTaxes + cInsurance + cGround;
+  const constrSubtotal = totalHard + totalSoft + totalCarry;
+  const TPC = totalAcq + constrSubtotal;
+  const credits = Math.abs(N(m.creditsAmt));
+  const netCost = TPC - credits;
+  const TDC = TPC;   // v1 name
+
+  const per = (x) => ({ bsf: totalBSF > 0 ? x / totalBSF : 0, gsf: GSF > 0 ? x / GSF : 0, unit: totalUnits > 0 ? x / totalUnits : 0 });
+
+  const cap = N(m.exitCapRatePct);
+  const exitValue = cap > 0 ? NOI / (cap / 100) : 0;
+  const equityCreated = exitValue - netCost;
+  const yieldOnCost = TPC > 0 ? NOI / TPC * 100 : 0;
+  const yieldOnNet = netCost > 0 ? NOI / netCost * 100 : 0;
+  const lostYr = lostM * 12;
+  const lostValue = cap > 0 ? lostYr / (cap / 100) : 0;
+
+  // permanent loan
+  const permLoan = N(m.permLoanAmt) > 0 ? N(m.permLoanAmt) : netCost * N(m.permLoanPct) / 100;
+  const dsAmort = pmtYr(permLoan, m.permRatePct, m.permAmortYrs);
+  const dsIO = permLoan * N(m.permRatePct) / 100;
+  const cfAmort = NOI - dsAmort, cfIO = NOI - dsIO;
+  const dscr = dsAmort > 0 ? NOI / dsAmort : 0;
+  const dscrIO = dsIO > 0 ? NOI / dsIO : 0;
+  const equityIn = netCost - permLoan;
+  const coc = equityIn > 0 ? cfAmort / equityIn * 100 : 0;
+  const debtYield = permLoan > 0 ? NOI / permLoan * 100 : 0;
+  const constant = permLoan > 0 ? dsAmort / permLoan : 0;
+  const maxLoan125 = constant > 0 ? NOI / 1.25 / constant : 0;
+
+  // condo sellout (main case for condo, "alt exit" for rental)
+  const sellGross = mktSF * N(m.marketSellPSF) + affSF * N(m.affordableSellPSF);
+  const sellCosts = sellGross * N(m.sellingCostPct) / 100;
+  const sellNet = sellGross - sellCosts;
+  const retailNOI = (retailYr - retailVac) - exRetail;
+  const retailValue = N(m.commCapRate) > 0 ? retailNOI / (N(m.commCapRate) / 100) : 0;
+  const condoProfit = sellNet + retailValue - netCost;
+  const condoMargin = netCost > 0 ? condoProfit / netCost * 100 : 0;
+  const condoMarginRev = (sellNet + retailValue) > 0 ? condoProfit / (sellNet + retailValue) * 100 : 0;
+
+  const profit = rental ? equityCreated : condoProfit;
+  const margin = netCost > 0 ? profit / netCost * 100 : 0;
+
+  return {
+    lease, rental, lotSF, baseFAR, effFAR, baseBSF, zoningBSF, bonusBSF, airSF, totalBSF, buildableSF: zoningBSF, maxUnitsByZoning,
+    rows, totalUnits, affUnits, marketUnits, affordableUnits: affUnits, resiNetSF, affSF, mktSF, resiGSF, retailSF, zfaUsed, computedGSF, GSF,
+    actualBuildingSF: GSF, netSF: resiNetSF, bsfLeft, overAlloc,
+    affMode, affReqSF, affReqUnits, affSurplusSF, affSurplusUnits, affMet, affAvgAmi,
+    mktResiM, affResiM, resiM, lostM, lostYr, lostValue, retailYr, parkingM, otherYr, resiYr, GPI, resiVac, retailVac, vacancy, EGI,
+    exResi, exMgmt, exRetail, exTax, exGround, opexTotal, NOI,
+    price, closing, airCost, otherAcq, totalAcq, hardBase, contingency, totalHard, totalSoft,
+    constrLoan, cInterest, cFees, cTaxes, cInsurance, cGround, totalCarry, constrSubtotal, TPC, TDC, credits, netCost, per,
+    cap, exitValue, equityCreated, yieldOnCost, yieldOnNet,
+    permLoan, dsAmort, dsIO, cfAmort, cfIO, dscr, dscrIO, equityIn, coc, debtYield, maxLoan125,
+    sellGross, sellCosts, sellNet, retailNOI, retailValue, condoProfit, condoMargin, condoMarginRev,
+    profit, margin,
+    avgRentUnit: totalUnits > 0 ? resiM / totalUnits : 0,
+    avgMktRent: marketUnits > 0 ? mktResiM / marketUnits : 0,
+    avgAffRent: affUnits > 0 ? affResiM / affUnits : 0,
+    rentPSF: resiNetSF > 0 ? resiYr / resiNetSF : 0,
+    mktRentPSF: mktSF > 0 ? mktResiM * 12 / mktSF : 0,
+    affRentPSF: affSF > 0 ? affResiM * 12 / affSF : 0,
   };
-
-  if (m.dealType === "rental") {
-    const resEGI = gpi * (1 - N(m.vacancyPct) / 100);
-    const EGI = resEGI + commEGI;
-    const opex = EGI * N(m.opexPct) / 100;
-    const NOI = EGI - opex - N(m.propertyTaxAnnual);
-    const cap = N(m.exitCapRatePct);
-    const exitValue = cap > 0 ? NOI / (cap / 100) : 0;
-    out.GPI = gpi; out.EGI = EGI; out.opex = opex; out.NOI = NOI;
-    out.capRate = cap; out.exitValue = exitValue;
-    out.yieldOnCost = TDC > 0 ? NOI / TDC * 100 : 0;
-    out.profit = exitValue - TDC;
-  } else {
-    const mSF = totalUnits > 0 ? netSF * (marketUnits / totalUnits) : 0;
-    const aSF = totalUnits > 0 ? netSF * (affordableUnits / totalUnits) : 0;
-    const gross = mSF * N(m.marketSellPSF) + aSF * N(m.affordableSellPSF);
-    const net = gross * (1 - N(m.sellingCostPct) / 100);
-    const commVal = N(m.commCapRate) > 0 ? commEGI / (N(m.commCapRate) / 100) : 0;
-    out.grossRevenue = gross; out.netRevenue = net; out.commercialValue = commVal;
-    out.profit = net + commVal - TDC;
-    out.marginOnRevenue = (net + commVal) > 0 ? out.profit / (net + commVal) * 100 : 0;
-  }
-  out.margin = TDC > 0 ? out.profit / TDC * 100 : 0;
-  return out;
 }
+
+/* ---------- sensitivity: hard cost $/SF × exit cap (rental) or × sellout $/SF (condo) ---------- */
+function sensitivity(m) {
+  const rental = m.dealType !== "condo";
+  const hard = N(m.hardCostPerBSF);
+  const rowsV = [-30, -15, 0, 15, 30].map((d) => Math.max(0, hard + d));
+  const colsV = rental
+    ? [-0.5, -0.25, 0, 0.25, 0.5].map((d) => Math.max(0.25, N(m.exitCapRatePct) + d))
+    : [-0.1, -0.05, 0, 0.05, 0.1].map((d) => Math.round(N(m.marketSellPSF) * (1 + d)));
+  const grid = rowsV.map((h) => colsV.map((cv) => {
+    const mm = rental ? { ...m, hardCostPerBSF: h, exitCapRatePct: cv } : { ...m, hardCostPerBSF: h, marketSellPSF: cv };
+    const c = runCalc(mm);
+    return { profit: c.profit, yoc: c.yieldOnCost };
+  }));
+  return { rental, rowsV, colsV, grid };
+}
+
+/* ---------- formatting helpers ---------- */
+const psf = (n) => (n == null || isNaN(n) || !isFinite(n) ? "—" : "$" + Math.round(n).toLocaleString("en-US"));
+const sMoney = (n) => (n < 0 ? "-" : "") + money(Math.abs(n));
+const kMoney = (n) => {
+  const a = Math.abs(n), s = n < 0 ? "-" : "";
+  if (a >= 1e6) return s + "$" + (a / 1e6).toFixed(a >= 1e7 ? 1 : 2) + "M";
+  if (a >= 1e3) return s + "$" + Math.round(a / 1e3) + "K";
+  return s + "$" + Math.round(a);
+};
+const x2 = (n) => (isFinite(n) && n > 0 ? n.toFixed(2) + "x" : "—");
 
 /* ============================================================ */
 function Underwriting({ initialModel, onExit, notify, userId, userName }) {
-  const [m, setM] = useState(initialModel || blankModel());
+  const [m, setM] = useState(() => upgradeModel(initialModel));
   const [saved, setSaved] = useState([]);
   const [sheet, setSheet] = useState(false);
   const [busy, setBusy] = useState(false);
   const c = useMemo(() => runCalc(m), [m]);
+  const sens = useMemo(() => sensitivity(m), [m]);
 
   const set = (k, v) => setM((p) => ({ ...p, [k]: v }));
-  const setMkt = (t, f, v) => setM((p) => ({ ...p, mkt: { ...p.mkt, [t]: { ...p.mkt[t], [f]: v } } }));
-  const setAff = (t, b, f, v) => setM((p) => ({
-    ...p, aff: { ...p.aff, [t]: { ...p.aff[t], [b]: { ...p.aff[t][b], [f]: v } } },
-  }));
-  const setComm = (i, f, v) => setM((p) => {
-    const comm = p.comm.map((x, j) => (j === i ? { ...x, [f]: v } : x));
-    return { ...p, comm };
-  });
+  const num = (k, step = "any") => (
+    <input type="number" inputMode="decimal" step={step} value={m[k] ?? ""} onChange={(e) => set(k, e.target.value)} />
+  );
+  const setMix = (t, f, v) => setM((p) => ({ ...p, mix: { ...p.mix, [t]: { ...p.mix[t], [f]: v } } }));
+  const setTier = (i, fn) => setM((p) => ({ ...p, tiers: p.tiers.map((x, j) => (j === i ? fn(x) : x)) }));
+  const setTierU = (i, t, v) => setTier(i, (x) => ({ ...x, units: { ...x.units, [t]: v } }));
+  const setTierR = (i, t, v) => setTier(i, (x) => ({ ...x, rents: { ...x.rents, [t]: v } }));
+  const setTierAmi = (i, ami) => setTier(i, (x) => ({ ...x, ami: Number(ami), rents: hpdRents(Number(ami)) }));
+  const addTier = () => setM((p) => (p.tiers.length >= 3 ? p : { ...p, tiers: [...p.tiers, newTier(p.tiers.some((t) => N(t.ami) === 40) ? 80 : 40)] }));
+  const delTier = (i) => setM((p) => ({ ...p, tiers: p.tiers.length > 1 ? p.tiers.filter((_, j) => j !== i) : [newTier(60)] }));
+  const setFloor = (i, f, v) => setM((p) => ({ ...p, floors: p.floors.map((x, j) => (j === i ? { ...x, [f]: v } : x)) }));
+  const [fill, setFill] = useState({ n: 8, cov: 70, eff: 85 });
 
   useEffect(() => { loadList(); }, []);
   const loadList = async () => {
@@ -469,7 +682,8 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
   };
   const save = async () => {
     setBusy(true);
-    const rec = { ...m, ownerName: m.ownerName || userName, updated: new Date().toISOString().slice(0, 10) };
+    const rec = { ...m, v: 2, ownerName: m.ownerName || userName, updated: new Date().toISOString().slice(0, 10) };
+    delete rec._owner;
     setM(rec);
     const { error } = await supabase.from("models").upsert({
       id: rec.id, data: rec, owner_id: userId, is_public: !!rec.isPublic, updated_at: new Date().toISOString(),
@@ -493,20 +707,31 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
     }));
   };
   const applyProgram = (prog) => {
-    const P = PROGRAM_PRESETS[prog];
+    const P = PROGRAMS[prog];
     setM((p) => {
-      const mkt = { ...p.mkt }, aff = { ...p.aff };
-      UNIT_TYPES.forEach(([t]) => {
-        mkt[t] = { ...mkt[t], u: P.market[t] };
-        aff[t] = { ...aff[t] };
-        AMI_BANDS.forEach((b) => { aff[t][b] = { ...aff[t][b], u: P.aff[b][t] }; });
-      });
-      return { ...p, program: prog, affordablePct: P.affordablePct, mkt, aff };
+      let pct = P.pct;
+      if (prog === "485x") pct = runCalc(p).totalUnits >= 100 ? 25 : 20;
+      const tiers = p.tiers.map((t, i) => (i === 0 ? { ...t, ami: P.ami, rents: hpdRents(P.ami) } : t));
+      const next = { ...p, program: prog, affMode: P.mode, affReqPct: pct, tiers };
+      if (prog === "uap" && p.devPath !== "uap") {
+        const v = p.district ? farFor(p.district, p.street) : null;
+        next.devPath = "uap";
+        if (v && v.uap) next.bonusFar = v.uap;
+      }
+      return next;
     });
+  };
+  const applyBorough = (b) => {
+    const bc = costsFor(b);
+    setM((p) => ({ ...p, borough: b, hardCostPerBSF: bc.hard, softCostPct: bc.soft }));
+    notify?.(`${b || "Default"} costs: hard $${bc.hard}/SF, soft ${bc.soft}% of hard (editable)`);
   };
 
   const isSS = streetSensitive.includes(m.district);
-  const rental = m.dealType === "rental";
+  const rental = c.rental, lease = c.lease;
+  const P = PROGRAMS[m.program] || PROGRAMS.market;
+  const bc = costsFor(m.borough);
+  const tierAmiOK = (m.tiers || []).every((t) => N(t.ami) <= 100);
 
   return (
     <div className="uw">
@@ -516,7 +741,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
           <h1 style={{ margin: "2px 0 8px", fontSize: 26, fontWeight: 800, letterSpacing: "-0.01em" }}>Development Site Model</h1>
           <div className="dealline">
             <span>Deal</span>
-            <input value={m.dealName} onChange={(e) => set("dealName", e.target.value)} placeholder="230 W 122nd Street" />
+            <input value={m.dealName} onChange={(e) => set("dealName", e.target.value)} />
           </div>
           <div className="dealline">
             <span>Market</span>
@@ -529,7 +754,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
           <button className="ghost" data-on={!!m.isPublic} onClick={() => set("isPublic", !m.isPublic)}>
             {m.isPublic ? "Published ✓" : "Private"}
           </button>
-          <button className="ghost" onClick={() => setSheet(true)}>Client summary</button>
+          <button className="ghost" onClick={() => setSheet(true)}>Report / PDF</button>
           <button className="primary" onClick={save} disabled={busy}>{busy ? "Saving…" : "Save model"}</button>
         </div>
       </header>
@@ -538,7 +763,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
         <div className="savedStrip">
           {saved.map((s) => (
             <span key={s.id} className="savedChip">
-              <span onClick={() => setM(s)}>{s.dealName}{s._owner && s._owner !== userId ? ` · ${s.ownerName || "shared"}` : ""}</span>
+              <span onClick={() => setM(upgradeModel(s))}>{s.dealName}{s._owner && s._owner !== userId ? ` · ${s.ownerName || "shared"}` : ""}</span>
               {(!s._owner || s._owner === userId) && <b onClick={() => del(s.id)}>✕</b>}
             </span>
           ))}
@@ -547,7 +772,14 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
 
       <div className="segRow">
         <div>
-          <div className="segLabel">Deal type</div>
+          <div className="segLabel">Structure</div>
+          <div className="seg">
+            <button data-on={!lease} onClick={() => set("structure", "sale")}>Buy land</button>
+            <button data-on={lease} onClick={() => set("structure", "lease")}>Ground lease</button>
+          </div>
+        </div>
+        <div>
+          <div className="segLabel">Exit</div>
           <div className="seg">
             <button data-on={rental} onClick={() => set("dealType", "rental")}>Rental hold</button>
             <button data-on={!rental} onClick={() => set("dealType", "condo")}>Condo sellout</button>
@@ -573,7 +805,13 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
                   {Object.keys(farDB).map((d) => <option key={d}>{d}</option>)}
                 </select>
               </F>
-              <F label="Street type" hint={isSS ? "affects FAR here" : "no effect in this district"}>
+              <F label="Borough" hint="sets cost defaults">
+                <select value={m.borough || ""} onChange={(e) => applyBorough(e.target.value)}>
+                  <option value="">—</option>
+                  {BOROUGHS.map((b) => <option key={b}>{b}</option>)}
+                </select>
+              </F>
+              <F label="Street type" hint={isSS ? "affects FAR here" : "no effect here"}>
                 <select value={m.street} onChange={(e) => applyDistrict(m.district, e.target.value, m.devPath)} style={{ opacity: isSS ? 1 : 0.5 }}>
                   <option value="narrow">Narrow street</option>
                   <option value="wide">Wide street</option>
@@ -585,217 +823,437 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
                   <option value="uap">City of Yes — UAP</option>
                 </select>
               </F>
-              <F label="Overlay / special district" hint="optional">
+              <F label="Lot size" hint="SF">{num("lotSF")}</F>
+              <F label="Base FAR" hint="as-of-right">{num("far", "0.01")}</F>
+              <F label="Bonus FAR" hint="UAP etc · 0 = base">{num("bonusFar", "0.01")}</F>
+              <F label="Overlay / special" hint="optional">
                 <input value={m.overlay} onChange={(e) => set("overlay", e.target.value)} placeholder="C2-4 overlay" />
               </F>
-              <F label="Lot size" hint="SF"><input type="number" value={m.lotSF} onChange={(e) => set("lotSF", e.target.value)} /></F>
-              <F label="Base FAR" hint="as-of-right"><input type="number" step="0.01" value={m.far} onChange={(e) => set("far", e.target.value)} /></F>
-              <F label="Bonus FAR" hint="0 = use base"><input type="number" step="0.01" value={m.bonusFar} onChange={(e) => set("bonusFar", e.target.value)} /></F>
-              <F label="Efficiency ratio" hint="built → net %"><input type="number" value={m.efficiency} onChange={(e) => set("efficiency", e.target.value)} /></F>
+              <F label="Air rights / neighbor transfer" hint="BSF">{num("airRightsSF")}</F>
+              <F label="Air rights price" hint="$ / BSF">{num("airRightsPSF")}</F>
             </div>
             <div className="derived">
-              Zoning buildable: {fmt(c.buildableSF)} BSF (max {c.maxUnitsByZoning} units @ 680 SF) → Actual building: {fmt(c.actualBuildingSF)} SF → Net rentable/sellable: {fmt(c.netSF)} SF
+              Lot {fmt(c.lotSF)} × FAR {c.baseFAR.toFixed(2)} = {fmt(c.baseBSF)} BSF
+              {c.bonusBSF > 0 && <> + {fmt(c.bonusBSF)} bonus</>}
+              {c.airSF > 0 && <> + {fmt(c.airSF)} transfer</>}
+              {" "}= <b>{fmt(c.totalBSF)} total BSF</b> · zoning max ≈ {c.maxUnitsByZoning} units (680 SF factor)
             </div>
-            <div className="fg1" style={{ marginTop: 14 }}>
-              <F label="Actual building SF" hint="drives cost — can differ from zoning envelope">
-                <div style={{ display: "flex", gap: 8 }}>
-                  <input type="number" value={m.actualBuildingSF} onChange={(e) => set("actualBuildingSF", e.target.value)} />
-                  <button className="mini" onClick={() => set("actualBuildingSF", Math.round(c.buildableSF))}>Match zoning max</button>
+          </Sec>
+
+          <Sec n="02" t="Unit Mix & Building" open>
+            <div className="tableWrap">
+              <table className="rr">
+                <thead><tr><th>Type</th><th>Avg net SF</th><th>Units</th><th>Market rent / mo</th><th>Mkt · Aff</th></tr></thead>
+                <tbody>
+                  {UNIT_TYPES.map(([t, label]) => {
+                    const r = c.rows.find((x) => x.type === t);
+                    return (
+                      <tr key={t}>
+                        <td>{label}</td>
+                        <td><input type="number" inputMode="decimal" value={m.mix[t].sf} onChange={(e) => setMix(t, "sf", e.target.value)} /></td>
+                        <td><input type="number" inputMode="decimal" value={m.mix[t].units} onChange={(e) => setMix(t, "units", e.target.value)} /></td>
+                        <td><input type="number" inputMode="decimal" value={m.mix[t].rent} onChange={(e) => setMix(t, "rent", e.target.value)} /></td>
+                        <td className={"mono" + (r.over ? " bad" : "")}>{r.mktU} · {r.affU}</td>
+                      </tr>
+                    );
+                  })}
+                  <tr className="tot"><td>Total</td><td>{fmt(c.resiNetSF)} SF</td><td>{fmt(c.totalUnits)}</td><td>{c.totalUnits ? money(c.avgRentUnit) + " avg" : "—"}</td><td className="mono">{c.marketUnits} · {c.affUnits}</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div className="fg2">
+              <F label="Gross-up for walls / common" hint="% on net">{num("addonPct")}</F>
+              <F label="Retail / commercial" hint="SF (zoning floor area)">{num("retailSF")}</F>
+              <F label="Cellar / other gross" hint="SF · cost only">{num("otherGSF")}</F>
+              <F label="Building GSF override" hint="0 = calculated">{num("gsfOverride")}</F>
+            </div>
+            <div className="derived">
+              Resi net {fmt(c.resiNetSF)} SF × {(1 + N(m.addonPct) / 100).toFixed(2)} = {fmt(c.resiGSF)} gross
+              {c.retailSF > 0 && <> + {fmt(c.retailSF)} retail</>} = {fmt(c.zfaUsed)} SF vs {fmt(c.totalBSF)} BSF →{" "}
+              <b style={{ color: c.bsfLeft < -1 ? RED : undefined }}>
+                {c.bsfLeft >= 0 ? `${fmt(c.bsfLeft)} BSF unused` : `${fmt(-c.bsfLeft)} SF over zoning`}
+              </b>
+              <br />Building {fmt(c.GSF)} GSF{N(m.gsfOverride) > 0 ? " (override)" : ""} drives hard cost
+            </div>
+            <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+              <button className="mini tall" onClick={() => setM((p) => fitMix(p, runCalc(p).totalBSF))}>Fit units to BSF</button>
+              {N(m.gsfOverride) > 0 && <button className="mini tall" onClick={() => set("gsfOverride", 0)}>Use calculated GSF</button>}
+            </div>
+          </Sec>
+
+          <Sec n="03" t={`Affordable — ${m.program === "market" ? "set-aside" : m.program.toUpperCase()}`} open>
+            <div className="subnote" style={{ marginTop: 10 }}>{P.label}</div>
+            <div className="fg2">
+              <F label="Requirement basis">
+                <select value={m.affMode} onChange={(e) => set("affMode", e.target.value)}>
+                  {REQ_MODES.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+                </select>
+              </F>
+              {(m.affMode === "sf" || m.affMode === "units") && <F label="Required" hint="%">{num("affReqPct", "1")}</F>}
+              {m.affMode === "uap" && <F label="UAP bonus floor area" hint="from Site"><input readOnly value={fmt(c.bonusBSF) + " BSF"} /></F>}
+            </div>
+            {m.tiers.map((tr, i) => (
+              <div key={i}>
+                <div className="rrHead" style={{ marginTop: 16 }}>
+                  <span>Affordable tier {i + 1}</span>
+                  <span style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                    <select className="amiSel" value={tr.ami} onChange={(e) => setTierAmi(i, e.target.value)}>
+                      {AMI_LEVELS.map((a) => <option key={a} value={a}>{a}% AMI</option>)}
+                    </select>
+                    {m.tiers.length > 1 && <button className="mini" onClick={() => delTier(i)}>✕</button>}
+                  </span>
                 </div>
+                <div className="tableWrap">
+                  <table className="rr">
+                    <thead><tr><th>Type</th><th>Aff. units</th><th>Max gross rent</th><th>Net vs market</th></tr></thead>
+                    <tbody>
+                      {UNIT_TYPES.map(([t, label]) => (
+                        <tr key={t}>
+                          <td>{label}</td>
+                          <td><input type="number" inputMode="decimal" value={tr.units[t]} onChange={(e) => setTierU(i, t, e.target.value)} /></td>
+                          <td><input type="number" inputMode="decimal" value={tr.rents[t]} onChange={(e) => setTierR(i, t, e.target.value)} /></td>
+                          <td className="mono">{N(m.mix[t].rent) ? "-" + money(N(m.mix[t].rent) - N(tr.rents[t]) + N(m.utilAllow?.[t])) : "—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ))}
+            <div className="rrHead" style={{ marginTop: 14 }}><span>Utility allowance</span><em>$ / mo, subtracted from gross rent · 0 = tenant pays none</em></div>
+            <div className="tableWrap">
+              <table className="rr">
+                <thead><tr>{UNIT_TYPES.map(([t]) => <th key={t}>{UT_SHORT[t]}</th>)}</tr></thead>
+                <tbody><tr>{UNIT_TYPES.map(([t]) => (
+                  <td key={t}><input type="number" inputMode="decimal" value={m.utilAllow?.[t] ?? 0} onChange={(e) => setM((p) => ({ ...p, utilAllow: { ...p.utilAllow, [t]: e.target.value } }))} /></td>
+                ))}</tr></tbody>
+              </table>
+            </div>
+            <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+              {m.affMode !== "none" && <button className="mini tall" onClick={() => setM((p) => autoAffordable(p))}>Auto-fill to requirement</button>}
+              {m.tiers.length < 3 && <button className="mini tall" onClick={addTier}>+ AMI tier</button>}
+              <button className="mini tall" onClick={() => setM((p) => ({ ...p, tiers: p.tiers.map((t) => ({ ...t, rents: hpdRents(N(t.ami)) })) }))}>Reset rents to HPD</button>
+            </div>
+            <div className="subnote">Rents default to {HPD_RENT_SRC}. Edit any rent to match the term sheet.</div>
+            <div className="chk">
+              <div><span>Required</span><b>{m.affMode === "none" ? "—" : m.affMode === "units" ? `${c.affReqUnits} units` : `${fmt(c.affReqSF)} SF`}</b>
+                <em>{m.affMode === "units" ? `≈ ${fmt(c.affReqSF)} SF` : m.affMode === "none" ? "no set-aside" : `${c.resiNetSF ? pct(c.affReqSF / c.resiNetSF * 100) : "—"} of resi net SF`}</em></div>
+              <div><span>Provided</span><b>{fmt(c.affSF)} SF</b><em>{c.affUnits} units · {c.totalUnits ? pct(c.affUnits / c.totalUnits * 100) : "—"} of units</em></div>
+              <div className={c.affMet ? "ok" : "no"}><span>{c.affMet ? "Surplus" : "Shortfall"}</span>
+                <b>{m.affMode === "units" ? `${c.affSurplusUnits > 0 ? "+" : ""}${c.affSurplusUnits} units` : `${c.affSurplusSF > 0 ? "+" : ""}${fmt(c.affSurplusSF)} SF`}</b>
+                <em>{m.affMode === "none" ? "" : c.affMet ? "requirement met" : "add affordable units"}</em></div>
+              <div><span>Weighted avg AMI</span><b>{c.affUnits ? Math.round(c.affAvgAmi) + "%" : "—"}</b><em>{P.avg ? `program target ≤ ${P.avg}%` : "by units"}{!tierAmiOK ? " · a tier is over 100%" : ""}</em></div>
+              <div><span>Revenue given up</span><b>{money(c.lostM)}/mo</b><em>{money(c.lostYr)}/yr vs all-market</em></div>
+              <div><span>Value given up</span><b>{kMoney(c.lostValue)}</b><em>@ {N(m.exitCapRatePct).toFixed(2)}% cap</em></div>
+            </div>
+            {c.overAlloc && <div className="warn">More affordable units than total units for a type — fix the unit mix.</div>}
+          </Sec>
+
+          <Sec n="04" t={lease ? "Acquisition — Ground Lease" : "Acquisition — Land Purchase"} open>
+            <div className="fg2">
+              {lease ? (
+                <>
+                  <F label="Key money" hint="$ upfront">{num("keyMoney")}</F>
+                  <F label="Ground rent" hint="$ / yr (expense)">{num("groundRentYr")}</F>
+                  <F label="Free rent in construction" hint="months">{num("groundRentFreeMonths")}</F>
+                </>
+              ) : (
+                <F label="Purchase price" hint="$">{num("purchasePrice")}</F>
+              )}
+              <F label="Closing costs" hint={`% of ${lease ? "key money" : "price"}`}>{num("closingCostPct", "0.1")}</F>
+              <F label="Other acquisition costs" hint="$">{num("otherAcqCosts")}</F>
+              <F label="Credits / grants" hint="$ — reduces basis">{num("creditsAmt")}</F>
+              <F label="Credit label">
+                <input value={m.creditsLabel || ""} onChange={(e) => set("creditsLabel", e.target.value)} placeholder="Brownfield / other credits" />
               </F>
             </div>
-          </Sec>
-
-          <Sec n="02" t="Acquisition" open>
-            <div className="fg2">
-              <F label="Purchase price" hint="$"><input type="number" value={m.purchasePrice} onChange={(e) => set("purchasePrice", e.target.value)} /></F>
-              <F label="Closing costs" hint="%"><input type="number" step="0.1" value={m.closingCostPct} onChange={(e) => set("closingCostPct", e.target.value)} /></F>
-              <F label="Other acquisition costs" hint="$"><input type="number" value={m.otherAcqCosts} onChange={(e) => set("otherAcqCosts", e.target.value)} /></F>
-            </div>
-          </Sec>
-
-          <Sec n="03" t="Hard & Soft Costs" open>
-            <div className="fg2">
-              <F label="Hard cost" hint="$ / built SF"><input type="number" value={m.hardCostPerBSF} onChange={(e) => set("hardCostPerBSF", e.target.value)} /></F>
-              <F label="Contingency" hint="%"><input type="number" step="0.1" value={m.hardContingencyPct} onChange={(e) => set("hardContingencyPct", e.target.value)} /></F>
-              <F label="Soft costs" hint="% of hard"><input type="number" step="0.1" value={m.softCostPct} onChange={(e) => set("softCostPct", e.target.value)} /></F>
-            </div>
-          </Sec>
-
-          <Sec n="04" t="Construction Financing" open>
-            <div className="fg2">
-              <F label="Loan-to-cost" hint="%"><input type="number" step="0.1" value={m.ltcPct} onChange={(e) => set("ltcPct", e.target.value)} /></F>
-              <F label="Interest rate" hint="%"><input type="number" step="0.1" value={m.interestRatePct} onChange={(e) => set("interestRatePct", e.target.value)} /></F>
-              <F label="Construction period" hint="months"><input type="number" value={m.constructionMonths} onChange={(e) => set("constructionMonths", e.target.value)} /></F>
-              <F label="Origination fee" hint="%"><input type="number" step="0.1" value={m.originationFeePct} onChange={(e) => set("originationFeePct", e.target.value)} /></F>
-              <F label="Avg outstanding balance" hint="draw curve %"><input type="number" value={m.avgOutstandingPct} onChange={(e) => set("avgOutstandingPct", e.target.value)} /></F>
-            </div>
-          </Sec>
-
-          <Sec n="05" t="Program & Unit Mix" open>
-            <div className="derived brassText" style={{ borderTop: "none", paddingTop: 0, marginTop: 0 }}>
-              Zoning max units (680 SF factor): {c.maxUnitsByZoning} — based on {fmt(c.buildableSF)} BSF
-            </div>
-            {!rental && (
-              <div className="fg2" style={{ marginTop: 14 }}>
-                <F label="Total units">
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <input type="number" value={m.totalUnits} onChange={(e) => set("totalUnits", e.target.value)} />
-                    <button className="mini" onClick={() => set("totalUnits", c.maxUnitsByZoning)}>Use max</button>
-                  </div>
-                </F>
-                <F label="Affordable units" hint="%"><input type="number" step="0.1" value={m.affordablePct} onChange={(e) => set("affordablePct", e.target.value)} /></F>
-              </div>
-            )}
-            {rental && (
-              <div className="fg2" style={{ marginTop: 14 }}>
-                <F label="Target total units" hint="planning check">
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <input type="number" value={m.targetTotalUnits} onChange={(e) => set("targetTotalUnits", e.target.value)} />
-                    <button className="mini" onClick={() => set("targetTotalUnits", c.maxUnitsByZoning)}>Use max</button>
-                  </div>
-                </F>
-              </div>
-            )}
             <div className="derived">
-              {Math.round(c.marketUnits)} market + {Math.round(c.affordableUnits)} affordable = {Math.round(c.totalUnits)} total · avg {fmt(c.avgUnitSF)} SF/unit
-              {rental && N(m.targetTotalUnits) > 0 && (
-                Math.round(c.totalUnits) === Math.round(N(m.targetTotalUnits))
-                  ? ` · matches target of ${Math.round(N(m.targetTotalUnits))}`
-                  : ` · ${Math.round(c.totalUnits) - Math.round(N(m.targetTotalUnits)) > 0 ? "+" : ""}${Math.round(c.totalUnits) - Math.round(N(m.targetTotalUnits))} vs target`
-              )}
+              Acquisition {money(c.totalAcq)} · {psf(c.per(c.totalAcq).bsf)}/BSF{c.totalUnits ? ` · ${money(c.per(c.totalAcq).unit)}/unit` : ""}
+              {lease && N(m.groundRentYr) > 0 && <><br />Ground rent {money(m.groundRentYr)}/yr · {psf(N(m.groundRentYr) / (c.totalBSF || 1))}/BSF/yr</>}
             </div>
+          </Sec>
+
+          <Sec n="05" t="Hard, Soft & Carrying Costs" open>
+            <div className="fg2">
+              <F label="Hard cost" hint={`$/gross SF · ${m.borough || "default"} $${bc.hard}`}>{num("hardCostPerBSF")}</F>
+              <F label="Soft cost" hint={`% of hard · default ${bc.soft}%`}>{num("softCostPct", "0.5")}</F>
+              <F label="Hard contingency" hint="% on top">{num("hardContingencyPct", "0.5")}</F>
+              <F label="Construction period" hint="months">{num("constructionMonths")}</F>
+              <F label="Construction loan" hint="% LTC">{num("ltcPct")}</F>
+              <F label="Construction rate" hint="%">{num("interestRatePct", "0.125")}</F>
+              <F label="Avg loan drawn" hint="% over period">{num("avgOutstandingPct")}</F>
+              <F label="Loan fees" hint="% of loan">{num("originationFeePct", "0.25")}</F>
+              <F label="RE taxes in construction" hint="$ / yr">{num("cTaxesYr")}</F>
+              <F label="Insurance (builder's risk + GL)" hint="% of hard">{num("cInsurancePct", "0.25")}</F>
+            </div>
+            <div className="rrHead" style={{ marginTop: 18 }}><span>Development budget</span><em>{fmt(c.totalBSF)} BSF · {fmt(c.GSF)} GSF · {c.totalUnits} units</em></div>
+            <BudgetTable m={m} c={c} />
           </Sec>
 
           {rental ? (
-            <Sec n="06" t="Unit Mix & Rent Roll" open>
-              <div className="rrHead"><span>Free market</span></div>
-              <div className="tableWrap">
-                <table className="rr">
-                  <thead><tr><th>Unit type</th><th>Units</th><th>Rent / mo</th></tr></thead>
-                  <tbody>
-                    {UNIT_TYPES.map(([t, label]) => (
-                      <tr key={t}>
-                        <td>{label}</td>
-                        <td><input type="number" value={m.mkt[t].u} onChange={(e) => setMkt(t, "u", e.target.value)} /></td>
-                        <td><input type="number" value={m.mkt[t].r} onChange={(e) => setMkt(t, "r", e.target.value)} /></td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+            <Sec n="06" t="Income & Expenses" open>
+              <div className="fg2">
+                <F label="Resi vacancy" hint="%">{num("vacancyPct", "0.5")}</F>
+                <F label="Retail rent" hint="$ / SF / yr">{num("retailPSF")}</F>
+                <F label="Parking spaces">{num("parkingSpaces")}</F>
+                <F label="Parking rent" hint="$ / mo">{num("parkingRent")}</F>
+                <F label="Other income" hint="$ / yr">{num("otherIncomeYr")}</F>
+                <F label="Retail vacancy" hint="%">{num("commVacancyPct", "0.5")}</F>
+                <F label="Resi operating exp." hint="$ / unit / yr">{num("opexPerUnit")}</F>
+                <F label="Mgmt / other" hint="% of EGI">{num("mgmtPct", "0.5")}</F>
+                <F label="Retail expenses" hint="% of retail income">{num("retailExpPct", "0.5")}</F>
+                <F label="RE tax (485-x / abated)" hint="$ / yr">{num("propertyTaxAnnual")}</F>
+                <F label="Exit cap rate" hint="%">{num("exitCapRatePct", "0.05")}</F>
               </div>
-              <div className="rrHead" style={{ marginTop: 18 }}>
-                <span>Affordable</span>
-                <em>{PROGRAM_PRESETS[m.program].note}</em>
-              </div>
-              <div className="tableWrap">
-                <table className="rr">
-                  <thead>
-                    <tr><th rowSpan={2}>Unit type</th><th colSpan={2}>80% AMI</th><th colSpan={2}>60% AMI</th><th colSpan={2}>40% AMI</th></tr>
-                    <tr><th>Units</th><th>Rent</th><th>Units</th><th>Rent</th><th>Units</th><th>Rent</th></tr>
-                  </thead>
-                  <tbody>
-                    {UNIT_TYPES.map(([t, label]) => (
-                      <tr key={t}>
-                        <td>{label}</td>
-                        {AMI_BANDS.map((b) => (
-                          <React.Fragment key={b}>
-                            <td><input type="number" value={m.aff[t][b].u} onChange={(e) => setAff(t, b, "u", e.target.value)} /></td>
-                            <td><input type="number" value={m.aff[t][b].r} onChange={(e) => setAff(t, b, "r", e.target.value)} /></td>
-                          </React.Fragment>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-              <div className="subnote">Affordable rents pre-loaded from the current AMI schedule. Update if HPD/HCR publishes new figures or your community district differs.</div>
-              <div className="fg2" style={{ marginTop: 18 }}>
-                <F label="Vacancy" hint="%"><input type="number" step="0.1" value={m.vacancyPct} onChange={(e) => set("vacancyPct", e.target.value)} /></F>
-                <F label="Operating expenses" hint="% of EGI"><input type="number" step="0.1" value={m.opexPct} onChange={(e) => set("opexPct", e.target.value)} /></F>
-                <F label="Property tax" hint="annual, net of abatement"><input type="number" value={m.propertyTaxAnnual} onChange={(e) => set("propertyTaxAnnual", e.target.value)} /></F>
-                <F label="Exit cap rate" hint="%"><input type="number" step="0.05" value={m.exitCapRatePct} onChange={(e) => set("exitCapRatePct", e.target.value)} /></F>
+              <div className="derived">
+                Market resi {money(c.mktResiM)}/mo · affordable {money(c.affResiM)}/mo · avg {money(c.avgRentUnit)}/unit · {psf(c.rentPSF)}/net SF/yr
+                <br />Gross {money(c.GPI)} − vacancy {money(c.vacancy)} − expenses {money(c.opexTotal)}{lease ? " (incl. ground rent)" : ""} = <b>NOI {money(c.NOI)}</b>
               </div>
             </Sec>
           ) : (
-            <Sec n="06" t="Sellout Assumptions" open>
+            <Sec n="06" t="Sellout & Retail" open>
               <div className="fg2">
-                <F label="Market sellout" hint="$/SF"><input type="number" value={m.marketSellPSF} onChange={(e) => set("marketSellPSF", e.target.value)} /></F>
-                <F label="Affordable sellout" hint="$/SF"><input type="number" value={m.affordableSellPSF} onChange={(e) => set("affordableSellPSF", e.target.value)} /></F>
-                <F label="Selling costs" hint="% commission + legal"><input type="number" step="0.1" value={m.sellingCostPct} onChange={(e) => set("sellingCostPct", e.target.value)} /></F>
+                <F label="Market sellout" hint="$ / net SF">{num("marketSellPSF")}</F>
+                <F label="Affordable sellout" hint="$ / net SF">{num("affordableSellPSF")}</F>
+                <F label="Selling costs" hint="% commission + legal">{num("sellingCostPct", "0.5")}</F>
+                <F label="Retail rent" hint="$ / SF / yr">{num("retailPSF")}</F>
+                <F label="Retail vacancy" hint="%">{num("commVacancyPct", "0.5")}</F>
+                <F label="Retail expenses" hint="% of retail income">{num("retailExpPct", "0.5")}</F>
+                <F label="Retail cap rate" hint="values retained retail">{num("commCapRate", "0.05")}</F>
+              </div>
+              <div className="derived">
+                Sellout {money(c.sellGross)} − costs {money(c.sellCosts)} = {money(c.sellNet)}{c.retailValue > 0 ? ` + retail ${money(c.retailValue)}` : ""}
               </div>
             </Sec>
           )}
 
-          <Sec n="07" t="Commercial Income">
-            <div className="tableWrap">
-              <table className="rr">
-                <thead><tr><th>Space</th><th>SF</th><th>Rent / SF / yr</th></tr></thead>
-                <tbody>
-                  {m.comm.map((cm, i) => (
-                    <tr key={i}>
-                      <td>Commercial {i + 1}</td>
-                      <td><input type="number" value={cm.sf} onChange={(e) => setComm(i, "sf", e.target.value)} /></td>
-                      <td><input type="number" value={cm.rent} onChange={(e) => setComm(i, "rent", e.target.value)} /></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+          {rental && (
+            <Sec n="07" t="Permanent Loan & Cash Flow" open>
+              <div className="fg2">
+                <F label="Loan" hint="% of net cost">{num("permLoanPct")}</F>
+                <F label="Or loan amount" hint="$ · 0 = use %">{num("permLoanAmt")}</F>
+                <F label="Rate" hint="%">{num("permRatePct", "0.125")}</F>
+                <F label="Amortization" hint="years">{num("permAmortYrs")}</F>
+              </div>
+              <div className="tableWrap" style={{ marginTop: 14 }}>
+                <table className="rr num">
+                  <thead><tr><th></th><th>Debt service / yr</th><th>Cash flow</th><th>DSCR</th></tr></thead>
+                  <tbody>
+                    <tr><td>Amortizing</td><td>{money(c.dsAmort)}</td><td>{sMoney(c.cfAmort)}</td><td>{x2(c.dscr)}</td></tr>
+                    <tr><td>Interest-only</td><td>{money(c.dsIO)}</td><td>{sMoney(c.cfIO)}</td><td>{x2(c.dscrIO)}</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <div className="derived">
+                Loan {money(c.permLoan)} · equity in {money(c.equityIn)} · cash-on-cash {pct(c.coc)} · debt yield {pct(c.debtYield)}
+                <br />Max loan at 1.25x DSCR ≈ {money(c.maxLoan125)}
+              </div>
+            </Sec>
+          )}
+
+          {rental && (
+            <Sec n="08" t="Condo Exit Check (optional)">
+              <div className="fg2">
+                <F label="Market sellout" hint="$ / net SF">{num("marketSellPSF")}</F>
+                <F label="Affordable sellout" hint="$ / net SF">{num("affordableSellPSF")}</F>
+                <F label="Selling costs" hint="%">{num("sellingCostPct", "0.5")}</F>
+                <F label="Retail cap rate" hint="%">{num("commCapRate", "0.05")}</F>
+              </div>
+              <div className="derived">
+                If sold as condos: {money(c.sellNet + c.retailValue)} net → profit <b style={{ color: c.condoProfit < 0 ? RED : undefined }}>{sMoney(c.condoProfit)}</b> ({pct(c.condoMargin)} on cost) vs rental equity created {sMoney(c.equityCreated)}
+              </div>
+            </Sec>
+          )}
+
+          <Sec n={rental ? "09" : "07"} t="Massing Check (optional)">
+            <div className="fg2" style={{ gridTemplateColumns: "1fr 1fr 1fr" }}>
+              <F label="Floors"><input type="number" inputMode="decimal" value={fill.n} onChange={(e) => setFill({ ...fill, n: e.target.value })} /></F>
+              <F label="Coverage" hint="%"><input type="number" inputMode="decimal" value={fill.cov} onChange={(e) => setFill({ ...fill, cov: e.target.value })} /></F>
+              <F label="Efficiency" hint="%"><input type="number" inputMode="decimal" value={fill.eff} onChange={(e) => setFill({ ...fill, eff: e.target.value })} /></F>
             </div>
-            <div className="derived">
-              {c.commTotalSF > 0
-                ? `${fmt(c.commTotalSF)} SF commercial → ${fmt(c.residentialSF)} SF left for residential (of ${fmt(c.actualBuildingSF)} total)`
-                : `No commercial entered — full ${fmt(c.actualBuildingSF)} SF treated as residential`}
+            <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+              <button className="mini tall" onClick={() => set("floors", Array.from({ length: Math.min(60, Math.max(0, Math.round(N(fill.n)))) }, () => ({ cov: fill.cov, eff: fill.eff })))}>Fill floors</button>
+              <button className="mini tall" onClick={() => set("floors", [...(m.floors || []), { cov: fill.cov, eff: fill.eff }])}>+ Floor</button>
             </div>
-            <div className="fg2" style={{ marginTop: 14 }}>
-              <F label="Commercial vacancy" hint="%"><input type="number" step="0.1" value={m.commVacancyPct} onChange={(e) => set("commVacancyPct", e.target.value)} /></F>
-              {!rental && <F label="Commercial cap rate" hint="values retained space"><input type="number" step="0.05" value={m.commCapRate} onChange={(e) => set("commCapRate", e.target.value)} /></F>}
-            </div>
-            <div className="subnote">Commercial SF is carved out of actual building SF — not added on top.</div>
+            {(m.floors || []).length > 0 && (
+              <MassingTable m={m} c={c} setFloor={setFloor} onDel={(i) => set("floors", m.floors.filter((_, j) => j !== i))} onReserve={(v) => set("massReserveSF", v)} />
+            )}
+          </Sec>
+
+          <Sec n={rental ? "10" : "08"} t="Sensitivity" open>
+            <SensTable s={sens} m={m} />
           </Sec>
         </div>
 
         <div className="uwSum">
           <div className="sumHead">
-            <span>Underwriting summary</span>
-            <span>{rental ? "RENTAL" : "CONDO"} · {m.program.toUpperCase()}</span>
+            <span>Summary</span>
+            <span>{lease ? "LEASE" : "SALE"} · {rental ? "RENTAL" : "CONDO"} · {m.program.toUpperCase()}</span>
           </div>
           <div style={{ padding: "6px 18px 18px" }}>
-            <div className="divLabel">Development cost</div>
-            <Row l="Acquisition" v={money(c.totalAcq)} />
-            <Row l="Hard costs" v={money(c.totalHard)} />
-            <Row l="Soft costs" v={money(c.totalSoft)} />
-            <Row l="Financing costs" v={money(c.totalFin)} />
-            <Row l="Total dev. cost" v={money(c.TDC)} total />
-            <div className="divLabel">{rental ? "Revenue at stabilization" : "Sellout revenue"}</div>
+            <div className="divLabel">Development cost <i>total · $/BSF</i></div>
+            <Row l="Hard cost" v={money(c.totalHard)} s={psf(c.per(c.totalHard).bsf)} />
+            <Row l="Soft cost" v={money(c.totalSoft)} s={psf(c.per(c.totalSoft).bsf)} />
+            <Row l="Carrying cost" v={money(c.totalCarry)} s={psf(c.per(c.totalCarry).bsf)} />
+            <Row l={lease ? "Key money + acq." : "Acquisition"} v={money(c.totalAcq)} s={psf(c.per(c.totalAcq).bsf)} />
+            <Row l="Total project cost" v={money(c.TPC)} s={psf(c.per(c.TPC).bsf)} total />
+            {c.credits > 0 && <Row l={"Less " + (m.creditsLabel || "credits")} v={"-" + money(c.credits)} />}
+            {c.credits > 0 && <Row l="Net cost (basis)" v={money(c.netCost)} s={psf(c.per(c.netCost).bsf)} total />}
+            <div className="divLabel">{rental ? "Stabilized" : "Sellout"}</div>
             {rental ? (
               <>
+                <Row l="Effective gross income" v={money(c.EGI)} />
+                <Row l="Expenses" v={money(c.opexTotal)} />
                 <Row l="Net operating income" v={money(c.NOI)} />
-                <Row l={`Exit value @ ${N(m.exitCapRatePct).toFixed(2)}% cap`} v={money(c.exitValue)} total />
+                <Row l={`Value @ ${N(m.exitCapRatePct).toFixed(2)}% cap`} v={money(c.exitValue)} total />
               </>
             ) : (
               <>
-                <Row l="Gross sellout revenue" v={money(c.grossRevenue)} />
-                <Row l="Net revenue + commercial" v={money(c.netRevenue + c.commercialValue)} total />
+                <Row l="Gross sellout" v={money(c.sellGross)} />
+                <Row l="Net sellout + retail" v={money(c.sellNet + c.retailValue)} total />
               </>
             )}
             <div className={"profit" + (c.profit < 0 ? " neg" : "")}>
-              <div className="pl">Projected profit</div>
-              <div className="pv">{(c.profit < 0 ? "-" : "") + money(Math.abs(c.profit))}</div>
+              <div className="pl">{rental ? "Equity created" : "Projected profit"}</div>
+              <div className="pv">{sMoney(c.profit)}</div>
             </div>
             <div className="mcards">
-              <MC l="Profit margin" v={pct(c.margin)} good={c.margin >= 0} />
-              <MC l={rental ? "Yield on cost" : "Margin on revenue"} v={pct(rental ? c.yieldOnCost : c.marginOnRevenue)} />
-              <MC l="Cost / built SF" v={c.actualBuildingSF > 0 ? money(c.TDC / c.actualBuildingSF) : "—"} />
-              <MC l="Cost / unit" v={c.totalUnits > 0 ? money(c.TDC / c.totalUnits) : "—"} />
+              {rental ? (
+                <>
+                  <MC l="Yield on cost" v={pct(c.yieldOnCost)} good={c.yieldOnCost >= N(m.exitCapRatePct)} />
+                  <MC l={c.credits > 0 ? "Yield on net cost" : "Margin on cost"} v={pct(c.credits > 0 ? c.yieldOnNet : c.margin)} />
+                  <MC l="DSCR (amort.)" v={x2(c.dscr)} good={c.dscr >= 1.25} />
+                  <MC l="Cash-on-cash" v={pct(c.coc)} />
+                </>
+              ) : (
+                <>
+                  <MC l="Margin on cost" v={pct(c.condoMargin)} good={c.condoMargin >= 0} />
+                  <MC l="Margin on revenue" v={pct(c.condoMarginRev)} />
+                </>
+              )}
+              <MC l="All-in / BSF" v={psf(c.per(c.netCost).bsf)} />
+              <MC l="All-in / unit" v={c.totalUnits > 0 ? kMoney(c.per(c.netCost).unit) : "—"} />
+              <MC l="Affordable" v={m.affMode === "none" ? "None" : c.affMet ? "Met ✓" : "Short"} good={m.affMode === "none" ? undefined : c.affMet} />
+              <MC l="Units" v={`${c.marketUnits}+${c.affUnits}`} />
             </div>
           </div>
         </div>
       </div>
 
-      <div className="foot">Editable defaults, not advice — verify 485-x / UAP / MIH rules and rent tables before circulating.</div>
-      {sheet && <ClientSheet m={m} c={c} onClose={() => setSheet(false)} />}
+      <div className="foot">Editable defaults, not advice — verify 485-x / UAP / MIH rules, HPD rents and costs before circulating.</div>
+      {sheet && <ClientSheet m={m} c={c} sens={sens} onClose={() => setSheet(false)} />}
     </div>
+  );
+}
+
+/* ---------- shared tables (screen + report) ---------- */
+function budgetRows(m, c) {
+  const L = c.lease;
+  return [
+    { l: `Hard cost — ${fmt(c.GSF)} GSF × $${fmt(N(m.hardCostPerBSF))}`, v: c.hardBase, sub: true, hide: !c.contingency },
+    { l: `Contingency (${N(m.hardContingencyPct)}%)`, v: c.contingency, sub: true, hide: !c.contingency },
+    { l: c.contingency ? "Hard cost" : `Hard cost (${fmt(c.GSF)} GSF × $${fmt(N(m.hardCostPerBSF))})`, v: c.totalHard, k: "head" },
+    { l: `Soft cost (${N(m.softCostPct)}% of hard)`, v: c.totalSoft, k: "head" },
+    { l: `Interest — ${N(m.interestRatePct)}% on ${money(c.constrLoan)} loan, ${N(m.constructionMonths)} mo, ${N(m.avgOutstandingPct)}% avg drawn`, v: c.cInterest, sub: true },
+    { l: `Loan fees (${N(m.originationFeePct)}%)`, v: c.cFees, sub: true, hide: !c.cFees },
+    { l: `RE taxes during construction (${N(m.constructionMonths)} mo)`, v: c.cTaxes, sub: true },
+    { l: `Insurance (${N(m.cInsurancePct)}% of hard)`, v: c.cInsurance, sub: true },
+    { l: `Ground rent during construction`, v: c.cGround, sub: true, hide: !L },
+    { l: "Carrying cost", v: c.totalCarry, k: "head" },
+    { l: "Construction subtotal (hard + soft + carrying)", v: c.constrSubtotal, k: "sub2" },
+    { l: L ? "Key money" : "Land purchase", v: c.price, sub: true },
+    { l: `Closing costs (${N(m.closingCostPct)}%)`, v: c.closing, sub: true, hide: !c.closing },
+    { l: "Other acquisition costs", v: c.otherAcq, sub: true, hide: !c.otherAcq },
+    { l: `Air rights (${fmt(c.airSF)} SF × $${fmt(N(m.airRightsPSF))})`, v: c.airCost, sub: true, hide: !c.airCost },
+    { l: L ? "Acquisition (ground lease)" : "Acquisition", v: c.totalAcq, k: "head" },
+    { l: "TOTAL PROJECT COST", v: c.TPC, k: "tot" },
+    { l: "Less: " + (m.creditsLabel || "credits"), v: -c.credits, k: "head", hide: !c.credits },
+    { l: "NET PROJECT COST (basis)", v: c.netCost, k: "tot", hide: !c.credits },
+  ].filter((r) => !r.hide);
+}
+function BudgetTable({ m, c, sheet }) {
+  const rows = budgetRows(m, c);
+  return (
+    <div className={sheet ? "shWrap" : "tableWrap"}>
+      <table className={(sheet ? "shTable bud" : "rr bud")}>
+        <thead><tr><th>Line</th><th>Total</th><th>$/BSF</th><th>$/GSF</th><th>Per unit</th><th>%</th></tr></thead>
+        <tbody>
+          {rows.map((r, i) => {
+            const p = c.per(r.v);
+            return (
+              <tr key={i} className={r.sub ? "sub" : r.k || ""}>
+                <td>{r.l}</td>
+                <td>{sMoney(r.v)}</td>
+                <td>{r.sub ? "" : psf(p.bsf)}</td>
+                <td>{r.sub ? "" : psf(p.gsf)}</td>
+                <td>{r.sub || !c.totalUnits ? "" : psf(p.unit)}</td>
+                <td>{r.sub || !c.TPC ? "" : pct(r.v / c.TPC * 100)}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+function MassingTable({ m, c, setFloor, onDel, onReserve }) {
+  const lot = c.lotSF;
+  let gross = 0, net = 0;
+  const rows = (m.floors || []).map((f) => { const plate = lot * N(f.cov) / 100; const n = plate * N(f.eff) / 100; gross += plate; net += n; return { plate, n }; });
+  const resiNet = net - N(m.massReserveSF);
+  return (
+    <>
+      <div className="tableWrap" style={{ marginTop: 12 }}>
+        <table className="rr">
+          <thead><tr><th>Floor</th><th>Coverage %</th><th>Plate SF</th><th>Eff. %</th><th>Net SF</th><th></th></tr></thead>
+          <tbody>
+            {(m.floors || []).map((f, i) => (
+              <tr key={i}>
+                <td>{i + 1}</td>
+                <td><input type="number" inputMode="decimal" value={f.cov} onChange={(e) => setFloor(i, "cov", e.target.value)} /></td>
+                <td className="mono">{fmt(rows[i].plate)}</td>
+                <td><input type="number" inputMode="decimal" value={f.eff} onChange={(e) => setFloor(i, "eff", e.target.value)} /></td>
+                <td className="mono">{fmt(rows[i].n)}</td>
+                <td><button className="mini" onClick={() => onDel(i)}>✕</button></td>
+              </tr>
+            ))}
+            <tr className="tot"><td>Total</td><td></td><td className="mono">{fmt(gross)}</td><td></td><td className="mono">{fmt(net)}</td><td></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div className="fg2"><F label="Reserve (bulkhead, amenities)" hint="net SF"><input type="number" inputMode="decimal" value={m.massReserveSF} onChange={(e) => onReserve(e.target.value)} /></F></div>
+      <div className="derived">
+        Massing {fmt(gross)} SF vs {fmt(c.totalBSF)} BSF → <b style={{ color: gross - c.totalBSF > 1 ? RED : undefined }}>{gross <= c.totalBSF ? `${fmt(c.totalBSF - gross)} under` : `${fmt(gross - c.totalBSF)} over`}</b>
+        <br />Net {fmt(net)} − reserve {fmt(N(m.massReserveSF))} = {fmt(resiNet)} SF vs unit mix {fmt(c.resiNetSF)} SF
+      </div>
+    </>
+  );
+}
+function SensTable({ s, m, sheet }) {
+  const base = (i, j) => i === 2 && j === 2;
+  return (
+    <>
+      <div className={sheet ? "" : "subnote"} style={sheet ? { fontSize: 12, color: "#6a6558", marginBottom: 8 } : { marginTop: 10 }}>
+        {s.rental ? "Equity created (value − net cost) by hard cost $/GSF (rows) × exit cap rate (columns); yield on cost under each." : "Profit by hard cost $/GSF (rows) × market sellout $/SF (columns)."}
+      </div>
+      <div className={sheet ? "shWrap" : "tableWrap"} style={{ marginTop: 8 }}>
+        <table className={(sheet ? "shTable" : "rr") + " sens"}>
+          <thead><tr><th>Hard \ {s.rental ? "Cap" : "$/SF"}</th>{s.colsV.map((v, j) => <th key={j}>{s.rental ? v.toFixed(2) + "%" : "$" + fmt(v)}</th>)}</tr></thead>
+          <tbody>
+            {s.rowsV.map((h, i) => (
+              <tr key={i}>
+                <td>${fmt(h)}</td>
+                {s.grid[i].map((g, j) => (
+                  <td key={j} className={(g.profit < 0 ? "neg" : "pos") + (base(i, j) ? " base" : "")}>
+                    {kMoney(g.profit)}{s.rental && <small>{pct(g.yoc)}</small>}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </>
   );
 }
 
@@ -821,8 +1279,8 @@ function F({ label, hint, children }) {
     </div>
   );
 }
-function Row({ l, v, total }) {
-  return <div className={"ledger" + (total ? " total" : "")}><span>{l}</span><b>{v}</b></div>;
+function Row({ l, v, s, total }) {
+  return <div className={"ledger" + (total ? " total" : "")}><span>{l}</span><b>{v}{s && <small>{s}</small>}</b></div>;
 }
 function MC({ l, v, good }) {
   return (
@@ -833,10 +1291,10 @@ function MC({ l, v, good }) {
   );
 }
 
-/* ---------- client summary sheet ---------- */
-function ClientSheet({ m, c, onClose }) {
-  const rental = m.dealType === "rental";
-  const typeLabels = Object.fromEntries(UNIT_TYPES);
+/* ---------- report sheet (screen → Print / Save as PDF) ---------- */
+function ClientSheet({ m, c, sens, onClose }) {
+  const rental = c.rental, lease = c.lease;
+  const P = PROGRAMS[m.program] || PROGRAMS.market;
   const zdLabel = m.district
     ? m.district + (streetSensitive.includes(m.district) ? ` — ${m.street === "wide" ? "Wide street" : "Narrow street"}` : "")
     : "—";
@@ -846,111 +1304,201 @@ function ClientSheet({ m, c, onClose }) {
     const w = window.open("", "_blank");
     if (w) {
       w.document.open();
-      w.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>${m.dealName}</title><style>${css}
+      w.document.write(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${m.dealName}</title><style>${css}
 body{background:#f2efe6;margin:0;padding:24px;}
-#uw-sheet{box-shadow:none;margin:0 auto;}</style></head><body>${html}</body></html>`);
+#uw-sheet{box-shadow:none;margin:0 auto;max-width:860px}</style></head><body>${html}</body></html>`);
       w.document.close();
     }
   };
-  return (
+  const IR = ({ l, mo, yr, neg, b }) => (
+    <tr className={b ? "tot" : ""}><td>{l}</td><td>{mo == null ? "" : sMoney(neg ? -mo : mo)}</td><td>{sMoney(neg ? -yr : yr)}</td></tr>
+  );
+  const affRows = c.rows.filter((r) => r.parts.length);
+  useEffect(() => { document.body.classList.add("uwPrint"); return () => document.body.classList.remove("uwPrint"); }, []);
+  return createPortal(<div className="uwPortal">
     <div className="modalWrap" onClick={onClose}>
-      <div style={{ width: 780, maxWidth: "100%" }} onClick={(e) => e.stopPropagation()}>
+      <div style={{ width: 860, maxWidth: "100%" }} onClick={(e) => e.stopPropagation()}>
         <div className="sheet" id="uw-sheet">
           <div className="shTop">
             <div>
               <img className="shLogo" src={LOGO_FULL} alt="JStone Realty" />
-              <div className="shBrand">Development Underwriting Summary</div>
+              <div className="shBrand">Development Underwriting</div>
               <div className="shTitle">{m.dealName}</div>
               <div className="shSub">
-                {[m.marketArea, rental ? "Rental Hold" : "Condo Sellout", m.program.toUpperCase() + " Program"].filter(Boolean).join(" · ")}
+                {[m.marketArea, lease ? "Ground lease" : "Land purchase", rental ? "Rental hold" : "Condo sellout", m.program === "market" ? "Free market" : m.program.toUpperCase()].filter(Boolean).join(" · ")}
               </div>
             </div>
             <div className="shDate">{new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })}</div>
           </div>
+
+          <div className="shKpis">
+            <div><span>Total project cost</span><b>{kMoney(c.TPC)}</b><em>{psf(c.per(c.TPC).bsf)}/BSF · {c.totalUnits ? kMoney(c.per(c.TPC).unit) + "/unit" : ""}</em></div>
+            {rental ? (
+              <>
+                <div><span>NOI</span><b>{kMoney(c.NOI)}</b><em>yield on cost {pct(c.yieldOnCost)}</em></div>
+                <div><span>Value @ {N(m.exitCapRatePct).toFixed(2)}% cap</span><b>{kMoney(c.exitValue)}</b><em>{c.totalUnits ? kMoney(c.exitValue / c.totalUnits) + "/unit" : ""}</em></div>
+                <div><span>Equity created</span><b className={c.equityCreated < 0 ? "neg" : ""}>{kMoney(c.equityCreated)}</b><em>{pct(c.margin)} on {c.credits ? "net " : ""}cost</em></div>
+              </>
+            ) : (
+              <>
+                <div><span>Net sellout</span><b>{kMoney(c.sellNet + c.retailValue)}</b><em>{psf(N(m.marketSellPSF))}/SF market</em></div>
+                <div><span>Profit</span><b className={c.condoProfit < 0 ? "neg" : ""}>{kMoney(c.condoProfit)}</b><em>{pct(c.condoMargin)} on cost</em></div>
+              </>
+            )}
+          </div>
+
           <div className="shSec">
-            <div className="shH">Site & Program</div>
+            <div className="shH">Site & Zoning</div>
             <div className="shGrid">
               <SR l="Zoning district" v={zdLabel} />
               <SR l="Development path" v={m.devPath === "uap" ? "City of Yes — UAP" : "As-of-right"} />
               {m.overlay && <SR l="Overlay" v={m.overlay} />}
+              {m.borough && <SR l="Borough" v={m.borough} />}
               <SR l="Lot size" v={fmt(c.lotSF) + " SF"} />
-              <SR l="Effective FAR" v={c.effFAR.toFixed(2)} />
-              <SR l="Zoning buildable" v={fmt(c.buildableSF) + " BSF"} />
-              <SR l="Zoning max units" v={c.maxUnitsByZoning} />
-              <SR l="Actual building SF" v={fmt(c.actualBuildingSF) + " SF"} />
-              <SR l="Net rentable/sellable" v={fmt(c.netSF) + " SF"} />
-              <SR l="Total units" v={Math.round(c.totalUnits)} />
-              <SR l="Market / affordable" v={`${Math.round(c.marketUnits)} / ${Math.round(c.affordableUnits)}`} />
+              <SR l="FAR (base / with bonus)" v={c.baseFAR.toFixed(2) + " / " + c.effFAR.toFixed(2)} />
+              <SR l="Base BSF" v={fmt(c.baseBSF)} />
+              {c.bonusBSF > 0 && <SR l="Bonus BSF" v={fmt(c.bonusBSF)} />}
+              {c.airSF > 0 && <SR l="Air rights / transfer" v={fmt(c.airSF) + " SF"} />}
+              <SR l="Total BSF" v={fmt(c.totalBSF)} />
+              <SR l="Resi net SF" v={fmt(c.resiNetSF)} />
+              <SR l={`Resi gross (+${N(m.addonPct)}%)`} v={fmt(c.resiGSF)} />
+              {c.retailSF > 0 && <SR l="Retail SF" v={fmt(c.retailSF)} />}
+              <SR l="Building GSF (cost basis)" v={fmt(c.GSF)} />
+              <SR l="BSF used / unused" v={c.bsfLeft >= 0 ? `${fmt(c.zfaUsed)} / ${fmt(c.bsfLeft)}` : `${fmt(-c.bsfLeft)} SF over`} />
+              <SR l="Units (market + affordable)" v={`${c.totalUnits} (${c.marketUnits} + ${c.affUnits})`} />
             </div>
           </div>
-          {rental && c.rentRoll?.length > 0 && (
-            <div className="shSec">
-              <div className="shH">Unit Mix & Rent Roll</div>
+
+          <div className="shSec">
+            <div className="shH">Unit Mix & Rents</div>
+            <div className="shWrap">
               <table className="shTable">
-                <thead><tr><th>Unit type</th><th>Free market</th><th style={{ textAlign: "left" }}>Affordable</th></tr></thead>
+                <thead><tr><th>Type</th><th>Avg SF</th><th>Units</th><th>Market</th><th>Affordable</th><th>Net SF</th></tr></thead>
                 <tbody>
-                  {c.rentRoll.filter((r) => r.mu > 0 || Object.keys(r.bands).length).map((r) => (
+                  {c.rows.filter((r) => r.units > 0).map((r) => (
                     <tr key={r.type}>
-                      <td>{typeLabels[r.type]}</td>
-                      <td>{r.mu > 0 ? `${r.mu} @ ${money(r.mr)}` : "—"}</td>
-                      <td style={{ textAlign: "left" }}>
-                        {AMI_BANDS.map((b) => (r.bands[b] ? `${r.bands[b].u} @ ${money(r.bands[b].r)} (${b}% AMI)` : null)).filter(Boolean).join(" · ") || "—"}
-                      </td>
+                      <td>{r.label}</td><td>{fmt(r.sf)}</td><td>{r.units}</td>
+                      <td>{r.mktU > 0 ? `${r.mktU} @ ${money(r.rent)}` : "—"}</td>
+                      <td>{r.parts.map((p) => `${p.u} @ ${money(p.net)} (${p.ami}%)`).join(" · ") || "—"}</td>
+                      <td>{fmt(r.netSF)}</td>
                     </tr>
                   ))}
+                  <tr className="tot"><td>Total</td><td>{c.totalUnits ? fmt(c.resiNetSF / c.totalUnits) : "—"}</td><td>{c.totalUnits}</td><td>{c.marketUnits} · avg {money(c.avgMktRent)}</td><td>{c.affUnits} · avg {money(c.avgAffRent)}</td><td>{fmt(c.resiNetSF)}</td></tr>
                 </tbody>
               </table>
             </div>
-          )}
-          {c.commTotalSF > 0 && (
+          </div>
+
+          <div className="shSec">
+            <div className="shH">Affordable Set-Aside — {m.program === "market" ? "none" : m.program.toUpperCase()}</div>
+            <div className="shNote">{P.label}</div>
+            <div className="shGrid">
+              <SR l="Requirement" v={m.affMode === "none" ? "None" : m.affMode === "units" ? `${N(m.affReqPct)}% of units = ${c.affReqUnits} units` : m.affMode === "uap" ? `UAP bonus ${fmt(c.bonusBSF)} BSF ≈ ${fmt(c.affReqSF)} net SF` : `${N(m.affReqPct)}% of resi = ${fmt(c.affReqSF)} SF`} />
+              <SR l="Provided" v={`${fmt(c.affSF)} SF · ${c.affUnits} units (${c.totalUnits ? pct(c.affUnits / c.totalUnits * 100) : "—"})`} />
+              <SR l={c.affMet ? "Surplus" : "Shortfall"} v={m.affMode === "units" ? `${c.affSurplusUnits} units` : `${fmt(c.affSurplusSF)} SF`} />
+              <SR l="Weighted avg AMI" v={c.affUnits ? Math.round(c.affAvgAmi) + "%" + (P.avg ? ` (target ≤ ${P.avg}%)` : "") : "—"} />
+              <SR l="Rent given up vs market" v={`${money(c.lostM)}/mo · ${money(c.lostYr)}/yr`} />
+              <SR l={`Value given up @ ${N(m.exitCapRatePct).toFixed(2)}% cap`} v={money(c.lostValue)} />
+            </div>
+            {affRows.length > 0 && (
+              <div className="shWrap" style={{ marginTop: 10 }}>
+                <table className="shTable">
+                  <thead><tr><th>Type</th><th>Units</th><th>AMI</th><th>Gross rent</th><th>Utility allow.</th><th>Net rent</th><th>Market rent</th><th>Lost / yr</th></tr></thead>
+                  <tbody>
+                    {affRows.flatMap((r) => r.parts.map((p, k) => (
+                      <tr key={r.type + k}><td>{r.label}</td><td>{p.u}</td><td>{p.ami}%</td><td>{money(p.r)}</td><td>{p.ua ? "-" + money(p.ua) : "—"}</td><td>{money(p.net)}</td><td>{money(r.rent)}</td><td>{money(p.u * (r.rent - p.net) * 12)}</td></tr>
+                    )))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            <div className="shSrc">Affordable rents: {HPD_RENT_SRC}. Net rent = gross rent − utility allowance.</div>
+          </div>
+
+          <div className="shSec">
+            <div className="shH">Development Budget</div>
+            <BudgetTable m={m} c={c} sheet />
+            <div className="shSrc">BSF = {fmt(c.totalBSF)} buildable SF · GSF = {fmt(c.GSF)} gross building SF · {c.totalUnits} units. Hard ${fmt(N(m.hardCostPerBSF))}/GSF{m.borough ? ` (${m.borough} default $${costsFor(m.borough).hard})` : ""}; soft {N(m.softCostPct)}% of hard; construction loan {N(m.ltcPct)}% LTC at {N(m.interestRatePct)}%.</div>
+          </div>
+
+          {rental ? (
             <div className="shSec">
-              <div className="shH">Commercial Income</div>
+              <div className="shH">Stabilized Income & Expenses</div>
+              <div className="shWrap">
+                <table className="shTable inc">
+                  <thead><tr><th>Income</th><th>Monthly</th><th>Yearly</th></tr></thead>
+                  <tbody>
+                    <IR l={`Market residential (${c.marketUnits} units)`} mo={c.mktResiM} yr={c.mktResiM * 12} />
+                    <IR l={`Affordable residential (${c.affUnits} units)`} mo={c.affResiM} yr={c.affResiM * 12} />
+                    {c.retailYr > 0 && <IR l={`Retail (${fmt(c.retailSF)} SF × $${fmt(N(m.retailPSF))})`} mo={c.retailYr / 12} yr={c.retailYr} />}
+                    {c.parkingM > 0 && <IR l={`Parking (${N(m.parkingSpaces)} × $${fmt(N(m.parkingRent))}/mo)`} mo={c.parkingM} yr={c.parkingM * 12} />}
+                    {c.otherYr > 0 && <IR l="Other income" mo={c.otherYr / 12} yr={c.otherYr} />}
+                    <IR l="Gross potential income" mo={c.GPI / 12} yr={c.GPI} b />
+                    <IR l={`Vacancy (resi ${N(m.vacancyPct)}%${c.retailYr > 0 ? `, retail ${N(m.commVacancyPct)}%` : ""})`} mo={c.vacancy / 12} yr={c.vacancy} neg />
+                    <IR l="Effective gross income" mo={c.EGI / 12} yr={c.EGI} b />
+                    <tr className="hd"><td colSpan={3}>Expenses</td></tr>
+                    <IR l={`Residential opex ($${fmt(N(m.opexPerUnit))}/unit/yr)`} mo={c.exResi / 12} yr={c.exResi} neg />
+                    {c.exMgmt > 0 && <IR l={`Management / other (${N(m.mgmtPct)}% of EGI)`} mo={c.exMgmt / 12} yr={c.exMgmt} neg />}
+                    {c.exRetail > 0 && <IR l={`Retail expenses (${N(m.retailExpPct)}%)`} mo={c.exRetail / 12} yr={c.exRetail} neg />}
+                    <IR l="Real estate tax (485-x / abated)" mo={c.exTax / 12} yr={c.exTax} neg />
+                    {lease && <IR l="Ground lease payment" mo={c.exGround / 12} yr={c.exGround} neg />}
+                    <IR l="Total expenses" mo={c.opexTotal / 12} yr={c.opexTotal} neg b />
+                    <IR l="NET OPERATING INCOME" mo={c.NOI / 12} yr={c.NOI} b />
+                  </tbody>
+                </table>
+              </div>
+              <div className="shSrc">Avg rent {money(c.avgRentUnit)}/unit/mo ({psf(c.rentPSF)}/net SF/yr) · market {money(c.avgMktRent)} ({psf(c.mktRentPSF)}/SF) · affordable {money(c.avgAffRent)} ({psf(c.affRentPSF)}/SF) · expense ratio {c.EGI ? pct(c.opexTotal / c.EGI * 100) : "—"}</div>
+            </div>
+          ) : (
+            <div className="shSec">
+              <div className="shH">Sellout</div>
               <div className="shGrid">
-                <SR l="Total commercial SF" v={fmt(c.commTotalSF) + " SF"} />
-                <SR l="Effective income" v={money(c.commEGI) + "/yr"} />
-                {!rental && <SR l="Retained commercial value" v={money(c.commercialValue)} />}
+                <SR l={`Market (${fmt(c.mktSF)} SF × $${fmt(N(m.marketSellPSF))})`} v={money(c.mktSF * N(m.marketSellPSF))} />
+                <SR l={`Affordable (${fmt(c.affSF)} SF × $${fmt(N(m.affordableSellPSF))})`} v={money(c.affSF * N(m.affordableSellPSF))} />
+                <SR l={`Selling costs (${N(m.sellingCostPct)}%)`} v={"-" + money(c.sellCosts)} />
+                {c.retailValue > 0 && <SR l={`Retail value @ ${N(m.commCapRate)}% cap`} v={money(c.retailValue)} />}
+                <SR l="Net revenue" v={money(c.sellNet + c.retailValue)} />
+                <SR l="Profit / margin on cost" v={`${sMoney(c.condoProfit)} · ${pct(c.condoMargin)}`} />
               </div>
             </div>
           )}
+
+          {rental && (
+            <div className="shSec">
+              <div className="shH">Returns & Debt</div>
+              <div className="shGrid">
+                <SR l="Yield on total cost" v={pct(c.yieldOnCost)} />
+                {c.credits > 0 && <SR l="Yield on net cost (after credits)" v={pct(c.yieldOnNet)} />}
+                <SR l={`Value @ ${N(m.exitCapRatePct).toFixed(2)}% cap`} v={money(c.exitValue)} />
+                <SR l="Value / BSF · / unit" v={`${psf(c.per(c.exitValue).bsf)} · ${c.totalUnits ? kMoney(c.per(c.exitValue).unit) : "—"}`} />
+                <SR l={c.credits > 0 ? "Net project cost" : "Total project cost"} v={money(c.netCost)} />
+                <SR l="Equity created" v={sMoney(c.equityCreated)} />
+                <SR l="Permanent loan" v={`${money(c.permLoan)} @ ${N(m.permRatePct)}%, ${N(m.permAmortYrs)} yr`} />
+                <SR l="Equity required" v={money(c.equityIn)} />
+                <SR l="Debt service (amort. / IO)" v={`${money(c.dsAmort)} / ${money(c.dsIO)}`} />
+                <SR l="Cash flow after debt (amort. / IO)" v={`${sMoney(c.cfAmort)} / ${sMoney(c.cfIO)}`} />
+                <SR l="DSCR (amort. / IO)" v={`${x2(c.dscr)} / ${x2(c.dscrIO)}`} />
+                <SR l="Cash-on-cash · debt yield" v={`${pct(c.coc)} · ${pct(c.debtYield)}`} />
+                {N(m.marketSellPSF) > 0 && <SR l={`Alt: sell as condo @ $${fmt(N(m.marketSellPSF))}/SF`} v={`${sMoney(c.condoProfit)} profit`} />}
+              </div>
+              <div className="shHl">
+                <span>Yield on cost</span>
+                <b>{pct(c.yieldOnCost)}</b>
+              </div>
+            </div>
+          )}
+
           <div className="shSec">
-            <div className="shH">Development Cost</div>
-            <div className="shGrid">
-              <SR l="Acquisition" v={money(c.totalAcq)} />
-              <SR l="Hard costs" v={money(c.totalHard)} />
-              <SR l="Soft costs" v={money(c.totalSoft)} />
-              <SR l="Financing costs" v={money(c.totalFin)} />
-              <SR l="Total dev. cost" v={money(c.TDC)} />
-              <SR l="Cost / unit" v={c.totalUnits > 0 ? money(c.TDC / c.totalUnits) : "—"} />
-            </div>
+            <div className="shH">Sensitivity</div>
+            <SensTable s={sens} m={m} sheet />
           </div>
-          <div className="shSec">
-            <div className="shH">{rental ? "Projected Value at Stabilization" : "Projected Sellout"}</div>
-            <div className="shGrid">
-              {rental ? (
-                <>
-                  <SR l="Net operating income" v={money(c.NOI)} />
-                  <SR l="Exit cap rate" v={N(m.exitCapRatePct).toFixed(2) + "%"} />
-                  <SR l="Exit value" v={money(c.exitValue)} />
-                  <SR l="Projected profit" v={money(c.profit)} />
-                </>
-              ) : (
-                <>
-                  <SR l="Gross sellout revenue" v={money(c.grossRevenue)} />
-                  <SR l="Net revenue" v={money(c.netRevenue)} />
-                  <SR l="Projected profit" v={money(c.profit)} />
-                  <SR l="Profit margin on cost" v={pct(c.margin)} />
-                </>
-              )}
-            </div>
-            <div className="shHl">
-              <span>{rental ? "Yield on cost" : "Margin on revenue"}</span>
-              <b>{pct(rental ? c.yieldOnCost : c.marginOnRevenue)}</b>
-            </div>
-          </div>
+
           <div className="shFoot">
-            Prepared by JStone Realty. Figures are preliminary underwriting estimates based on the assumptions stated
-            above and are subject to due diligence, final zoning analysis, and market verification. Not an offer or
-            guarantee of financing, pricing, or returns.
+            Prepared by JStone Realty. Preliminary underwriting estimates based on the assumptions stated above
+            (construction {N(m.constructionMonths)} months, {N(m.avgOutstandingPct)}% average draw, RE taxes during construction ${fmt(N(m.cTaxesYr))}/yr,
+            insurance {N(m.cInsurancePct)}% of hard{lease ? `, ground rent ${money(m.groundRentYr)}/yr with ${N(m.groundRentFreeMonths)} free months` : ""}).
+            Subject to due diligence, final zoning analysis, program rules (485-x / UAP / MIH) and market verification.
+            Not an offer or guarantee of financing, pricing, or returns.
           </div>
         </div>
         <div className="sheetActions">
@@ -960,7 +1508,7 @@ body{background:#f2efe6;margin:0;padding:24px;}
         </div>
       </div>
     </div>
-  );
+  </div>, document.body);
 }
 function SR({ l, v }) {
   return <div className="shRow"><span>{l}</span><b>{v}</b></div>;
@@ -2161,7 +2709,7 @@ function Shell({ user }) {
                 <div className="homeCard" onClick={() => { setUwModel(blankModel()); setReturnTo(null); setView("uw"); }}>
                   <div className="hcTag">04</div>
                   <h2>Underwriting</h2>
-                  <p>Full development model — FAR and unit counts, 485-x / UAP / MIH programs, rent roll, costs, financing, exit. Client summary in one click.</p>
+                  <p>Full development model — buy or ground lease, unit mix, 485-x / UAP / MIH set-aside, hard / soft / carrying costs, NOI, debt, exit. Report / PDF in one click.</p>
                   <span className="hcGo">Open model →</span>
                 </div>
                 <div className="homeCard" onClick={() => setView("contacts")}>
@@ -2675,10 +3223,11 @@ table.rr tbody tr:last-child td{border-bottom:none}
 .sheetActions{display:flex;gap:8px;justify-content:flex-end;padding:14px 0;flex-wrap:wrap}
 .sheetActions .ghost{background:#fff}
 @media print{
-  body *{visibility:hidden}
-  #uw-sheet,#uw-sheet *{visibility:visible}
-  .modalWrap{position:static;background:none;padding:0;overflow:visible}
-  #uw-sheet{position:absolute;top:0;left:0;width:100%;box-shadow:none}
+  body.uwPrint > *:not(.uwPortal){display:none !important}
+  body.uwPrint{background:#fff}
+  .uwPortal .modalWrap{position:static;background:none;padding:0;overflow:visible;display:block}
+  .uwPortal .modalWrap > div{width:100% !important}
+  #uw-sheet{box-shadow:none}
   .sheetActions{display:none}
 }
 @media (max-width:900px){.uwGrid{grid-template-columns:1fr}.uwSum{position:static}}
@@ -2824,6 +3373,85 @@ table.rr tbody tr:last-child td{border-bottom:none}
 @media (max-width:760px){
   .lookFacts{grid-template-columns:1fr}
   .fuqDate input{width:140px}
+}
+
+/* ---- underwriting v2 ---- */
+.uwGrid>*{min-width:0}
+.mini.tall{padding:7px 12px}
+.mono{font-family:'IBM Plex Mono',monospace;font-size:12px}
+table.rr td.bad{color:${RED};font-weight:700}
+table.rr tr.tot td{font-weight:700;background:#F6F5F1;font-family:'IBM Plex Mono',monospace;font-size:11.5px}
+table.rr.num td{font-family:'IBM Plex Mono',monospace;font-size:12px}
+table.bud{min-width:560px}
+table.bud td{text-align:right;font-family:'IBM Plex Mono',monospace;font-size:11.5px;white-space:nowrap}
+table.bud td:first-child{text-align:left;font-family:inherit;white-space:normal;font-size:12.5px;opacity:1}
+table.bud th:not(:first-child){text-align:right}
+table.bud tr.sub td{opacity:.6;font-size:11px}
+table.bud tr.sub td:first-child{padding-left:22px;font-size:11.5px}
+table.bud tr.head td{font-weight:700}
+table.bud tr.sub2 td{font-weight:700;background:#F6F5F1}
+table.bud tr.tot td{font-weight:800;border-top:2px solid ${INK};background:#F1EEE4}
+table.sens td{font-family:'IBM Plex Mono',monospace;font-size:11.5px;line-height:1.25}
+table.sens td small{display:block;opacity:.55;font-size:10px}
+table.sens td.neg{color:${RED}}
+table.sens td.base{outline:2px solid #9C7A2E;outline-offset:-2px;font-weight:700}
+.amiSel{width:auto;padding:4px 8px;font-size:12px;font-family:'IBM Plex Mono',monospace}
+.chk{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:14px}
+.chk>div{border:1px solid ${LINE};border-radius:8px;padding:9px 10px;background:#FBFAF7}
+.chk span{display:block;font-size:10px;text-transform:uppercase;letter-spacing:.08em;opacity:.55}
+.chk b{display:block;font-family:'IBM Plex Mono',monospace;font-size:15px;margin-top:2px}
+.chk em{display:block;font-style:normal;font-size:10.5px;opacity:.6;margin-top:2px}
+.chk>div.ok{border-color:#84B482;background:rgba(132,180,130,.08)}
+.chk>div.ok b{color:${GREEN}}
+.chk>div.no{border-color:#C47764;background:rgba(196,119,100,.08)}
+.chk>div.no b{color:${RED}}
+.warn{margin-top:10px;font-size:12px;color:${RED};font-weight:600}
+.ledger b small{font-size:10.5px;opacity:.5;margin-left:7px;font-weight:400}
+.divLabel i{font-style:normal;opacity:.5;letter-spacing:.06em;margin-left:6px;color:#EDEDE8}
+.shKpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:-6px 0 26px}
+.shKpis>div{border:1px solid #ddd0ac;background:#faf6ea;border-radius:5px;padding:12px 14px}
+.shKpis span{display:block;font-size:10.5px;font-weight:700;letter-spacing:.07em;color:#8a6f45;text-transform:uppercase}
+.shKpis b{display:block;font-family:'Source Serif 4',serif;font-size:24px;color:#1c1a15;margin-top:4px}
+.shKpis b.neg{color:#A8453A}
+.shKpis em{display:block;font-style:normal;font-size:11.5px;color:#6a6558;margin-top:2px}
+.shWrap{overflow-x:auto}
+.shNote{font-size:12.5px;color:#6a6558;margin:-4px 0 10px;line-height:1.5}
+.shSrc{font-size:11px;color:#8a8577;margin-top:8px;line-height:1.5}
+.shTable tr.tot td{font-weight:800;border-top:1.5px solid #8a6f45;color:#1c1a15}
+.shTable tr.hd td{font-size:11px;font-weight:700;color:#8a6f45;text-transform:uppercase;letter-spacing:.05em;padding-top:14px}
+.shTable.bud{font-size:12.5px}
+.shTable.bud td{text-align:right;padding:6px 8px}
+.shTable.bud td:first-child{text-align:left;color:#1c1a15}
+.shTable.bud tr.sub td{color:#8a8577;font-size:11.5px}
+.shTable.bud tr.sub td:first-child{padding-left:22px;color:#8a8577}
+.shTable.bud tr.head td{font-weight:700}
+.shTable.bud tr.sub2 td{font-weight:700;background:#f5efdf}
+.shTable.bud tr.tot td{background:#f5efdf;border-top:2px solid #8a6f45}
+.shTable.inc td{text-align:right}
+.shTable.inc td:first-child{text-align:left}
+.shTable.sens td{font-size:12.5px}
+.shTable.sens td.neg{color:#A8453A}
+.shTable.sens td.base{outline:2px solid #c9a267;outline-offset:-2px;font-weight:700}
+.shTable.sens td small{display:block;font-size:10.5px;color:#8a8577}
+@media (max-width:760px){
+  .uw .fg2{grid-template-columns:1fr 1fr;gap:10px}
+  .uw .uwField label{flex-wrap:wrap;gap:0 6px;font-size:11.5px}
+  .uw .uwField label em{white-space:nowrap}
+  .uw .secBody{padding:4px 12px 14px}
+  .chk{grid-template-columns:1fr 1fr}
+  .sheet{padding:20px}
+  .shTitle{font-size:24px}
+  .shGrid{grid-template-columns:1fr}
+  .shKpis{grid-template-columns:1fr 1fr}
+  .shTop{flex-direction:column}
+}
+@media print{
+  @page{size:letter;margin:.45in}
+  #uw-sheet{padding:0;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  .shSec{break-inside:avoid}
+  .shTable tr,.shRow,.shKpis{break-inside:avoid}
+  .shH{break-after:avoid}
+  .shWrap{overflow:visible}
 }
 `;
 
