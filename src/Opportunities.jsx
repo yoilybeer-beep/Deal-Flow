@@ -218,7 +218,7 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
     await supabase.from("contacts").update({ converted_deal_id: id, updated_at: new Date().toISOString() }).eq("id", f.id);
     setContacts((cs) => cs.map((c) => (c.id === f.id ? { ...c, converted_deal_id: id } : c)));
     putState((s) => ({ ...s, contacts: { ...s.contacts, [f.id]: { ...(s.contacts[f.id] || {}), status: "Converted" } } }));
-    if (p) setPStatus(pkey(p), "Interested");
+    if (p && (stRef.current.prospects[pkey(p)]?.status || "New") === "New") setPStatus(pkey(p), "Interested");
     setForm(null);
     notify?.(`Deal created for ${data.address || f.name}.`);
     onGo?.("deals", id);
