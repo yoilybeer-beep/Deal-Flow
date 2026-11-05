@@ -5,6 +5,7 @@ import Papa from "papaparse";
 import { supabase } from "./supabaseClient";
 import Contacts, { contactMatches, matchingNote } from "./Contacts";
 import Team from "./Team";
+import Opportunities, { OPPS_PREFIX } from "./Opportunities";
 import { QuickActions, LastContactedTag, lastContacted, todayISO, autoContact, sellerFromDeal, personFromBuyer, FollowUpQuick, shortDay } from "./crmKit";
 
 /* ============================================================
@@ -684,7 +685,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
   useEffect(() => { loadList(); }, []);
   const loadList = async () => {
     const { data } = await supabase.from("models").select("id, data, owner_id, is_public").order("updated_at", { ascending: false });
-    setSaved((data || []).map((r) => ({ ...r.data, isPublic: !!r.is_public, _owner: r.owner_id })));
+    setSaved((data || []).filter((r) => !String(r.id).startsWith(OPPS_PREFIX)).map((r) => ({ ...r.data, isPublic: !!r.is_public, _owner: r.owner_id })));
   };
   const save = async () => {
     setBusy(true);
@@ -2661,7 +2662,7 @@ function Shell({ user }) {
   // invite links land here with a session in the URL; ask for a password once
   const [needsPassword, setNeedsPassword] = useState(() => /type=(invite|recovery)/.test(window.location.hash));
 
-  const NAV = [["home", "Home"], ["deals", "Deals"], ["buyers", "Buyers"], ["contacts", "Contacts"], ["zcalc", "Zoning calc"], ["uw", "Underwriting"],
+  const NAV = [["home", "Home"], ["opps", "New Opportunities"], ["deals", "Deals"], ["buyers", "Buyers"], ["contacts", "Contacts"], ["zcalc", "Zoning calc"], ["uw", "Underwriting"],
     ...(role === "admin" ? [["team", "Team"]] : [])];
 
   return (
@@ -2748,6 +2749,8 @@ function Shell({ user }) {
           )}
 
           {view === "team" && role === "admin" && <Team userId={userId} notify={notify} />}
+
+          {view === "opps" && <Opportunities userId={userId} userName={displayName} notify={notify} onGo={go} />}
 
           {view === "contacts" && (
             <Contacts notify={notify} userId={userId} userName={displayName} onGo={go}
