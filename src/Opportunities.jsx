@@ -60,6 +60,8 @@ const noteTime = (iso) => {
   return isNaN(d) ? "" : d.toLocaleDateString("en-US", { month: "short", day: "numeric" }) + " · " + d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
 };
 const newId = () => (crypto.randomUUID ? crypto.randomUUID() : "x" + Date.now().toString(36) + Math.random().toString(36).slice(2));
+const street = (a) => String(a || "").replace(/,\s*(Bronx|New York|NY)\b.*$/i, "").trim();   // "121 East 169 Street, Bronx, NY 10452" -> "121 East 169 Street"
+const withBoro = (a) => (/bronx/i.test(a || "") ? a : a ? `${a}, Bronx` : "");
 const appId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);   // same as uid() in App.jsx
 
 export default function Opportunities({ userId, userName, notify, onGo }) {
@@ -122,8 +124,8 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
   const openNew = (seed = {}) => setForm({ id: null, name: "", role: "owner", phone: "", email: "", address: "", prospectKey: "", status: "Lead", callbackAt: "", notes: [], ...seed });
   const fromProspect = (p, n) => {
     const k = pkey(p);
-    if (n) openNew({ name: titleCase(n.owner), role: "neighbor", address: `${n.address}, Bronx`, prospectKey: k });
-    else openNew({ name: titleCase(p.base.owner), role: "owner", address: `${p.base.address}, Bronx`, prospectKey: k });
+    if (n) openNew({ name: titleCase(n.owner), role: "neighbor", address: withBoro(n.address), prospectKey: k });
+    else openNew({ name: titleCase(p.base.owner), role: "owner", address: withBoro(p.base.address), prospectKey: k });
     setTab("crm");
     window.scrollTo(0, 0);
   };
@@ -197,13 +199,13 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
     const id = appId();
     const notesText = [...(f.notes || [])].reverse().map((n) => `${noteTime(n.noted_at)}: ${n.body}`).join("\n");
     const summary = p ? [
-      `New Opportunities ${p.date} #${p.rank}: assemblage at ${b.address} (${b.zoning}, ${b.front_ft}×${b.depth_ft}, ${fmt(b.lot_sf)} SF lot).`,
+      `New Opportunities ${p.date} #${p.rank}: assemblage at ${street(b.address)} (${b.zoning}, ${b.front_ft}×${b.depth_ft}, ${fmt(b.lot_sf)} SF lot).`,
       `Combined buildable ~${fmt(p.combined_buildable_gsf)} GSF / ~${fmt(p.est_units)} units (UAP ~${fmt(p.combined_buildable_gsf_uap)} GSF / ~${fmt(p.est_units_uap)} units).`,
-      ...(p.neighbors || []).map((n) => `Neighbor ${n.side}: ${n.address} (${titleCase(n.owner)}), ~${fmt(n.unused_sf)} SF unused.`),
+      ...(p.neighbors || []).map((n) => `Neighbor ${n.side}: ${street(n.address)} (${titleCase(n.owner)}), ~${fmt(n.unused_sf)} SF unused.`),
       f.role === "neighbor" ? `Contact is a neighbor: ${f.address}.` : "",
     ].filter(Boolean).join("\n") : "";
     const data = {   // blankDeal() defaults + what we already know
-      id, address: p ? b.address : (f.address || "").replace(/,\s*Bronx$/i, ""), borough: "Bronx", neighborhood: p?.neighborhood || "",
+      id, address: street(p ? b.address : f.address), borough: "Bronx", neighborhood: p?.neighborhood || "",
       zone: (p && b.zoning) || "R6", photos: [], streetWidth: "narrow", devPath: "aor",
       lotArea: p && b.lot_sf ? String(b.lot_sf) : "", customFar: p && b.max_far ? String(b.max_far) : "", askingPrice: "",
       sellerNumber: f.phone || "", vacancy: "TBD", existingSf: p && b.existing_bldg_sf ? String(b.existing_bldg_sf) : "",
@@ -362,7 +364,7 @@ function Prospect({ p, status, note, contacts, onStatus, onNote, onAdd, onOpen }
       <div className="opCardTop">
         <span className="opRank">#{p.rank}</span>
         <div className="opAddrWrap">
-          <div className="opAddr">{b.address}</div>
+          <div className="opAddr">{street(b.address)}</div>
           <div className="opSub">{[p.neighborhood, b.zoning, b.front_ft && b.depth_ft ? `${far(b.front_ft)}×${far(b.depth_ft)}` : "", b.lot_sf ? `${fmt(b.lot_sf)} SF lot` : ""].filter(Boolean).join(" · ")}</div>
         </div>
         {b.zola && <a className="opZola" href={b.zola} target="_blank" rel="noopener noreferrer">ZoLa</a>}
@@ -383,7 +385,7 @@ function Prospect({ p, status, note, contacts, onStatus, onNote, onAdd, onOpen }
             <div key={i} className="opNbr">
               <span className="opSide">{x.side || "adj."}</span>
               <div className="opNbrMain">
-                <div><b>{x.address}</b> <span className="opPlus">+{fmt(x.unused_sf)} SF</span></div>
+                <div><b>{street(x.address)}</b> <span className="opPlus">+{fmt(x.unused_sf)} SF</span></div>
                 <div className="opNbrOwner">{titleCase(x.owner) || "—"}</div>
               </div>
               <div className="opNbrActs">
@@ -446,7 +448,7 @@ function ContactCard({ f, setF, prospects, pByKey, onSave, onBack, onAddNote, on
         <div className="field"><label className="flabel">Linked prospect</label>
           <select value={f.prospectKey || ""} onChange={set("prospectKey")}>
             <option value="">None</option>
-            {prospects.map((x) => { const k = pkey(x); return <option key={k} value={k}>#{x.rank} {x.base?.address} · {dayLabel(x.date)}</option>; })}
+            {prospects.map((x) => { const k = pkey(x); return <option key={k} value={k}>#{x.rank} {street(x.base?.address)} · {dayLabel(x.date)}</option>; })}
           </select>
           {p && <div className="hintline">{p.base?.zoning} · ~{fmt(p.est_units)} units combined ({fmt(p.combined_buildable_gsf)} GSF){p.base?.zola ? <> · <a href={p.base.zola} target="_blank" rel="noopener noreferrer">ZoLa</a></> : null}</div>}
         </div>
