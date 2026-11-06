@@ -483,8 +483,11 @@ function runCalc(m) {
   const baseFAR = N(m.far);
   const effFAR = N(m.bonusFar) > 0 ? N(m.bonusFar) : baseFAR;
   const baseBSF = lotSF * baseFAR;
-  const zoningBSF = lotSF * effFAR;
-  const bonusBSF = Math.max(0, zoningBSF - baseBSF);
+  // UAP: the bonus is (UAP FAR − base FAR) × lot, unless the user typed how much of it they use (m.uapSF)
+  const autoBonusBSF = Math.max(0, lotSF * effFAR - baseBSF);
+  const uapEdited = autoBonusBSF > 0 && m.uapSF !== null && m.uapSF !== undefined && m.uapSF !== "";
+  const bonusBSF = uapEdited ? Math.max(0, N(m.uapSF)) : autoBonusBSF;
+  const zoningBSF = baseBSF + bonusBSF;
   const airSF = N(m.airRightsSF);
   const totalBSF = zoningBSF + airSF;
   const rawFactor = totalBSF / 680;
@@ -611,7 +614,7 @@ function runCalc(m) {
   const margin = netCost > 0 ? profit / netCost * 100 : 0;
 
   return {
-    lease, rental, lotSF, baseFAR, effFAR, baseBSF, zoningBSF, bonusBSF, airSF, totalBSF, buildableSF: zoningBSF, maxUnitsByZoning,
+    lease, rental, lotSF, baseFAR, effFAR, baseBSF, zoningBSF, bonusBSF, autoBonusBSF, uapEdited, airSF, totalBSF, buildableSF: zoningBSF, maxUnitsByZoning,
     rows, totalUnits, affUnits, marketUnits, affordableUnits: affUnits, resiNetSF, affSF, mktSF, resiGSF, retailSF, zfaUsed, computedGSF, GSF,
     actualBuildingSF: GSF, netSF: resiNetSF, bsfLeft, overAlloc,
     affMode, affReqSF, affReqUnits, affSurplusSF, affSurplusUnits, affMet, affAvgAmi,
@@ -709,6 +712,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
     const v = district ? farFor(district, street) : null;
     setM((p) => ({
       ...p, district, street, devPath,
+      uapSF: devPath === "uap" ? p.uapSF : null,
       far: v ? v.aor : p.far,
       bonusFar: v ? (devPath === "uap" ? v.uap : 0) : p.bonusFar,
     }));
@@ -728,6 +732,12 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
       return next;
     });
   };
+  // UAP SF typed (or reset): refit the unit mix to the new envelope and refill the affordable tier to the requirement
+  const refitUap = (p) => {
+    const fitted = fitMix(p, runCalc(p).totalBSF);
+    return fitted.affMode === "uap" ? autoAffordable(fitted) : fitted;
+  };
+  const resetUap = () => setM((p) => refitUap({ ...p, uapSF: null }));
   const applyBorough = (b) => {
     const bc = costsFor(b);
     setM((p) => ({ ...p, borough: b, hardCostPerBSF: bc.hard, softCostPct: bc.soft }));
@@ -833,6 +843,20 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
               <F label="Lot size" hint="SF">{num("lotSF")}</F>
               <F label="Base FAR" hint="as-of-right">{num("far", "0.01")}</F>
               <F label="Bonus FAR" hint="UAP etc · 0 = base">{num("bonusFar", "0.01")}</F>
+              {c.autoBonusBSF > 0 && (
+                <F label="UAP affordable SF" hint={c.uapEdited ? "your number" : "auto"}>
+                  <input type="number" inputMode="decimal" step="any" value={c.uapEdited ? m.uapSF : Math.round(c.autoBonusBSF)}
+                    onChange={(e) => set("uapSF", e.target.value)}
+                    onBlur={() => setM((p) => refitUap(p))}
+                    onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }} />
+                  <div className="uapNote">
+                    {c.uapEdited
+                      ? <>Auto {fmt(c.autoBonusBSF)} · edited <button className="linkBtn inline" onClick={resetUap}>reset to auto</button>
+                          {c.bonusBSF > c.autoBonusBSF + 0.5 && <b style={{ color: RED }}> · above UAP max</b>}</>
+                      : <>UAP affordable SF (auto): {fmt(c.autoBonusBSF)}</>}
+                  </div>
+                </F>
+              )}
               <F label="Overlay / special" hint="optional">
                 <input value={m.overlay} onChange={(e) => set("overlay", e.target.value)} placeholder="C2-4 overlay" />
               </F>
@@ -841,7 +865,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
             </div>
             <div className="derived">
               Lot {fmt(c.lotSF)} × FAR {c.baseFAR.toFixed(2)} = {fmt(c.baseBSF)} BSF
-              {c.bonusBSF > 0 && <> + {fmt(c.bonusBSF)} bonus</>}
+              {c.bonusBSF > 0 && <> + {fmt(c.bonusBSF)} {c.uapEdited ? "UAP (your number)" : "bonus"}</>}
               {c.airSF > 0 && <> + {fmt(c.airSF)} transfer</>}
               {" "}= <b>{fmt(c.totalBSF)} total BSF</b> · zoning max ≈ {c.maxUnitsByZoning} units (680 SF factor)
             </div>
@@ -1372,7 +1396,7 @@ body{background:#f2efe6;margin:0;padding:24px;}
               <SR l="Lot size" v={fmt(c.lotSF) + " SF"} />
               <SR l="FAR (base / with bonus)" v={c.baseFAR.toFixed(2) + " / " + c.effFAR.toFixed(2)} />
               <SR l="Base BSF" v={fmt(c.baseBSF)} />
-              {c.bonusBSF > 0 && <SR l="Bonus BSF" v={fmt(c.bonusBSF)} />}
+              {c.bonusBSF > 0 && <SR l={c.uapEdited ? "UAP affordable BSF (edited)" : "Bonus BSF"} v={fmt(c.bonusBSF) + (c.uapEdited ? ` of ${fmt(c.autoBonusBSF)} max` : "")} />}
               {c.airSF > 0 && <SR l="Air rights / transfer" v={fmt(c.airSF) + " SF"} />}
               <SR l="Total BSF" v={fmt(c.totalBSF)} />
               <SR l="Resi net SF" v={fmt(c.resiNetSF)} />
@@ -3388,6 +3412,7 @@ table.rr tbody tr:last-child td{border-bottom:none}
 .lookNote{margin-top:8px;font-size:11.5px;opacity:.6}
 .lookDiff{margin-top:8px;font-size:12.5px;background:#FDF3E3;border:1px solid #F0D9AE;color:#7A5410;border-radius:8px;padding:6px 9px}
 .linkBtn.inline{display:inline;padding:0 0 0 4px;color:${BLUE};font-size:12.5px}
+.uapNote{font-size:11.5px;color:${BLUE};margin-top:4px;line-height:1.4}
 .lookLinks .linkBtn.inline{padding:0}
 .streetPick{margin-top:12px}
 .streetPick .seg button{padding:9px 16px}
