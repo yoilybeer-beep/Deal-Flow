@@ -6,6 +6,8 @@ import { supabase } from "./supabaseClient";
 import Contacts, { contactMatches, matchingNote } from "./Contacts";
 import Team from "./Team";
 import Opportunities, { OPPS_PREFIX } from "./Opportunities";
+import RentalUW, { isRentalModel } from "./RentalUW";
+import { blankRental, newUnit, typicalExpenses } from "./rentalCalc";
 import { QuickActions, LastContactedTag, lastContacted, todayISO, autoContact, sellerFromDeal, personFromBuyer, FollowUpQuick, shortDay } from "./crmKit";
 
 /* ============================================================
@@ -408,6 +410,21 @@ function modelFromDeal(deal) {
   return fitMix(m, target);
 }
 
+/* ---------- prefill a rental model from a Deal Desk deal (existing building) ---------- */
+function rentalFromDeal(deal) {
+  const m = blankRental(deal.borough || "");
+  m.dealId = deal.id;
+  m.dealName = deal.address || "Untitled rental";
+  m.marketArea = [deal.neighborhood, deal.borough].filter(Boolean).join(", ");
+  m.purchasePrice = N(deal.askingPrice) || 0;
+  m.buildingSF = N(deal.existingSf) || N(deal.lot?.bldgarea) || 0;
+  m.yearBuilt = deal.lot?.yearbuilt ? String(deal.lot.yearbuilt) : "";
+  const n = Math.round(N(deal.lot?.unitsres));
+  if (n > 0 && n <= 400) { m.units = Array.from({ length: n }, (_, i) => newUnit(String(i + 1), { beds: 1, current: 0, market: 0 })); m.sampleRoll = true; }
+  m.exp = typicalExpenses(m);
+  return m;
+}
+
 /* scale the unit counts so resi gross + retail ≈ the target buildable SF */
 function fitMix(m, targetBSF) {
   const target = N(targetBSF) - N(m.retailSF);
@@ -688,7 +705,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
   useEffect(() => { loadList(); }, []);
   const loadList = async () => {
     const { data } = await supabase.from("models").select("id, data, owner_id, is_public").order("updated_at", { ascending: false });
-    setSaved((data || []).filter((r) => !String(r.id).startsWith(OPPS_PREFIX)).map((r) => ({ ...r.data, isPublic: !!r.is_public, _owner: r.owner_id })));
+    setSaved((data || []).filter((r) => !String(r.id).startsWith(OPPS_PREFIX) && !isRentalModel(r.data)).map((r) => ({ ...r.data, isPublic: !!r.is_public, _owner: r.owner_id })));
   };
   const save = async () => {
     setBusy(true);
@@ -1572,7 +1589,7 @@ const blankBuyer = () => ({
   followUpDate: "", lastContacted: "",
 });
 
-function DealDesk({ view, notify, onUnderwrite, userId, userName, openId, onOpened }) {
+function DealDesk({ view, notify, onUnderwrite, onUnderwriteRental, userId, userName, openId, onOpened }) {
   const [deals, setDeals] = useState([]);
   const [buyers, setBuyers] = useState([]);
   const [loaded, setLoaded] = useState(false);
@@ -1861,6 +1878,7 @@ function DealDesk({ view, notify, onUnderwrite, userId, userName, openId, onOpen
         onDelete={() => deleteDeal(dealForm.id)}
         onShare={() => setShareFor(dealForm)}
         onUnderwrite={() => onUnderwrite(dealForm)}
+        onUnderwriteRental={onUnderwriteRental ? () => onUnderwriteRental(dealForm) : null}
         isNew={!deals.some((d) => d.id === dealForm.id)}
         mine={!dealForm._owner || dealForm._owner === userId}
         notify={notify}
@@ -2095,7 +2113,7 @@ function lotFields(hit, lot) {
   };
 }
 
-function DealForm({ deal, setDeal, buyers, onSave, onCancel, onDelete, onShare, onUnderwrite, isNew, mine = true, notify, onFollow }) {
+function DealForm({ deal, setDeal, buyers, onSave, onCancel, onDelete, onShare, onUnderwrite, onUnderwriteRental, isNew, mine = true, notify, onFollow }) {
   const touched = useRef(new Set());   // fields typed by hand in this visit: a lookup never overwrites them
   const set = (k) => (e) => { touched.current.add(k); setDeal({ ...deal, [k]: e.target.value }); };
 
@@ -2200,6 +2218,7 @@ function DealForm({ deal, setDeal, buyers, onSave, onCancel, onDelete, onShare, 
           {!isNew && mine && <button className="danger" onClick={() => (arm ? onDelete() : setArm(true))}>{arm ? "Tap again to delete" : "Delete"}</button>}
           {!isNew && <button className="ghost" onClick={onShare}>Share ↗</button>}
           <button className="ghost" onClick={onUnderwrite} disabled={!deal.address.trim()}>Underwrite →</button>
+          {onUnderwriteRental && <button className="ghost" onClick={onUnderwriteRental} disabled={!deal.address.trim()}>Rental UW →</button>}
           <button className="ghost" onClick={onCancel}>{mine ? "Cancel" : "Back"}</button>
           {mine && <button className="primary" onClick={onSave} disabled={!deal.address.trim()}>Save deal</button>}
         </div>
@@ -2677,6 +2696,12 @@ function Shell({ user }) {
     setReturnTo("deals");
     setView("uw");
   };
+  const [rentModel, setRentModel] = useState(() => blankRental());
+  const underwriteRental = (deal) => {
+    setRentModel(rentalFromDeal(deal));
+    setReturnTo("deals");
+    setView("rent");
+  };
 
   // role comes from team_members (RLS allowlist); only admins see the Team screen
   const [role, setRole] = useState(undefined);   // undefined = loading, null = not on the team
@@ -2686,7 +2711,7 @@ function Shell({ user }) {
   // invite links land here with a session in the URL; ask for a password once
   const [needsPassword, setNeedsPassword] = useState(() => /type=(invite|recovery)/.test(window.location.hash));
 
-  const NAV = [["home", "Home"], ["opps", "New Opportunities"], ["deals", "Deals"], ["buyers", "Buyers"], ["contacts", "Contacts"], ["zcalc", "Zoning calc"], ["uw", "Underwriting"],
+  const NAV = [["home", "Home"], ["opps", "New Opportunities"], ["deals", "Deals"], ["buyers", "Buyers"], ["contacts", "Contacts"], ["zcalc", "Zoning calc"], ["uw", "Underwriting"], ["rent", "Rental UW"],
     ...(role === "admin" ? [["team", "Team"]] : [])];
 
   return (
@@ -2703,7 +2728,7 @@ function Shell({ user }) {
           <nav>
             {NAV.map(([id, label]) => (
               <button key={id} className="navBtn" data-on={view === id}
-                onClick={() => { if (id === "uw") setReturnTo(null); go(id); }}>{label}</button>
+                onClick={() => { if (id === "uw" || id === "rent") setReturnTo(null); go(id); }}>{label}</button>
             ))}
           </nav>
           <div className="sideFoot">
@@ -2751,8 +2776,14 @@ function Shell({ user }) {
                   <p>Full development model — buy or ground lease, unit mix, 485-x / UAP / MIH set-aside, hard / soft / carrying costs, NOI, debt, exit. Report / PDF in one click.</p>
                   <span className="hcGo">Open model →</span>
                 </div>
-                <div className="homeCard" onClick={() => setView("contacts")}>
+                <div className="homeCard" onClick={() => { setRentModel(blankRental()); setReturnTo(null); setView("rent"); }}>
                   <div className="hcTag">05</div>
+                  <h2>Rental Underwriting</h2>
+                  <p>Buy-and-hold model for an existing building — rent roll with RS / free-market / voucher units, itemized expenses, debt sized by LTV and DSCR, 5–10 year cash flow, IRR, sensitivity. Report / PDF.</p>
+                  <span className="hcGo">Open rental model →</span>
+                </div>
+                <div className="homeCard" onClick={() => setView("contacts")}>
+                  <div className="hcTag">06</div>
                   <h2>Contacts</h2>
                   <p>Owners, buyers, brokers and lenders. Area, follow-up date, and a dated note for every call.</p>
                   <span className="hcGo">Open contacts →</span>
@@ -2768,7 +2799,7 @@ function Shell({ user }) {
           )}
 
           {(view === "deals" || view === "buyers" || view === "zcalc") && (
-            <DealDesk view={view} notify={notify} onUnderwrite={underwriteDeal} userId={userId} userName={displayName}
+            <DealDesk view={view} notify={notify} onUnderwrite={underwriteDeal} onUnderwriteRental={underwriteRental} userId={userId} userName={displayName}
               openId={openTarget?.view === view ? openTarget.id : null} onOpened={() => setOpenTarget(null)} />
           )}
 
@@ -2779,6 +2810,17 @@ function Shell({ user }) {
           {view === "contacts" && (
             <Contacts notify={notify} userId={userId} userName={displayName} onGo={go}
               openId={openTarget?.view === "contacts" ? openTarget.id : null} onOpened={() => setOpenTarget(null)} />
+          )}
+
+          {view === "rent" && (
+            <RentalUW
+              key={rentModel.id}
+              initialModel={rentModel}
+              onExit={returnTo ? () => { setView(returnTo); setReturnTo(null); } : null}
+              notify={notify}
+              userId={userId}
+              userName={displayName}
+            />
           )}
 
           {view === "uw" && (
@@ -3452,6 +3494,9 @@ table.sens td.base{outline:2px solid #9C7A2E;outline-offset:-2px;font-weight:700
 .chk>div.no{border-color:#C47764;background:rgba(196,119,100,.08)}
 .chk>div.no b{color:${RED}}
 .warn{margin-top:10px;font-size:12px;color:${RED};font-weight:600}
+.rentFlags{margin-top:14px;padding:10px 12px;border:1px solid #C47764;border-radius:8px;background:rgba(196,119,100,.1);font-size:11.5px;line-height:1.5;color:#F0C9BE}
+table.rr.rroll{min-width:560px}
+table.rr.rroll input{min-width:64px}
 .ledger b small{font-size:10.5px;opacity:.5;margin-left:7px;font-weight:400}
 .divLabel i{font-style:normal;opacity:.5;letter-spacing:.06em;margin-left:6px;color:#EDEDE8}
 .shKpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:-6px 0 26px}
@@ -3502,4 +3547,5 @@ table.sens td.base{outline:2px solid #9C7A2E;outline-offset:-2px;font-weight:700
 }
 `;
 
+export { Sec, F, Row, MC, SR, LOGO_FULL, fmt, money, pct, kMoney, sMoney, psf, x2, RED, GREEN, BLUE, BOROUGHS };
 export default App;
