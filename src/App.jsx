@@ -316,6 +316,7 @@ function blankModel(borough = "") {
     vacancyPct: 5, opexPerUnit: 6000, mgmtPct: 3, propertyTaxAnnual: 0, exitCapRatePct: 5.5,
     permLoanPct: 90, permLoanAmt: 0, permRatePct: 6.5, permAmortYrs: 30,
     marketSellPSF: 1100, affordableSellPSF: 500, sellingCostPct: 6,
+    leaseUpMonths: 6, saleCostPct: 3,          // returns summary only (new; old models get these defaults, nothing else moves)
     isPublic: false, updated: new Date().toISOString().slice(0, 10),
   };
 }
@@ -507,7 +508,7 @@ function runCalc(m) {
   const zoningBSF = baseBSF + bonusBSF;
   const airSF = N(m.airRightsSF);
   const totalBSF = zoningBSF + airSF;
-  const rawFactor = totalBSF / 680;
+  const rawFactor = Math.max(0, totalBSF - N(m.retailSF)) / 680;   // dwelling-unit factor applies to residential floor area only
   const maxUnitsByZoning = Math.floor(rawFactor) + (rawFactor - Math.floor(rawFactor) >= 0.75 ? 1 : 0);
 
   // unit mix + affordable tiers
@@ -630,6 +631,24 @@ function runCalc(m) {
   const profit = rental ? equityCreated : condoProfit;
   const margin = netCost > 0 ? profit / netCost * 100 : 0;
 
+  // returns summary: build → lease-up (or sell out) → sell. All equity in on day 1, construction loan repaid from the sale.
+  const leaseUpMo = Math.max(0, N(m.leaseUpMonths));
+  const exitYears = (months + leaseUpMo) / 12;
+  const saleNet = rental ? exitValue * (1 - N(m.saleCostPct) / 100) : sellNet + retailValue;
+  const profitSold = saleNet - netCost;
+  const marginSold = netCost > 0 ? profitSold / netCost * 100 : 0;
+  const devEquity = Math.max(0, netCost - constrLoan);
+  const toEquity = saleNet - constrLoan;
+  const devMultiple = devEquity > 0 ? toEquity / devEquity : 0;
+  const devIRR = devEquity > 0 && exitYears > 0 && toEquity > 0 ? (Math.pow(toEquity / devEquity, 1 / exitYears) - 1) * 100 : (devEquity > 0 && toEquity <= 0 ? -100 : NaN);
+  const devSpreadBps = rental ? (yieldOnCost - cap) * 100 : 0;
+
+  // UAP deep affordability (ZR / HPD UAP rules as summarized in uwConstants — verify): 10,000+ SF affordable → 20% of it at ≤ 40% AMI
+  const deepSF = UNIT_TYPES.reduce((s, [t]) => s + tiers.reduce((a, tr) => a + (N(tr.ami) <= 40 ? N(tr.units?.[t]) : 0), 0) * N((m.mix || {})[t]?.sf), 0);
+  const uapDeepReq = affMode === "uap" && bonusBSF >= 10000;
+  const uapDeepSF = uapDeepReq ? affReqSF * 0.2 : 0;
+  const uapDeepMet = !uapDeepReq || deepSF >= uapDeepSF - 0.5;
+
   return {
     lease, rental, lotSF, baseFAR, effFAR, baseBSF, zoningBSF, bonusBSF, autoBonusBSF, uapEdited, airSF, totalBSF, buildableSF: zoningBSF, maxUnitsByZoning,
     rows, totalUnits, affUnits, marketUnits, affordableUnits: affUnits, resiNetSF, affSF, mktSF, resiGSF, retailSF, zfaUsed, computedGSF, GSF,
@@ -642,7 +661,8 @@ function runCalc(m) {
     cap, exitValue, equityCreated, yieldOnCost, yieldOnNet,
     permLoan, dsAmort, dsIO, cfAmort, cfIO, dscr, dscrIO, equityIn, cashPct, coc, debtYield, maxLoan125,
     sellGross, sellCosts, sellNet, retailNOI, retailValue, condoProfit, condoMargin, condoMarginRev,
-    profit, margin,
+    profit, margin, leaseUpMo, exitYears, saleNet, profitSold, marginSold, devEquity, toEquity, devMultiple, devIRR, devSpreadBps,
+    deepSF, uapDeepReq, uapDeepSF, uapDeepMet,
     avgRentUnit: totalUnits > 0 ? resiM / totalUnits : 0,
     avgMktRent: marketUnits > 0 ? mktResiM / marketUnits : 0,
     avgAffRent: affUnits > 0 ? affResiM / affUnits : 0,
@@ -678,6 +698,7 @@ const kMoney = (n) => {
   return s + "$" + Math.round(a);
 };
 const x2 = (n) => (isFinite(n) && n > 0 ? n.toFixed(2) + "x" : "—");
+const irPct = (n) => (isFinite(n) ? n.toFixed(1) + "%" : "—");
 
 /* ============================================================ */
 function Underwriting({ initialModel, onExit, notify, userId, userName }) {
@@ -725,18 +746,44 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
     if (m.id === id) setM(blankModel());
   };
 
+  // the envelope (total BSF) changed → refit the unit mix and refill the affordable tier, so units / NOI follow
+  const fitAt = useRef(null);
+  if (fitAt.current === null) fitAt.current = c.totalBSF;
+  const refitEnvelope = (p) => {   // called from event handlers with the current model (not inside a state updater)
+    const env = runCalc(p).totalBSF;
+    if (Math.abs(env - N(fitAt.current)) < 1) return p;
+    fitAt.current = env;
+    if (env <= 0) return p;
+    const fitted = fitMix(p, env);
+    notify?.(`Units refit to ${fmt(env)} BSF — edit the mix if you want something else`);
+    return fitted.affMode !== "none" ? autoAffordable(fitted) : fitted;
+  };
   const applyDistrict = (district, street, devPath) => {
     const v = district ? farFor(district, street) : null;
-    setM((p) => ({
-      ...p, district, street, devPath,
-      uapSF: devPath === "uap" ? p.uapSF : null,
-      far: v ? v.aor : p.far,
-      bonusFar: v ? (devPath === "uap" ? v.uap : 0) : p.bonusFar,
-    }));
+    const p = m;
+    {
+      const next = {
+        ...p, district, street, devPath,
+        uapSF: devPath === "uap" ? p.uapSF : null,
+        far: v ? v.aor : p.far,
+        bonusFar: v ? (devPath === "uap" ? v.uap : 0) : p.bonusFar,
+      };
+      // leaving the UAP path: a UAP set-aside with no bonus area means nothing, so fall back to free market
+      const leaveUap = devPath !== "uap" && p.program === "uap";
+      if (leaveUap) { next.program = "market"; next.affMode = "none"; next.affReqPct = 0; }
+      const out = refitEnvelope(next);
+      setM(leaveUap ? autoAffordable(out) : out);   // autoAffordable with no requirement clears tier 1
+      if (leaveUap) notify?.("Left the UAP path — program set to Market (pick 485-x / MIH if it applies)");
+    }
   };
+  const envNum = (k, step = "any") => (
+    <input type="number" inputMode="decimal" step={step} value={m[k] ?? ""} onChange={(e) => set(k, e.target.value)}
+      onBlur={() => setM(refitEnvelope(m))} onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }} />
+  );
   const applyProgram = (prog) => {
     const P = PROGRAMS[prog];
-    setM((p) => {
+    const p = m;
+    {
       let pct = P.pct;
       if (prog === "485x") pct = runCalc(p).totalUnits >= 100 ? 25 : 20;
       const tiers = p.tiers.map((t, i) => (i === 0 ? { ...t, ami: P.ami, rents: hpdRents(P.ami) } : t));
@@ -746,12 +793,14 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
         next.devPath = "uap";
         if (v && v.uap) next.bonusFar = v.uap;
       }
-      return next;
-    });
+      const out = refitEnvelope(next);   // envelope changed → refit + refill; otherwise just refill the affordable tier
+      setM(out === next && next.affMode !== "none" ? autoAffordable(next) : out);
+    }
   };
   // UAP SF typed (or reset): refit the unit mix to the new envelope and refill the affordable tier to the requirement
   const refitUap = (p) => {
     const fitted = fitMix(p, runCalc(p).totalBSF);
+    fitAt.current = runCalc(fitted).totalBSF;
     return fitted.affMode === "uap" ? autoAffordable(fitted) : fitted;
   };
   const resetUap = () => setM((p) => refitUap({ ...p, uapSF: null }));
@@ -784,7 +833,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           {onExit && <button className="ghost" onClick={onExit}>← Back to deal</button>}
-          <button className="ghost" onClick={() => setM(blankModel())}>New</button>
+          <button className="ghost" onClick={() => { const bm = blankModel(); fitAt.current = runCalc(bm).totalBSF; setM(bm); }}>New</button>
           <button className="ghost" data-on={!!m.isPublic} onClick={() => set("isPublic", !m.isPublic)}>
             {m.isPublic ? "Published ✓" : "Private"}
           </button>
@@ -797,7 +846,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
         <div className="savedStrip">
           {saved.map((s) => (
             <span key={s.id} className="savedChip">
-              <span onClick={() => setM(upgradeModel(s))}>{s.dealName}{s._owner && s._owner !== userId ? ` · ${s.ownerName || "shared"}` : ""}</span>
+              <span onClick={() => { const um = upgradeModel(s); fitAt.current = runCalc(um).totalBSF; setM(um); }}>{s.dealName}{s._owner && s._owner !== userId ? ` · ${s.ownerName || "shared"}` : ""}</span>
               {(!s._owner || s._owner === userId) && <b onClick={() => del(s.id)}>✕</b>}
             </span>
           ))}
@@ -857,9 +906,9 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
                   <option value="uap">City of Yes — UAP</option>
                 </select>
               </F>
-              <F label="Lot size" hint="SF">{num("lotSF")}</F>
-              <F label="Base FAR" hint="as-of-right">{num("far", "0.01")}</F>
-              <F label="Bonus FAR" hint="UAP etc · 0 = base">{num("bonusFar", "0.01")}</F>
+              <F label="Lot size" hint="SF · units refit">{envNum("lotSF")}</F>
+              <F label="Base FAR" hint="as-of-right">{envNum("far", "0.01")}</F>
+              <F label="Bonus FAR" hint="UAP max FAR · 0 = base">{envNum("bonusFar", "0.01")}</F>
               {c.autoBonusBSF > 0 && (
                 <F label="UAP affordable SF" hint={c.uapEdited ? "your number" : "auto"}>
                   <input type="number" inputMode="decimal" step="any" value={c.uapEdited ? m.uapSF : Math.round(c.autoBonusBSF)}
@@ -877,7 +926,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
               <F label="Overlay / special" hint="optional">
                 <input value={m.overlay} onChange={(e) => set("overlay", e.target.value)} placeholder="C2-4 overlay" />
               </F>
-              <F label="Air rights / neighbor transfer" hint="BSF">{num("airRightsSF")}</F>
+              <F label="Air rights / neighbor transfer" hint="BSF">{envNum("airRightsSF")}</F>
               <F label="Air rights price" hint="$ / BSF">{num("airRightsPSF")}</F>
             </div>
             <div className="derived">
@@ -924,7 +973,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
               <br />Building {fmt(c.GSF)} GSF{N(m.gsfOverride) > 0 ? " (override)" : ""} drives hard cost
             </div>
             <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
-              <button className="mini tall" onClick={() => setM((p) => fitMix(p, runCalc(p).totalBSF))}>Fit units to BSF</button>
+              <button className="mini tall" onClick={() => setM((p) => { fitAt.current = runCalc(p).totalBSF; return fitMix(p, runCalc(p).totalBSF); })}>Fit units to BSF</button>
               {N(m.gsfOverride) > 0 && <button className="mini tall" onClick={() => set("gsfOverride", 0)}>Use calculated GSF</button>}
             </div>
           </Sec>
@@ -1000,6 +1049,8 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
               <div><span>Value given up</span><b>{kMoney(c.lostValue)}</b><em>@ {N(m.exitCapRatePct).toFixed(2)}% cap</em></div>
             </div>
             {c.overAlloc && <div className="warn">More affordable units than total units for a type — fix the unit mix.</div>}
+            {c.uapDeepReq && !c.uapDeepMet && <div className="warn">UAP deep affordability: {fmt(c.affReqSF)} SF affordable is 10,000+ SF, so 20% of it (≈{fmt(c.uapDeepSF)} SF) should be at ≤40% AMI — you have {fmt(c.deepSF)} SF. Add a 40% AMI tier. (Rule as summarized above; verify.)</div>}
+            {c.uapDeepReq && c.uapDeepMet && <div className="subnote">UAP deep affordability: {fmt(c.deepSF)} SF at ≤40% AMI covers the 20% (≈{fmt(c.uapDeepSF)} SF) needed above 10,000 SF.</div>}
           </Sec>
 
           <Sec n="04" t={lease ? "Acquisition — Ground Lease" : "Acquisition — Land Purchase"} open>
@@ -1057,6 +1108,8 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
                 <F label="Retail expenses" hint="% of retail income">{num("retailExpPct", "0.5")}</F>
                 <F label="RE tax (485-x / abated)" hint="$ / yr">{num("propertyTaxAnnual")}</F>
                 <F label="Exit cap rate" hint="%">{num("exitCapRatePct", "0.05")}</F>
+                <F label="Lease-up after completion" hint="months · default 6">{num("leaseUpMonths")}</F>
+                <F label="Building sale costs" hint="% · default 3 · returns only">{num("saleCostPct", "0.25")}</F>
               </div>
               <div className="derived">
                 Market resi {money(c.mktResiM)}/mo · affordable {money(c.affResiM)}/mo · avg {money(c.avgRentUnit)}/unit · {psf(c.rentPSF)}/net SF/yr
@@ -1073,6 +1126,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
                 <F label="Retail vacancy" hint="%">{num("commVacancyPct", "0.5")}</F>
                 <F label="Retail expenses" hint="% of retail income">{num("retailExpPct", "0.5")}</F>
                 <F label="Retail cap rate" hint="values retained retail">{num("commCapRate", "0.05")}</F>
+                <F label="Sellout period" hint="months after completion · default 6">{num("leaseUpMonths")}</F>
               </div>
               <div className="derived">
                 Sellout {money(c.sellGross)} − costs {money(c.sellCosts)} = {money(c.sellNet)}{c.retailValue > 0 ? ` + retail ${money(c.retailValue)}` : ""}
@@ -1170,7 +1224,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
               </>
             )}
             <div className={"profit" + (c.profit < 0 ? " neg" : "")}>
-              <div className="pl">{rental ? "Equity created" : "Projected profit"}</div>
+              <div className="pl">{rental ? "Equity created (value − cost)" : "Projected profit"}</div>
               <div className="pv">{sMoney(c.profit)}</div>
             </div>
             <div className="mcards">
@@ -1192,6 +1246,12 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
               <MC l="Affordable" v={m.affMode === "none" ? "None" : c.affMet ? "Met ✓" : "Short"} good={m.affMode === "none" ? undefined : c.affMet} />
               <MC l="Units" v={`${c.marketUnits}+${c.affUnits}`} />
             </div>
+            <div className="divLabel">Returns <i>build → {rental ? "lease up" : "sell out"} → sell</i></div>
+            <Row l={rental ? "Profit if sold (after sale costs)" : "Profit"} v={sMoney(c.profitSold)} s={pct(c.marginSold) + " margin"} />
+            {rental && <Row l="Development yield" v={pct(c.yieldOnCost)} s={`${Math.round(c.devSpreadBps)} bps vs exit cap`} />}
+            <Row l="Equity in (cost − constr. loan)" v={money(c.devEquity)} />
+            <Row l="Levered IRR · multiple" v={irPct(c.devIRR)} s={(c.devMultiple ? c.devMultiple.toFixed(2) + "x" : "—") + ` · ${c.exitYears.toFixed(1)} yr`} total />
+            <div className="subnote" style={{ opacity: 0.6 }}>Simple: all equity in on day 1, construction loan repaid from the sale at {N(m.constructionMonths)} + {c.leaseUpMo} months. Lease-up carry and NOI not counted.</div>
           </div>
         </div>
       </div>
@@ -1515,6 +1575,7 @@ body{background:#f2efe6;margin:0;padding:24px;}
                 {c.retailValue > 0 && <SR l={`Retail value @ ${N(m.commCapRate)}% cap`} v={money(c.retailValue)} />}
                 <SR l="Net revenue" v={money(c.sellNet + c.retailValue)} />
                 <SR l="Profit / margin on cost" v={`${sMoney(c.condoProfit)} · ${pct(c.condoMargin)}`} />
+                <SR l={`Levered IRR · multiple (${c.exitYears.toFixed(1)} yr)`} v={`${irPct(c.devIRR)} · ${c.devMultiple ? c.devMultiple.toFixed(2) + "x" : "—"}`} />
               </div>
             </div>
           )}
@@ -1528,7 +1589,10 @@ body{background:#f2efe6;margin:0;padding:24px;}
                 <SR l={`Value @ ${N(m.exitCapRatePct).toFixed(2)}% cap`} v={money(c.exitValue)} />
                 <SR l="Value / BSF · / unit" v={`${psf(c.per(c.exitValue).bsf)} · ${c.totalUnits ? kMoney(c.per(c.exitValue).unit) : "—"}`} />
                 <SR l={c.credits > 0 ? "Net project cost" : "Total project cost"} v={money(c.netCost)} />
-                <SR l="Equity created" v={sMoney(c.equityCreated)} />
+                <SR l="Equity created (value − cost)" v={sMoney(c.equityCreated)} />
+                <SR l={`Profit if sold (after ${N(m.saleCostPct)}% sale costs)`} v={`${sMoney(c.profitSold)} · ${pct(c.marginSold)}`} />
+                <SR l="Development spread vs exit cap" v={`${Math.round(c.devSpreadBps)} bps`} />
+                <SR l={`Levered IRR · multiple (sell at ${c.exitYears.toFixed(1)} yr)`} v={`${irPct(c.devIRR)} · ${c.devMultiple ? c.devMultiple.toFixed(2) + "x" : "—"}`} />
                 <SR l="Loan" v={`${money(c.permLoan)} (${pct(100 - c.cashPct)} of cost) @ ${N(m.permRatePct)}%, ${N(m.permAmortYrs)} yr`} />
                 <SR l="CASH REQUIRED" v={`${money(c.equityIn)} · ${pct(c.cashPct)} of cost${c.totalUnits ? " · " + kMoney(c.equityIn / c.totalUnits) + "/unit" : ""}`} />
                 <SR l="Debt service (amort. / IO)" v={`${money(c.dsAmort)} / ${money(c.dsIO)}`} />
