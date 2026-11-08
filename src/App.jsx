@@ -1049,7 +1049,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
               <div><span>Value given up</span><b>{kMoney(c.lostValue)}</b><em>@ {N(m.exitCapRatePct).toFixed(2)}% cap</em></div>
             </div>
             {c.overAlloc && <div className="warn">More affordable units than total units for a type — fix the unit mix.</div>}
-            {c.uapDeepReq && !c.uapDeepMet && <div className="warn">UAP deep affordability: {fmt(c.affReqSF)} SF affordable is 10,000+ SF, so 20% of it (≈{fmt(c.uapDeepSF)} SF) should be at ≤40% AMI — you have {fmt(c.deepSF)} SF. Add a 40% AMI tier. (Rule as summarized above; verify.)</div>}
+            {c.uapDeepReq && !c.uapDeepMet && <div className="warn">UAP deep affordability: {fmt(c.bonusBSF)} SF of UAP floor area is 10,000+ SF, so 20% of the affordable (≈{fmt(c.uapDeepSF)} net SF) should be at ≤40% AMI — you have {fmt(c.deepSF)} SF. Add a 40% AMI tier. (Rule as summarized above; verify.)</div>}
             {c.uapDeepReq && c.uapDeepMet && <div className="subnote">UAP deep affordability: {fmt(c.deepSF)} SF at ≤40% AMI covers the 20% (≈{fmt(c.uapDeepSF)} SF) needed above 10,000 SF.</div>}
           </Sec>
 

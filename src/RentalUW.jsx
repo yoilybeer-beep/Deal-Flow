@@ -432,12 +432,12 @@ body{background:#f2efe6;margin:0;padding:24px;}
             <div className="shH">Rent Roll Summary</div>
             <div className="shWrap">
               <table className="shTable">
-                <thead><tr><th>Type</th><th>Units</th><th>In-place / mo</th><th>Pro forma / mo</th><th>Avg pro forma</th></tr></thead>
+                <thead><tr><th>Type</th><th>Units</th><th>In-place / mo</th><th>Pro forma / mo</th></tr></thead>
                 <tbody>
                   {UNIT_STATUS.map(([k, l]) => S[k].n > 0 && (
-                    <tr key={k}><td>{l}</td><td>{S[k].n}</td><td>{money(S[k].cur)}</td><td>{money(S[k].pf)}</td><td>{money(S[k].pf / S[k].n)}</td></tr>
+                    <tr key={k}><td>{l}</td><td>{S[k].n}</td><td>{money(S[k].cur)}</td><td>{money(S[k].pf)}</td></tr>
                   ))}
-                  <tr className="tot"><td>Total</td><td>{c.nU}{c.vacantN ? ` (${c.vacantN} vacant)` : ""}</td><td>{money(c.inPlaceM)}</td><td>{money(c.proFormaM)}</td><td>{c.nU ? money(c.proFormaM / c.nU) : "—"}</td></tr>
+                  <tr className="tot"><td>Total</td><td>{c.nU}{c.vacantN ? ` (${c.vacantN} vacant)` : ""}</td><td>{money(c.inPlaceM)}</td><td>{money(c.proFormaM)}</td></tr>
                 </tbody>
               </table>
             </div>
