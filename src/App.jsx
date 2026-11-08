@@ -876,9 +876,8 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
     if (Math.abs(env - N(fitAt.current)) < 1) return p;
     fitAt.current = env;
     if (env <= 0) return p;
-    const fitted = fitMix(p, env);
     notify?.(`Units refit to ${fmt(env)} BSF — edit the mix if you want something else`);
-    return fitted.affMode !== "none" ? autoAffordable(fitted) : fitted;
+    return fitAll(p, env);
   };
   const applyDistrict = (district, street, devPath) => {
     const v = district ? farFor(district, street) : null;
@@ -886,7 +885,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
     {
       const next = {
         ...p, district, street, devPath,
-        uapSF: devPath === "uap" ? p.uapSF : null,
+        uapSF: devPath === "uap" ? p.uapSF : null, uapUnits: devPath === "uap" ? p.uapUnits : null,
         far: v ? v.aor : p.far,
         bonusFar: v ? (devPath === "uap" ? v.uap : 0) : p.bonusFar,
       };
@@ -921,11 +920,97 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
   };
   // UAP SF typed (or reset): refit the unit mix to the new envelope and refill the affordable tier to the requirement
   const refitUap = (p) => {
-    const fitted = fitMix(p, runCalc(p).totalBSF);
+    const fitted = fitAll(p);
     fitAt.current = runCalc(fitted).totalBSF;
-    return fitted.affMode === "uap" ? autoAffordable(fitted) : fitted;
+    return fitted;
   };
   const resetUap = () => setM((p) => refitUap({ ...p, uapSF: null }));
+
+  // ---- round 2: one fit for every override (UAP SF, affordable units, unit sizes) ----
+  const refit = (p) => { const out = fitAll(p); fitAt.current = runCalc(out).totalBSF; return out; };
+  const setUapUnits = (v) => set("uapUnits", v === "" ? null : v);
+  const resetUapUnits = () => setM((p) => refit({ ...p, uapUnits: null }));
+  const resetAffSize = () => setM((p) => refit({ ...p, affUnitSF: null }));
+  const [draft, setDraft] = useState({});              // typed-but-not-applied values for fields that rescale the mix
+  const applyMktSize = () => {
+    const v = N(draft.mktSF); setDraft((d) => ({ ...d, mktSF: undefined }));
+    if (!(v > 0) || !(c.mktAvgSF > 0)) return;
+    const f = v / c.mktAvgSF;
+    setM((p) => refit({ ...p, mix: typeMap((t) => ({ ...p.mix[t], sf: Math.max(150, Math.round(N(p.mix[t].sf) * f)) })) }));
+  };
+  const mixIsDefaultSize = UNIT_TYPES.every(([t]) => N(m.mix[t].sf) === UNIT_SF[t]);
+  const resetMktSize = () => setM((p) => refit({ ...p, mix: typeMap((t) => ({ ...p.mix[t], sf: UNIT_SF[t] })) }));
+  const applyMktRent = () => {
+    const v = N(draft.rent); setDraft((d) => ({ ...d, rent: undefined }));
+    const cur = c.marketUnits > 0 ? c.avgMktRent : 0;
+    if (!(v > 0) || !(cur > 0)) return;
+    const f = v / cur;
+    setM((p) => ({ ...p, mix: typeMap((t) => ({ ...p.mix[t], rent: Math.round(N(p.mix[t].rent) * f) })) }));
+  };
+  const blurOnEnter = (e) => { if (e.key === "Enter") e.currentTarget.blur(); };
+  // path for the 2-minute view: as-of-right / UAP / MIH (MIH uses the bonus FAR from the same table, 25% of resi floor area)
+  const curPath = m.devPath === "uap" ? (m.program === "mih" ? "mih" : "uap") : "aor";
+  const applyPath = (path) => {
+    const v = m.district ? farFor(m.district, m.street) : null;
+    const prog = path === "aor" ? (["uap", "mih"].includes(m.program) ? "market" : m.program) : path;
+    const P2 = PROGRAMS[prog] || PROGRAMS.market;
+    let pct = P2.pct;
+    if (prog === "485x") pct = c.totalUnits >= 100 ? 25 : 20;
+    const tiers = m.tiers.map((t, i) => (i === 0 && prog !== m.program ? { ...t, ami: P2.ami, rents: hpdRents(P2.ami) } : t));
+    const next = {
+      ...m, devPath: path === "aor" ? "aor" : "uap", program: prog, affMode: P2.mode, affReqPct: pct, tiers,
+      bonusFar: path === "aor" ? 0 : (v && v.uap ? v.uap : m.bonusFar),
+      uapSF: path === "uap" ? m.uapSF : null, uapUnits: path === "uap" ? m.uapUnits : null,
+    };
+    setM(refit(next));
+  };
+  const [full, setFull] = useState(() => { try { return localStorage.getItem("uwFull") === "1"; } catch (e) { return false; } });
+  const toggleFull = () => setFull((f) => { try { localStorage.setItem("uwFull", f ? "0" : "1"); } catch (e) {} return !f; });
+
+  // UAP controls (shared by the 2-minute view and Site & Zoning): floor area, units given away, each with auto + reset
+  const uapControls = () => c.autoBonusBSF > 0 && (
+    <>
+      <F label={m.affMode === "uap" ? "UAP affordable SF" : "Bonus SF used"} hint={c.uapEdited ? "your number" : "auto"}>
+        <input type="number" inputMode="decimal" step="any" value={c.uapEdited ? m.uapSF : Math.round(c.autoBonusBSF)}
+          onChange={(e) => set("uapSF", e.target.value)} onBlur={() => setM((p) => refitUap(p))} onKeyDown={blurOnEnter} />
+        <div className="uapNote">
+          {c.uapEdited
+            ? <>Auto {fmt(c.autoBonusBSF)} · edited <button className="linkBtn inline" onClick={resetUap}>reset to auto</button>
+                {c.bonusBSF > c.autoBonusBSF + 0.5 && <b style={{ color: RED }}> · above UAP max (warning)</b>}</>
+            : <>Auto: ({c.effFAR.toFixed(2)} − {c.baseFAR.toFixed(2)} FAR) × lot = {fmt(c.autoBonusBSF)}</>}
+        </div>
+      </F>
+      {m.affMode === "uap" && (
+        <F label="Affordable units given" hint={c.uapUnitsEdited ? "your number" : "auto"}>
+          <input type="number" inputMode="numeric" step="1" value={c.uapUnitsEdited ? m.uapUnits : c.affUnits}
+            onChange={(e) => setUapUnits(e.target.value)} onBlur={() => setM((p) => refit(p))} onKeyDown={blurOnEnter} />
+          <div className="uapNote">
+            {c.uapUnitsEdited
+              ? <>Auto {c.uapUnitsAuto} · edited <button className="linkBtn inline" onClick={resetUapUnits}>reset to auto</button>
+                  {c.affSF < c.affReqSF - 0.5 && <b style={{ color: RED }}> · {fmt(c.affReqSF - c.affSF)} SF under the UAP area (warning)</b>}</>
+              : <>Auto: {fmt(c.affReqSF)} net SF ÷ {fmt(c.affUnitSFRef)} SF/unit ≈ {c.uapUnitsAuto}</>}
+          </div>
+        </F>
+      )}
+    </>
+  );
+  // unit sizes: market average (rescales the mix) and affordable average (its own number, or same as the mix)
+  const sizeControls = () => (
+    <>
+      <F label="Avg SF / market unit" hint={mixIsDefaultSize ? "def. J Stone mix" : "your mix"}>
+        <input type="number" inputMode="decimal" step="any" value={draft.mktSF ?? Math.round(c.mktAvgSF)}
+          onChange={(e) => setDraft((d) => ({ ...d, mktSF: e.target.value }))} onBlur={applyMktSize} onKeyDown={blurOnEnter} />
+        <div className="uapNote">{mixIsDefaultSize ? <>Net SF · drives the unit count</> : <>Edited · <button className="linkBtn inline" onClick={resetMktSize}>reset to default sizes</button></>}</div>
+      </F>
+      {m.affMode !== "none" && (
+        <F label="Avg SF / affordable unit" hint={c.affSizeEdited ? "your number" : "auto"}>
+          <input type="number" inputMode="decimal" step="any" value={c.affSizeEdited ? m.affUnitSF : Math.round(c.affAvgSF)}
+            onChange={(e) => set("affUnitSF", e.target.value === "" ? null : e.target.value)} onBlur={() => setM((p) => refit(p))} onKeyDown={blurOnEnter} />
+          <div className="uapNote">{c.affSizeEdited ? <>Auto = same as mix · <button className="linkBtn inline" onClick={resetAffSize}>reset to auto</button></> : <>Auto: same sizes as the mix</>}</div>
+        </F>
+      )}
+    </>
+  );
   const applyBorough = (b) => {
     const bc = costsFor(b);
     setM((p) => ({ ...p, borough: b, hardCostPerBSF: bc.hard, softCostPct: bc.soft }));
@@ -937,6 +1022,13 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
   const P = PROGRAMS[m.program] || PROGRAMS.market;
   const bc = costsFor(m.borough);
   const tierAmiOK = (m.tiers || []).every((t) => N(t.ami) <= 100);
+  const go = goNoGo(c);
+  const warns = [
+    c.uapEdited && c.bonusBSF > c.autoBonusBSF + 0.5 && `UAP SF ${fmt(c.bonusBSF)} is above the UAP max ${fmt(c.autoBonusBSF)}`,
+    m.affMode !== "none" && !c.affMet && (m.affMode === "units" ? `Affordable ${-c.affSurplusUnits} units short of the requirement` : `Affordable ${fmt(-c.affSurplusSF)} SF under the requirement`),
+    !c.uapDeepMet && `UAP: ${fmt(c.uapDeepSF)} SF should be at ≤40% AMI (have ${fmt(c.deepSF)})`,
+    c.bsfLeft < -1 && `${fmt(-c.bsfLeft)} SF over zoning`,
+  ].filter(Boolean);
 
   return (
     <div className="uw">
@@ -975,6 +1067,74 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
         </div>
       )}
 
+      <div className="quick">
+        <div className="qHead">
+          <div>
+            <div className="eyebrow">2-minute underwrite</div>
+            <div className="subnote" style={{ marginTop: 2 }}>Key inputs here · everything else uses labeled defaults (def.)</div>
+          </div>
+          <span className={"goChip " + go.k}>{go.t}</span>
+        </div>
+        <div className="fg2 q2">
+          <F label="Lot size" hint="SF">{envNum("lotSF")}</F>
+          <F label="Zoning" hint="sets FAR">
+            <select value={m.district} onChange={(e) => applyDistrict(e.target.value, m.street, m.devPath)}>
+              <option value="">Custom FAR</option>
+              {Object.keys(farDB).map((d) => <option key={d}>{d}</option>)}
+            </select>
+          </F>
+          <div className="uwField qWide">
+            <label>Path<em>{curPath === "mih" ? "bonus FAR · 25% of resi SF at avg 60% AMI · verify" : curPath === "uap" ? "bonus FAR = affordable" : "base FAR"}</em></label>
+            <div className="seg">
+              {[["aor", "As-of-right"], ["uap", "UAP"], ["mih", "MIH"]].map(([k, l]) => (
+                <button key={k} data-on={curPath === k} onClick={() => applyPath(k)}>{l}</button>
+              ))}
+            </div>
+          </div>
+          <F label={lease ? "Key money" : "Price"} hint="$">{num(lease ? "keyMoney" : "purchasePrice")}</F>
+          <F label="Hard cost" hint={m.borough ? `$/GSF · def. ${m.borough} $${bc.hard}` : `$/GSF · def. $${bc.hard}`}>{num("hardCostPerBSF")}</F>
+          <div className="uwField qWide">
+            <label>Exit<em>{rental ? "value = NOI ÷ cap" : "sell units as condos"}</em></label>
+            <div className="seg">
+              <button data-on={rental} onClick={() => set("dealType", "rental")}>Rental hold</button>
+              <button data-on={!rental} onClick={() => set("dealType", "condo")}>Condo sellout</button>
+            </div>
+          </div>
+          {rental
+            ? <F label="Exit cap" hint="% · def. 5.5">{num("exitCapRatePct", "0.05")}</F>
+            : <F label="Condo price" hint="$ / sellable SF · def. 1,100">{num("marketSellPSF")}</F>}
+          {rental
+            ? <F label="Market rent" hint="avg $/unit/mo">
+                <input type="number" inputMode="decimal" step="any" value={draft.rent ?? Math.round(c.avgMktRent)}
+                  onChange={(e) => setDraft((d) => ({ ...d, rent: e.target.value }))} onBlur={applyMktRent} onKeyDown={blurOnEnter} />
+              </F>
+            : <F label="Absorption" hint={`units / mo · 0 = ${N(m.leaseUpMonths)} mo`}>{num("condoPacePerMo", "1")}</F>}
+        </div>
+        <div className="fg2 q2 qUnits">{uapControls()}{sizeControls()}</div>
+        <div className="qCards">
+          <QC l="Buildable" v={fmt(c.totalBSF)} s="BSF" />
+          <QC l="Units" v={`${c.totalUnits}`} s={`${c.marketUnits} mkt + ${c.affUnits} aff`} />
+          <QC l="Total cost" v={kMoney(c.netCost)} s={psf(c.per(c.netCost).bsf) + "/BSF"} />
+          {rental
+            ? <QC l="Value" v={kMoney(c.exitValue)} s={`@ ${N(m.exitCapRatePct).toFixed(2)}% cap`} />
+            : <QC l="Net sellout" v={kMoney(c.saleNet)} s={`${c.condoSellMo} mo sellout`} />}
+          <QC l={rental ? "Profit if sold" : "Profit"} v={kMoney(c.profitSold)} bad={c.profitSold < 0} />
+          {rental
+            ? <QC l="Yield on cost" v={pct(c.yieldOnCost)} s={`${Math.round(c.devSpreadBps)} bps over cap`} />
+            : <QC l="Margin" v={pct(c.condoMargin)} s="on cost" />}
+          {rental ? <QC l="Margin" v={pct(c.marginSold)} s="on cost, after sale" /> : <QC l="Multiple" v={c.devMultiple ? c.devMultiple.toFixed(2) + "x" : "—"} s="equity" />}
+          <QC l="Levered IRR" v={irPct(c.devIRR)} s={`${c.exitYears.toFixed(1)} yr`} />
+        </div>
+        {warns.length > 0 && <div className="qWarn">{warns.map((w, i) => <div key={i}>⚠ {w}</div>)}</div>}
+        <div className="subnote qDefs">
+          Defaults in use: soft {N(m.softCostPct)}% of hard · {N(m.constructionMonths)}-mo build · constr. loan {N(m.ltcPct)}% LTC @ {N(m.interestRatePct)}% · closing {N(m.closingCostPct)}% · gross-up {N(m.addonPct)}%
+          {rental ? <> · vacancy {N(m.vacancyPct)}% · opex ${fmt(N(m.opexPerUnit))}/unit · lease-up {N(m.leaseUpMonths)} mo</> : <> · broker {N(m.sellingCostPct)}% · transfer {N(m.condoTransferPct)}% (verify) · deposits {N(m.condoDepositPct)}%</>}
+          {m.affMode !== "none" && <> · affordable at {Math.round(N(m.tiers?.[0]?.ami))}% AMI</>}. Go/no-go (def.): {rental ? "yield ≥ 150 bps over exit cap = go, 75–150 = tight" : "margin ≥ 20% on cost = go, 12–20% = tight"}.
+        </div>
+        <button className="fullToggle" onClick={toggleFull}>{full ? "Hide full detail ▴" : "Show full detail ▾"}</button>
+      </div>
+
+      {full && (<>
       <div className="segRow">
         <div>
           <div className="segLabel">Structure</div>
@@ -1031,20 +1191,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
               <F label="Lot size" hint="SF · units refit">{envNum("lotSF")}</F>
               <F label="Base FAR" hint="as-of-right">{envNum("far", "0.01")}</F>
               <F label="Bonus FAR" hint="UAP max FAR · 0 = base">{envNum("bonusFar", "0.01")}</F>
-              {c.autoBonusBSF > 0 && (
-                <F label="UAP affordable SF" hint={c.uapEdited ? "your number" : "auto"}>
-                  <input type="number" inputMode="decimal" step="any" value={c.uapEdited ? m.uapSF : Math.round(c.autoBonusBSF)}
-                    onChange={(e) => set("uapSF", e.target.value)}
-                    onBlur={() => setM((p) => refitUap(p))}
-                    onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }} />
-                  <div className="uapNote">
-                    {c.uapEdited
-                      ? <>Auto {fmt(c.autoBonusBSF)} · edited <button className="linkBtn inline" onClick={resetUap}>reset to auto</button>
-                          {c.bonusBSF > c.autoBonusBSF + 0.5 && <b style={{ color: RED }}> · above UAP max</b>}</>
-                      : <>UAP affordable SF (auto): {fmt(c.autoBonusBSF)}</>}
-                  </div>
-                </F>
-              )}
+              {uapControls()}
               <F label="Overlay / special" hint="optional">
                 <input value={m.overlay} onChange={(e) => set("overlay", e.target.value)} placeholder="C2-4 overlay" />
               </F>
@@ -1081,6 +1228,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
               </table>
             </div>
             <div className="fg2">
+              {sizeControls()}
               <F label="Gross-up for walls / common" hint="% on net">{num("addonPct")}</F>
               <F label="Retail / commercial" hint="SF (zoning floor area)">{num("retailSF")}</F>
               <F label="Cellar / other gross" hint="SF · cost only">{num("otherGSF")}</F>
@@ -1095,7 +1243,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
               <br />Building {fmt(c.GSF)} GSF{N(m.gsfOverride) > 0 ? " (override)" : ""} drives hard cost
             </div>
             <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
-              <button className="mini tall" onClick={() => setM((p) => { fitAt.current = runCalc(p).totalBSF; return fitMix(p, runCalc(p).totalBSF); })}>Fit units to BSF</button>
+              <button className="mini tall" onClick={() => setM((p) => refit(p))}>Fit units to BSF</button>
               {N(m.gsfOverride) > 0 && <button className="mini tall" onClick={() => set("gsfOverride", 0)}>Use calculated GSF</button>}
             </div>
           </Sec>
@@ -1241,17 +1389,31 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
           ) : (
             <Sec n="06" t="Sellout & Retail" open>
               <div className="fg2">
-                <F label="Market sellout" hint="$ / net SF">{num("marketSellPSF")}</F>
-                <F label="Affordable sellout" hint="$ / net SF">{num("affordableSellPSF")}</F>
-                <F label="Selling costs" hint="% commission + legal">{num("sellingCostPct", "0.5")}</F>
+                <F label="Market sellout" hint="$ / sellable SF">{num("marketSellPSF")}</F>
+                <F label="Sellable SF" hint="% of resi net · def. 100">{num("sellEffPct", "1")}</F>
+                <F label="Affordable units">
+                  <select value={m.condoAffMode || "sell"} onChange={(e) => set("condoAffMode", e.target.value)}>
+                    <option value="sell">Sold (affordable $/SF)</option>
+                    <option value="rent">Kept as rentals</option>
+                  </select>
+                </F>
+                {m.condoAffMode === "rent"
+                  ? <F label="Affordable value" hint={`NOI @ ${N(m.exitCapRatePct)}% exit cap`}><input readOnly value={money(c.affKeptValue)} /></F>
+                  : <F label="Affordable sellout" hint="$ / sellable SF">{num("affordableSellPSF")}</F>}
+                <F label="Broker + marketing" hint="% of gross · def. 6">{num("sellingCostPct", "0.5")}</F>
+                <F label="Transfer tax + closing" hint="% · def. 2, verify">{num("condoTransferPct", "0.05")}</F>
+                <F label="Absorption" hint="units / mo · 0 = months">{num("condoPacePerMo", "1")}</F>
+                <F label="Sellout period" hint={N(m.condoPacePerMo) > 0 ? `= ${c.condoSellMo} mo from pace` : "months after completion · def. 6"}>{num("leaseUpMonths")}</F>
+                <F label="Deposits to loan" hint="% of gross at completion · def. 10">{num("condoDepositPct", "1")}</F>
+                <F label="Retail cap rate" hint="values retained retail">{num("commCapRate", "0.05")}</F>
                 <F label="Retail rent" hint="$ / SF / yr">{num("retailPSF")}</F>
                 <F label="Retail vacancy" hint="%">{num("commVacancyPct", "0.5")}</F>
                 <F label="Retail expenses" hint="% of retail income">{num("retailExpPct", "0.5")}</F>
-                <F label="Retail cap rate" hint="values retained retail">{num("commCapRate", "0.05")}</F>
-                <F label="Sellout period" hint="months after completion · default 6">{num("leaseUpMonths")}</F>
               </div>
               <div className="derived">
-                Sellout {money(c.sellGross)} − costs {money(c.sellCosts)} = {money(c.sellNet)}{c.retailValue > 0 ? ` + retail ${money(c.retailValue)}` : ""}
+                {fmt(c.sellMktSF + c.sellAffSF)} sellable SF · gross {money(c.sellGross)} − broker {money(c.sellBroker)} − transfer/closing {money(c.sellTransfer)} = <b>{money(c.sellNet)} net</b>
+                {c.affKeptValue > 0 && <> + affordable rentals {money(c.affKeptValue)}</>}{c.retailValue > 0 && <> + retail {money(c.retailValue)}</>}
+                <br />{c.condoUnitsSold} units over {c.condoSellMo} mo{N(m.condoPacePerMo) > 0 ? ` at ${N(m.condoPacePerMo)}/mo` : ""} · profit <b>{sMoney(c.condoProfit)}</b> · {pct(c.condoMargin)} on cost · IRR {irPct(c.devIRR)} · {c.devMultiple ? c.devMultiple.toFixed(2) + "x" : "—"}
               </div>
             </Sec>
           )}
@@ -1286,6 +1448,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
                 <F label="Market sellout" hint="$ / net SF">{num("marketSellPSF")}</F>
                 <F label="Affordable sellout" hint="$ / net SF">{num("affordableSellPSF")}</F>
                 <F label="Selling costs" hint="%">{num("sellingCostPct", "0.5")}</F>
+                <F label="Transfer tax + closing" hint="% · def. 2, verify">{num("condoTransferPct", "0.05")}</F>
                 <F label="Retail cap rate" hint="%">{num("commCapRate", "0.05")}</F>
               </div>
               <div className="derived">
@@ -1341,8 +1504,13 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
               </>
             ) : (
               <>
-                <Row l="Gross sellout" v={money(c.sellGross)} />
-                <Row l="Net sellout + retail" v={money(c.sellNet + c.retailValue)} total />
+                <div className="divLabel">Sellout <i>{fmt(c.sellMktSF + c.sellAffSF)} sellable SF</i></div>
+                <Row l="Gross sellout" v={money(c.sellGross)} s={psf(N(m.marketSellPSF)) + "/SF mkt"} />
+                <Row l={`Broker + marketing (${N(m.sellingCostPct)}%)`} v={"-" + money(c.sellBroker)} />
+                {c.sellTransfer > 0 && <Row l={`Transfer tax + closing (${N(m.condoTransferPct)}%)`} v={"-" + money(c.sellTransfer)} />}
+                {c.affKeptValue > 0 && <Row l="Affordable kept as rentals" v={money(c.affKeptValue)} />}
+                {c.retailValue > 0 && <Row l="Retail value" v={money(c.retailValue)} />}
+                <Row l="Net sellout" v={money(c.sellNet + c.retailValue + c.affKeptValue)} total />
               </>
             )}
             <div className={"profit" + (c.profit < 0 ? " neg" : "")}>
@@ -1373,10 +1541,14 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
             {rental && <Row l="Development yield" v={pct(c.yieldOnCost)} s={`${Math.round(c.devSpreadBps)} bps vs exit cap`} />}
             <Row l="Equity in (cost − constr. loan)" v={money(c.devEquity)} />
             <Row l="Levered IRR · multiple" v={irPct(c.devIRR)} s={(c.devMultiple ? c.devMultiple.toFixed(2) + "x" : "—") + ` · ${c.exitYears.toFixed(1)} yr`} total />
-            <div className="subnote" style={{ opacity: 0.6 }}>Simple: all equity in on day 1, construction loan repaid from the sale at {N(m.constructionMonths)} + {c.leaseUpMo} months. Lease-up carry and NOI not counted.</div>
+            <div className="subnote" style={{ opacity: 0.6 }}>{rental
+              ? <>Simple: all equity in on day 1, construction loan repaid from the sale at {N(m.constructionMonths)} + {c.leaseUpMo} months. Lease-up carry and NOI not counted.</>
+              : <>Monthly: equity in on day 1; deposits ({N(m.condoDepositPct)}%) at completion and closings over {c.condoSellMo} mo repay the construction loan first, then go to equity. Sellout carry not counted.</>}</div>
           </div>
         </div>
       </div>
+
+      </>)}
 
       <div className="foot">Editable defaults, not advice — verify 485-x / UAP / MIH rules, HPD rents and costs before circulating.</div>
       {sheet && <ClientSheet m={m} c={c} sens={sens} onClose={() => setSheet(false)} />}
@@ -1520,6 +1692,20 @@ function F({ label, hint, children }) {
 function Row({ l, v, s, total }) {
   return <div className={"ledger" + (total ? " total" : "")}><span>{l}</span><b>{v}{s && <small>{s}</small>}</b></div>;
 }
+/* 2-minute view: answer card and go / no-go (thresholds are defaults, shown on screen) */
+function QC({ l, v, s, bad }) {
+  return <div className="qc"><div className="ml">{l}</div><div className="qv" data-bad={!!bad}>{v}</div>{s && <div className="qs">{s}</div>}</div>;
+}
+const GO_RULES = { rentalGoBps: 150, rentalTightBps: 75, condoGoPct: 20, condoTightPct: 12 };
+function goNoGo(c) {
+  if (!(c.netCost > 0) || !(c.totalBSF > 0)) return { k: "na", t: "Add inputs" };
+  if (c.rental) {
+    if (c.profitSold < 0 || c.devSpreadBps < GO_RULES.rentalTightBps) return { k: "no", t: "No-go" };
+    return c.devSpreadBps >= GO_RULES.rentalGoBps ? { k: "go", t: "Go" } : { k: "tight", t: "Tight" };
+  }
+  if (c.condoMargin < GO_RULES.condoTightPct) return { k: "no", t: "No-go" };
+  return c.condoMargin >= GO_RULES.condoGoPct ? { k: "go", t: "Go" } : { k: "tight", t: "Tight" };
+}
 function MC({ l, v, good }) {
   return (
     <div className="mcard">
@@ -1604,6 +1790,8 @@ body{background:#f2efe6;margin:0;padding:24px;}
               <SR l="Building GSF (cost basis)" v={fmt(c.GSF)} />
               <SR l="BSF used / unused" v={c.bsfLeft >= 0 ? `${fmt(c.zfaUsed)} / ${fmt(c.bsfLeft)}` : `${fmt(-c.bsfLeft)} SF over`} />
               <SR l="Units (market + affordable)" v={`${c.totalUnits} (${c.marketUnits} + ${c.affUnits})`} />
+              {c.uapUnitsEdited && <SR l="UAP affordable units (edited)" v={`${c.affUnits} (auto ${c.uapUnitsAuto})`} />}
+              <SR l="Avg SF / unit (market · affordable)" v={`${fmt(c.mktAvgSF)} · ${c.affUnits ? fmt(c.affAvgSF) : "—"}${c.affSizeEdited ? " (edited)" : ""}`} />
             </div>
           </div>
 
@@ -1691,11 +1879,16 @@ body{background:#f2efe6;margin:0;padding:24px;}
             <div className="shSec">
               <div className="shH">Sellout</div>
               <div className="shGrid">
-                <SR l={`Market (${fmt(c.mktSF)} SF × $${fmt(N(m.marketSellPSF))})`} v={money(c.mktSF * N(m.marketSellPSF))} />
-                <SR l={`Affordable (${fmt(c.affSF)} SF × $${fmt(N(m.affordableSellPSF))})`} v={money(c.affSF * N(m.affordableSellPSF))} />
-                <SR l={`Selling costs (${N(m.sellingCostPct)}%)`} v={"-" + money(c.sellCosts)} />
+                <SR l={`Market (${fmt(c.sellMktSF)} sellable SF × $${fmt(N(m.marketSellPSF))})`} v={money(c.sellMkt)} />
+                {c.affKeep
+                  ? <SR l={`Affordable kept as rentals (NOI @ ${N(m.exitCapRatePct)}% cap)`} v={money(c.affKeptValue)} />
+                  : <SR l={`Affordable (${fmt(c.sellAffSF)} SF × $${fmt(N(m.affordableSellPSF))})`} v={money(c.sellAff)} />}
+                {c.sellEff !== 1 && <SR l="Sellable SF" v={`${Math.round(c.sellEff * 100)}% of resi net`} />}
+                <SR l={`Broker + marketing (${N(m.sellingCostPct)}%)`} v={"-" + money(c.sellBroker)} />
+                {c.sellTransfer > 0 && <SR l={`Transfer tax + closing (${N(m.condoTransferPct)}%, verify)`} v={"-" + money(c.sellTransfer)} />}
                 {c.retailValue > 0 && <SR l={`Retail value @ ${N(m.commCapRate)}% cap`} v={money(c.retailValue)} />}
-                <SR l="Net revenue" v={money(c.sellNet + c.retailValue)} />
+                <SR l="Net revenue" v={money(c.sellNet + c.retailValue + c.affKeptValue)} />
+                <SR l="Absorption" v={`${c.condoUnitsSold} units over ${c.condoSellMo} mo` + (N(m.condoPacePerMo) > 0 ? ` (${N(m.condoPacePerMo)}/mo)` : "")} />
                 <SR l="Profit / margin on cost" v={`${sMoney(c.condoProfit)} · ${pct(c.condoMargin)}`} />
                 <SR l={`Levered IRR · multiple (${c.exitYears.toFixed(1)} yr)`} v={`${irPct(c.devIRR)} · ${c.devMultiple ? c.devMultiple.toFixed(2) + "x" : "—"}`} />
               </div>
@@ -3641,6 +3834,27 @@ table.rr tbody tr:last-child td{border-bottom:none}
 .lookDiff{margin-top:8px;font-size:12.5px;background:#FDF3E3;border:1px solid #F0D9AE;color:#7A5410;border-radius:8px;padding:6px 9px}
 .linkBtn.inline{display:inline;padding:0 0 0 4px;color:${BLUE};font-size:12.5px}
 .uapNote{font-size:11.5px;color:${BLUE};margin-top:4px;line-height:1.4}
+.quick{background:#fff;border:1px solid ${LINE};border-radius:10px;padding:14px 16px 12px;margin-bottom:16px}
+.qHead{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
+.goChip{font-size:12px;font-weight:700;letter-spacing:.04em;padding:5px 12px;border-radius:20px;white-space:nowrap;border:1px solid}
+.goChip.go{background:#EEF3E6;color:#2E7D5B;border-color:#BFD8B8}
+.goChip.tight{background:#FBF3E0;color:#9C7A2E;border-color:#E6D3A3}
+.goChip.no{background:#F8E9E5;color:#B5533F;border-color:#E7C2B8}
+.goChip.na{background:#F6F5F1;color:#8a8576;border-color:${LINE}}
+.q2{grid-template-columns:1fr 1fr !important;gap:10px 12px}
+.q2 .qWide{grid-column:1 / -1}
+.q2 .seg{display:flex;width:100%}
+.q2 .seg button{flex:1;padding:8px 6px}
+.qUnits{border-top:1px dashed ${LINE};padding-top:10px}
+.qCards{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:14px;background:${INK};color:#EDEDE8;border:1px solid #9C7A2E;border-radius:10px;padding:10px}
+.qc{padding:6px 4px;min-width:0}
+.qv{font-family:'Inter',-apple-system,'Segoe UI',sans-serif;font-size:17px;font-weight:700;margin-top:2px;color:#D6B45C;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.qv[data-bad="true"]{color:#C47764}
+.qs{font-size:10.5px;opacity:.6;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.qWarn{margin-top:10px;font-size:12px;color:#B5533F;line-height:1.5}
+.qDefs{opacity:.6;font-size:11px}
+.fullToggle{display:block;width:100%;margin-top:10px;background:none;border:1px solid ${LINE};border-radius:8px;padding:9px;font-size:13px;font-weight:700;color:${BLUE}}
+@media (max-width:760px){.qCards{grid-template-columns:1fr 1fr}.quick{padding:12px 12px 10px}}
 .lookLinks .linkBtn.inline{padding:0}
 .streetPick{margin-top:12px}
 .streetPick .seg button{padding:9px 16px}
