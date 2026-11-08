@@ -53,3 +53,31 @@ export const DEFAULT_COSTS = { hard: 275, soft: 15 };
 
 export const UNIT_SF = { studio: 400, "1br": 575, "2br": 800, "3br": 950 };
 export const MKT_RENTS = { studio: 2600, "1br": 3200, "2br": 4200, "3br": 5200 };
+
+
+/* ---------- RENTAL ACQUISITION defaults (all editable, all labeled "default" in the app) ----------
+   Starting points for an existing NYC walk-up. They are J Stone defaults / typical figures, not
+   market data or legal advice — replace them with the deal's actual numbers. */
+export const RENTAL_DEFAULTS = {
+  closingCostPct: 2.0,      // title, legal, transfer-tax share etc., % of price (default)
+  mrtPct: 2.8,              // NYC mortgage recording tax, % of loan (commercial ≥ $500K; CEMA can reduce) — verify
+  vacancyPct: 3, creditLossPct: 2,
+  rentGrowthPct: 3.0,       // free-market rent growth / yr (default)
+  rgbPct: 2.75,             // rent-stabilized increase / yr — your assumption; the Rent Guidelines Board sets it each year
+  voucherGrowthPct: 2.0,    // voucher payment-standard growth / yr (default)
+  mtmY1Pct: 50,             // share of the free-market gap to market captured in year 1 (all of it from year 2)
+  mgmtPct: 4, reservesPerUnit: 300,
+  expGrowthPct: 3.0, taxGrowthPct: 4.0,
+  taxPctOfPrice: 1.5,       // first-guess RE taxes as % of price — replace with the DOF bill
+  ltvPct: 65, ratePct: 6.5, amortYrs: 30, loanFeePct: 1.0, minDscr: 1.25, minDebtYield: 8,
+  holdYrs: 5, exitCapPct: 6.0, sellCostPct: 4.0,
+};
+/* Typical NYC walk-up operating costs, $ per unit per year (typical, verify against the T-12) */
+export const RENTAL_EXP_PER_UNIT = {
+  taxes: 0, insurance: 1200, water: 1100, fuel: 1300, electric: 300, repairs: 1200, payroll: 900, legal: 350, other: 0,
+};
+export const RENTAL_EXP_LABELS = [
+  ["taxes", "Real estate taxes"], ["insurance", "Insurance"], ["water", "Water / sewer"], ["fuel", "Heat / fuel"],
+  ["electric", "Electric (common)"], ["repairs", "Repairs & maintenance"], ["payroll", "Payroll / super"],
+  ["legal", "Legal / admin"], ["other", "Other"],
+];
