@@ -3564,6 +3564,9 @@ table.rr.rroll td,table.rr.rroll th{padding:5px 2px}
 table.rr.rroll td:first-child,table.rr.rroll th:first-child{padding-left:6px}
 table.rr.rroll select{padding:4px 2px;font-size:12px}
 table.rr.cflow{min-width:0}
+table.rr.rexp{min-width:0}
+table.rr.rexp td,table.rr.rexp th{padding:5px 3px}
+table.rr.rexp input{min-width:0;width:78px}
 table.rr.rsens{min-width:0}
 table.rr.rsens td,table.rr.rsens th{padding:6px 3px}
 table.rr.cflow td,table.rr.cflow th{padding:6px 3px}

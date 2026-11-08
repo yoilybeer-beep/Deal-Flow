@@ -125,8 +125,8 @@ export default function RentalUW({ initialModel, onExit, notify, userId, userNam
                 </select>
               </F>
               <F label="Year built" hint="optional"><input value={m.yearBuilt || ""} onChange={(e) => set("yearBuilt", e.target.value)} placeholder="1928" /></F>
-              <F label="Closing costs" hint={`% of price · default ${RD.closingCostPct}%`}>{num("closingCostPct", "0.1")}</F>
-              <F label="Other acquisition costs" hint="$ (reports, legal)">{num("otherAcqCosts")}</F>
+              <F label="Closing costs" hint={`% · default ${RD.closingCostPct}`}>{num("closingCostPct", "0.1")}</F>
+              <F label="Other acq. costs" hint="$">{num("otherAcqCosts")}</F>
             </div>
             <div className="derived">
               {c.nU} units · {money(c.perUnit)}/unit{c.bsf ? ` · ${psf(c.perSF)}/SF` : ""} · GRM {c.grm ? c.grm.toFixed(1) + "x" : "—"} (price ÷ in-place rent roll)
@@ -182,13 +182,13 @@ export default function RentalUW({ initialModel, onExit, notify, userId, userNam
 
           <Sec n="03" t="Income, Vacancy & Growth" open>
             <div className="fg2">
-              <F label="Other income" hint="$ / yr · laundry, parking">{num("otherIncomeYr")}</F>
-              <F label="Vacancy" hint={`% · default ${RD.vacancyPct}%`}>{num("vacancyPct", "0.5")}</F>
-              <F label="Credit loss" hint={`% · default ${RD.creditLossPct}%`}>{num("creditLossPct", "0.5")}</F>
-              <F label="Free-market rent growth" hint={`% / yr · default ${RD.rentGrowthPct}%`}>{num("rentGrowthPct", "0.25")}</F>
-              <F label="Rent-stabilized increase (RGB)" hint={`% / yr · your assumption, default ${RD.rgbPct}%`}>{num("rgbPct", "0.25")}</F>
-              <F label="Voucher rent growth" hint={`% / yr · default ${RD.voucherGrowthPct}%`}>{num("voucherGrowthPct", "0.25")}</F>
-              <F label="Free-market gap captured in yr 1" hint={`% · default ${RD.mtmY1Pct}%, all by yr 2`}>{num("mtmY1Pct", "5")}</F>
+              <F label="Other income" hint="$ / yr">{num("otherIncomeYr")}</F>
+              <F label="Vacancy" hint={`% · default ${RD.vacancyPct}`}>{num("vacancyPct", "0.5")}</F>
+              <F label="Credit loss" hint={`% · default ${RD.creditLossPct}`}>{num("creditLossPct", "0.5")}</F>
+              <F label="FM rent growth" hint={`% / yr · def. ${RD.rentGrowthPct}`}>{num("rentGrowthPct", "0.25")}</F>
+              <F label="RS increase (RGB)" hint={`% / yr · def. ${RD.rgbPct}`}>{num("rgbPct", "0.25")}</F>
+              <F label="Voucher growth" hint={`% / yr · def. ${RD.voucherGrowthPct}`}>{num("voucherGrowthPct", "0.25")}</F>
+              <F label="FM gap to market, yr 1" hint={`% · def. ${RD.mtmY1Pct}`}>{num("mtmY1Pct", "5")}</F>
             </div>
             <div className="derived">
               Year 1: rent {money(c.years[0].GPR)} + other {money(c.years[0].other)} − vacancy & credit {money(c.years[0].vac)} = <b>EGI {money(c.years[0].EGI)}</b>
@@ -197,7 +197,7 @@ export default function RentalUW({ initialModel, onExit, notify, userId, userNam
 
           <Sec n="04" t="Operating Expenses" open>
             <div className="tableWrap" style={{ marginTop: 10 }}>
-              <table className="rr">
+              <table className="rr rexp">
                 <thead><tr><th>Expense</th><th>$ / yr</th><th>$ / unit</th><th>% EGI</th></tr></thead>
                 <tbody>
                   {RENTAL_EXP_LABELS.map(([k, l]) => (
@@ -225,8 +225,8 @@ export default function RentalUW({ initialModel, onExit, notify, userId, userNam
               </table>
             </div>
             <div className="fg2">
-              <F label="Expense growth" hint={`% / yr · default ${RD.expGrowthPct}%`}>{num("expGrowthPct", "0.25")}</F>
-              <F label="RE tax growth" hint={`% / yr · default ${RD.taxGrowthPct}%`}>{num("taxGrowthPct", "0.25")}</F>
+              <F label="Expense growth" hint={`% / yr · def. ${RD.expGrowthPct}`}>{num("expGrowthPct", "0.25")}</F>
+              <F label="RE tax growth" hint={`% / yr · def. ${RD.taxGrowthPct}`}>{num("taxGrowthPct", "0.25")}</F>
             </div>
             <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
               <button className="mini tall" onClick={fillTypical}>Fill typical NYC $/unit</button>
@@ -236,7 +236,7 @@ export default function RentalUW({ initialModel, onExit, notify, userId, userNam
 
           <Sec n="05" t="Capex / Renovation" open>
             <div className="fg2">
-              <F label="Renovation budget" hint="$ · paid at closing (equity)">{num("capex")}</F>
+              <F label="Renovation budget" hint="$ · at closing">{num("capex")}</F>
               <F label="What it covers" hint="optional"><input value={m.capexNote || ""} onChange={(e) => set("capexNote", e.target.value)} placeholder="Turn 3 vacant units, boiler" /></F>
             </div>
             <div className="derived">{money(N(m.capex))} · {money(capexPU)}/unit · total basis {money(c.costBasis)} ({c.nU ? money(c.costBasis / c.nU) : "—"}/unit)</div>
@@ -244,16 +244,17 @@ export default function RentalUW({ initialModel, onExit, notify, userId, userNam
 
           <Sec n="06" t="Debt" open>
             <div className="fg2">
-              <F label="LTV" hint={`% of price · default ${RD.ltvPct}%`}>{num("ltvPct", "1")}</F>
-              <F label="Or loan amount" hint="$ · used with 'My amount'">{num("loanAmt")}</F>
-              <F label="Rate" hint={`% · default ${RD.ratePct}%`}>{num("ratePct", "0.125")}</F>
-              <F label="Amortization" hint="years · 0 = interest-only">{num("amortYrs")}</F>
-              <F label="Interest-only period" hint="years">{num("ioYrs")}</F>
+              <F label="LTV" hint={`% of price · def. ${RD.ltvPct}`}>{num("ltvPct", "1")}</F>
+              <F label="Or loan amount" hint="$ · My amount">{num("loanAmt")}</F>
+              <F label="Rate" hint={`% · def. ${RD.ratePct}`}>{num("ratePct", "0.125")}</F>
+              <F label="Amortization" hint="yrs · 0 = IO">{num("amortYrs")}</F>
+              <F label="IO period" hint="years">{num("ioYrs")}</F>
               <F label="Loan fees" hint="% of loan">{num("loanFeePct", "0.25")}</F>
-              <F label="Mortgage recording tax" hint={`% of loan · NYC default ${RD.mrtPct}%, verify / CEMA`}>{num("mrtPct", "0.05")}</F>
-              <F label="Min DSCR (lender)" hint={`x · default ${RD.minDscr}`}>{num("minDscr", "0.05")}</F>
-              <F label="Min debt yield" hint={`% · default ${RD.minDebtYield}% · 0 = ignore`}>{num("minDebtYield", "0.5")}</F>
+              <F label="Mortgage rec. tax" hint={`% of loan · def. ${RD.mrtPct}`}>{num("mrtPct", "0.05")}</F>
+              <F label="Min DSCR" hint={`x · def. ${RD.minDscr}`}>{num("minDscr", "0.05")}</F>
+              <F label="Min debt yield" hint={`% · 0 = off`}>{num("minDebtYield", "0.5")}</F>
             </div>
+            <div className="subnote">Defaults are labeled "def." and editable. Mortgage recording tax: NYC commercial rate on loans of $500K+, a CEMA can reduce it — verify. Selling costs include broker and transfer taxes.</div>
             <div className="tableWrap" style={{ marginTop: 14 }}>
               <table className="rr num">
                 <thead><tr><th>Max loan by</th><th>Amount</th><th>LTV</th></tr></thead>
@@ -273,9 +274,9 @@ export default function RentalUW({ initialModel, onExit, notify, userId, userNam
 
           <Sec n="07" t="Hold & Exit" open>
             <div className="fg2">
-              <F label="Hold period" hint="years (1–10)">{num("holdYrs", "1")}</F>
-              <F label="Exit cap rate" hint={`% · default ${RD.exitCapPct}%`}>{num("exitCapPct", "0.05")}</F>
-              <F label="Selling costs" hint={`% · default ${RD.sellCostPct}% (broker + transfer taxes)`}>{num("sellCostPct", "0.25")}</F>
+              <F label="Hold period" hint="years, 1–10">{num("holdYrs", "1")}</F>
+              <F label="Exit cap rate" hint={`% · def. ${RD.exitCapPct}`}>{num("exitCapPct", "0.05")}</F>
+              <F label="Selling costs" hint={`% · def. ${RD.sellCostPct}`}>{num("sellCostPct", "0.25")}</F>
             </div>
             <div className="derived">
               Year {c.hold + 1} NOI {money(c.exitNOI)} ÷ {N(m.exitCapPct).toFixed(2)}% = {money(c.exitValue)} − selling {money(c.sellCosts)} − loan payoff {money(c.loanPayoff)} = <b>{sMoney(c.netSale - c.loanPayoff)} to equity</b>
