@@ -1,0 +1,1560 @@
+import React, { useState, useEffect, useMemo } from "react";
+import { createPortal } from "react-dom";
+import { HPD_RENTS, HPD_RENT_SRC, HPD_RENT_LABEL, DEFAULT_AMI, RENT_DEDUCTION, RENT_DEDUCTION_LABEL, PROGRAMS, BORO_COSTS, DEFAULT_COSTS, UNIT_SF, MKT_RENTS } from "./uwConstants";
+import { supabase } from "./supabaseClient";
+import { OPPS_PREFIX } from "./Opportunities";
+
+/* ============================================================
+   CLASSIC DEVELOPMENT UNDERWRITING — kept so the new model can be checked against it.
+   This is the development underwriting exactly as it ran on main d40784f (Nov 6 2026):
+   same math, same screen. It has its own copies of every helper, so nothing here
+   shares state with the new Underwriting. Compare only: it reads saved models and
+   never writes, publishes or deletes them (save from the new Underwrite tab).
+   ============================================================ */
+
+/* ============================================================
+   J STONE REALTY GROUP — DEAL PLATFORM
+   ------------------------------------------------------------
+   Records live one-per-row in `deals`, `buyers` and `models`,
+   each stamped with the owner. Visibility is enforced by
+   Postgres row-level security, not by this file: a teammate
+   cannot fetch a private deal even outside the app.
+   Photos go to the `deal-photos` storage bucket.
+   Run supabase-schema.sql once before deploying this.
+   ============================================================ */
+/* ============================================================
+   J STONE REALTY GROUP — DEAL PLATFORM
+   Local desktop build. All data is stored in this browser on
+   this computer: records in localStorage, photos in IndexedDB.
+   Nothing is uploaded anywhere.
+   ============================================================ */
+
+
+/* ---------- photos now live in Supabase Storage ---------- */
+const photoUrl = (p) => p || "";          // records already hold full URLs
+const photosBoot = async () => {};        // nothing to preload any more
+
+async function photoDel(url) {
+  if (!supabase || !url) return;
+  const marker = "/deal-photos/";
+  const i = url.indexOf(marker);
+  if (i < 0) return;                      // not one of ours; leave it alone
+  const path = decodeURIComponent(url.slice(i + marker.length));
+  try { await supabase.storage.from("deal-photos").remove([path]); } catch (e) {}
+}
+
+/* ---------- export a snapshot of everything you can see ---------- */
+async function exportBackup() {
+  const grab = async (t) => (await supabase.from(t).select("id, data, owner_id, is_public, updated_at")).data || [];
+  const [deals, buyers, models] = await Promise.all([grab("deals"), grab("buyers"), grab("models")]);
+  const payload = {
+    app: "jstone-realty", version: 2, exported: new Date().toISOString(),
+    deals, buyers, models,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "jstone-backup-" + new Date().toISOString().slice(0, 10) + ".json";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+
+/* ============================================================
+   SHARED LIBRARY
+   ============================================================ */
+
+/* ---------- NYC residential FAR (post City of Yes, ZR 23-21/23-22) ----------
+   aor = as-of-right FAR ; uap = max FAR with UAP affordable housing */
+const farDB = {
+  'R1-1':{aor:0.75,uap:1.00},'R1-2':{aor:0.75,uap:1.00},'R1-2A':{aor:0.75,uap:1.00},
+  'R2':{aor:0.75,uap:1.00},'R2A':{aor:0.75,uap:1.00},'R2X':{aor:1.00,uap:1.00},
+  'R3-1':{aor:0.75,uap:1.00},'R3-2':{aor:0.75,uap:1.00},'R3A':{aor:0.75,uap:1.00},'R3X':{aor:0.75,uap:1.00},
+  'R4':{aor:1.00,uap:1.50},'R4-1':{aor:1.00,uap:1.50},'R4A':{aor:1.00,uap:1.50},'R4B':{aor:1.00,uap:1.50},
+  'R5':{aor:1.50,uap:2.00},'R5A':{aor:1.50,uap:2.00},'R5B':{aor:1.50,uap:2.00},'R5D':{aor:2.00,uap:2.00},
+  'R6':{narrow:{aor:2.20,uap:3.90},wide:{aor:3.00,uap:3.90}},
+  'R6-1':{aor:3.00,uap:3.90},'R6-2':{aor:2.50,uap:3.00},
+  'R6A':{aor:3.00,uap:3.90},'R6B':{aor:2.00,uap:2.40},'R6D':{aor:2.50,uap:3.00},
+  'R7-1':{narrow:{aor:3.44,uap:5.01},wide:{aor:4.00,uap:5.01}},
+  'R7-2':{narrow:{aor:3.44,uap:5.01},wide:{aor:4.00,uap:5.01}},
+  'R7-3':{aor:5.00,uap:6.00},'R7A':{aor:4.00,uap:5.01},'R7B':{aor:3.00,uap:3.90},
+  'R7D':{aor:4.66,uap:5.60},'R7X':{aor:5.00,uap:6.00},
+  'R8':{narrow:{aor:6.02,uap:7.20},wide:{aor:7.20,uap:8.64}},
+  'R8A':{aor:6.02,uap:7.20},'R8B':{aor:4.00,uap:4.80},'R8X':{aor:6.02,uap:7.20},
+  'R9':{aor:7.52,uap:9.02},'R9-1':{aor:9.00,uap:10.80},'R9A':{aor:7.52,uap:9.02},
+  'R9D':{aor:9.00,uap:10.80},'R9X':{aor:9.00,uap:10.80},
+  'R10':{aor:10.00,uap:12.00},'R10A':{aor:10.00,uap:12.00},'R10X':{aor:10.00,uap:12.00},
+  'R11':{aor:12.50,uap:15.00},'R12':{aor:15.00,uap:18.00},
+};
+const streetSensitive = ['R6','R7-1','R7-2','R8'];
+
+/* Deal Desk district picker — includes commercial/MX equivalents mapped to a residential district */
+const DEAL_ZONES = {
+  'R5':'R5','R5B':'R5B','R5D':'R5D','R6':'R6','R6A':'R6A','R6B':'R6B',
+  'R7-1':'R7-1','R7-2':'R7-2','R7A':'R7A','R7B':'R7B','R7D':'R7D','R7X':'R7X',
+  'R8':'R8','R8A':'R8A','R8B':'R8B','R8X':'R8X','R9':'R9','R9A':'R9A','R9X':'R9X',
+  'R10':'R10','R10A':'R10A','R10X':'R10X',
+  'C4-4 (R7 equiv)':'R7-1','C4-4A (R7A equiv)':'R7A','C4-5X (R7X equiv)':'R7X',
+  'C6-2 (R8 equiv)':'R8','C6-3 (R9 equiv)':'R9','C6-4 (R10 equiv)':'R10',
+  'M1-2/R6 (MX)':'R6A','M1-4/R7A (MX)':'R7A',
+  'Custom':null,
+};
+/* Commercial districts -> residential equivalent (ZR 34-112 / 35-23), used when an
+   address lookup brings back a district that isn't in the picker above. */
+const COMM_EQUIV = {
+  'C1-6':'R7-2','C2-6':'R7-2','C1-6A':'R7A','C2-6A':'R7A','C1-7':'R8','C2-7':'R8','C1-7A':'R8A','C2-7A':'R8A',
+  'C1-8':'R9','C2-8':'R9','C1-8A':'R9A','C2-8A':'R9A','C1-8X':'R9X','C2-8X':'R9X','C1-9':'R10','C2-9':'R10','C1-9A':'R10A','C2-9A':'R10A',
+  'C4-1':'R5','C4-2':'R6','C4-2A':'R6A','C4-3':'R6','C4-3A':'R6A','C4-4':'R7-2','C4-4A':'R7A','C4-4D':'R8A','C4-4L':'R7A',
+  'C4-5':'R7-2','C4-5A':'R7A','C4-5D':'R7D','C4-5X':'R7X','C4-6':'R10','C4-6A':'R10A','C4-7':'R10','C4-7A':'R10A',
+  'C5-1':'R10','C5-1A':'R10A','C5-2':'R10','C5-2A':'R10A','C5-3':'R10','C5-5':'R10',
+  'C6-1':'R7-2','C6-1A':'R6','C6-2':'R8','C6-2A':'R8A','C6-3':'R9','C6-3A':'R9A','C6-3D':'R9D','C6-3X':'R9X',
+  'C6-4':'R10','C6-4A':'R10A','C6-4X':'R10X','C6-5':'R10','C6-6':'R10','C6-7':'R10','C6-9':'R10',
+};
+// any district label -> the residential district we have FARs for (null = use the typed / looked-up FAR)
+function resolveDistrict(label) {
+  if (!label) return null;
+  if (label in DEAL_ZONES) return DEAL_ZONES[label];
+  const z = String(label).toUpperCase().trim();
+  if (farDB[z]) return z;
+  if (COMM_EQUIV[z]) return COMM_EQUIV[z];
+  if (z.includes('/')) { const r = z.split('/').map((s) => s.trim()).find((s) => farDB[s]); if (r) return r; }   // MX: M1-4/R7A
+  return null;
+}
+const isStreetSensitive = (label) => streetSensitive.includes(resolveDistrict(label));
+function farFor(district, street) {
+  const e = farDB[district];
+  if (!e) return null;
+  return streetSensitive.includes(district) ? e[street === 'wide' ? 'wide' : 'narrow'] : e;
+}
+function computeZoning(zoneLabel, street, lotArea, customFar) {
+  const district = resolveDistrict(zoneLabel);
+  const area = parseFloat(lotArea) || 0;
+  if (!district) {
+    const base = parseFloat(customFar) || 0;
+    const uap = zoneLabel === 'Custom' && base ? base * 1.2 : 0;   // looked-up districts we can't map get no UAP guess
+    return { district: null, baseFar: base, uapFar: uap,
+             baseZfa: base * area, uapZfa: uap ? uap * area : null };
+  }
+  const v = farFor(district, street);
+  if (!v) return null;
+  return { district, baseFar: v.aor, uapFar: v.uap,
+           baseZfa: v.aor * area, uapZfa: v.uap ? v.uap * area : null };
+}
+
+// buildable SF shown on cards: the typed override, else lot x FAR on the chosen path
+function dealBuildable(d) {
+  const o = parseFloat(d.buildableSf);
+  if (o > 0) return o;
+  const z = computeZoning(d.zone, d.streetWidth, d.lotArea, d.customFar);
+  if (!z) return null;
+  const v = d.devPath === 'uap' && z.uapZfa ? z.uapZfa : z.baseZfa;
+  return v > 0 ? v : null;
+}
+
+const BOROUGHS = ['Bronx','Brooklyn','Queens','Manhattan','Staten Island'];
+const ASSET_TYPES = ['Development / Land','Value-add','Existing / Stabilized','Office','Retail','Industrial','Conversion','Other'];
+// Tags saved before the new list. Read as the new names; the next save writes the new name.
+const ASSET_ALIAS = { 'Development site': 'Development / Land', 'Multifamily': 'Existing / Stabilized', 'Mixed-use': 'Existing / Stabilized' };
+const normTypes = (arr) => [...new Set((arr || []).map((t) => ASSET_ALIAS[t] || t))];
+const VACANCY = ['Delivered vacant','Partially occupied','Fully occupied','TBD'];
+// Deal pipeline. Saved in deals.data.stage; deals without one are "New".
+const DEAL_STAGES = ['New','Underwriting','Sent to buyers','Offer','Contract','Closed'];
+const stageOf = (d) => (DEAL_STAGES.includes(d?.stage) ? d.stage : 'New');
+
+const fmt = (n, d = 0) =>
+  n == null || isNaN(n) ? '—' : Number(n).toLocaleString('en-US', { maximumFractionDigits: d });
+const money = (n) =>
+  n == null || n === '' || isNaN(n) ? '—' : '$' + Math.round(Number(n)).toLocaleString('en-US');
+const pct = (n) => (isNaN(n) ? '—' : Number(n).toFixed(1) + '%');
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+const N = (v) => { const x = parseFloat(v); return isNaN(x) ? 0 : x; };
+
+// one clause for the save toast about the auto-contact
+function contactNote(c, who) {
+  if (!c) return "";
+  if (c.status === "created") return ` ${who} added to Contacts.`;
+  if (c.status === "updated") return ` ${who}'s contact updated.`;
+  if (c.status === "error") return ` (Couldn't add to Contacts: ${c.error})`;
+  return "";
+}
+
+/* ---------- follow-up date status (today, relative to the device clock) ---------- */
+function followUpStatus(dateStr) {
+  if (!dateStr) return null;
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const due = new Date(dateStr + 'T00:00:00');
+  if (isNaN(due.getTime())) return null;
+  const days = Math.round((due - today) / 86400000);
+  if (days < 0) return { cls: 'overdue', label: `Overdue ${Math.abs(days)}d`, days };
+  if (days === 0) return { cls: 'due', label: 'Follow up today', days };
+  if (days === 1) return { cls: 'soon', label: 'Follow up tomorrow', days };
+  if (days <= 7) return { cls: 'soon', label: `Follow up in ${days}d`, days };
+  return { cls: 'upcoming', label: `Follow up ${due.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`, days };
+}
+
+// Auto-match: a buyer fits when nothing in their buy box rules the deal out
+// (borough, what they buy, budget with 10% stretch, min size). Each criterion the
+// buyer actually has filled in and that fits counts as a "hit"; best fits first.
+function matchBuyers(deal, buyers) {
+  const z = computeZoning(deal.zone, deal.streetWidth, deal.lotArea, deal.customFar);
+  const bsf = dealBuildable(deal) || (z ? Math.max(z.baseZfa, z.uapZfa || 0) : 0);
+  const price = parseFloat(deal.askingPrice) || null;
+  const type = deal.assetType || '';
+  const out = [];
+  for (const b of buyers) {
+    const hits = [];
+    if (b.boroughs?.length) { if (!b.boroughs.includes(deal.borough)) continue; hits.push(deal.borough); }
+    const bt = normTypes(b.assetTypes);
+    if (type && bt.length) { if (!bt.includes(type)) continue; hits.push(type); }
+    if (b.maxBudget && price) { if (price > Number(b.maxBudget) * 1.1) continue; hits.push('Budget ' + money(b.maxBudget)); }
+    if (b.minSize && bsf) { if (bsf < Number(b.minSize)) continue; hits.push(fmt(b.minSize) + '+ SF'); }
+    out.push({ ...b, _hits: hits });
+  }
+  return out.sort((a, b) => b._hits.length - a._hits.length);
+}
+
+/* ---------- client-facing share text (no seller number / contact / notes) ---------- */
+function buildShareText(deal) {
+  const z = computeZoning(deal.zone, deal.streetWidth, deal.lotArea, deal.customFar);
+  const ask = parseFloat(deal.askingPrice);
+  const uapPath = deal.devPath === 'uap';
+  const L = [];
+  L.push(`🏢 ${deal.address}${deal.neighborhood ? ' · ' + deal.neighborhood : ''} — ${deal.borough}`);
+  const bits = [`Zoning ${deal.zone}`];
+  if (deal.lotArea) bits.push(`${fmt(deal.lotArea)} SF lot`);
+  L.push(bits.join(' · '));
+  if (ask > 0) L.push(`Asking: ${money(ask)}`);
+  if (z && z.baseZfa > 0) {
+    const aorPer = ask > 0 ? ` — $${fmt(ask / z.baseZfa)}/BSF` : '';
+    L.push(`As-of-right: ~${fmt(z.baseZfa)} BSF${aorPer}${!uapPath ? '  ←' : ''}`);
+    if (z.uapZfa) {
+      const uapPer = ask > 0 ? ` — $${fmt(ask / z.uapZfa)}/BSF` : '';
+      L.push(`With UAP: ~${fmt(z.uapZfa)} BSF${uapPer}${uapPath ? '  ←' : ''}`);
+    }
+  }
+  if (parseFloat(deal.buildableSf) > 0) L.push(`Buildable (provided): ~${fmt(deal.buildableSf)} SF`);
+  if (deal.existingSf) L.push(`Existing building: ${fmt(deal.existingSf)} SF`);
+  if (deal.vacancy && deal.vacancy !== 'TBD') L.push(deal.vacancy);
+  L.push('');
+  L.push('J Stone Realty Group');
+  return L.join('\n');
+}
+
+/* ---------- image resize before storing ---------- */
+function resizeImage(file, maxDim = 1600) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      const s = Math.min(1, maxDim / Math.max(img.width, img.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.width * s);
+      c.height = Math.round(img.height * s);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      c.toBlob((b) => { URL.revokeObjectURL(url); resolve(b || file); }, 'image/jpeg', 0.85);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); resolve(file); };
+    img.src = url;
+  });
+}
+
+/* ---------- brand marks ----------
+   LOGO      : building glyph, recoloured for the dark sidebar
+   LOGO_FULL : full lockup in brand colours, for the client sheet */
+const LOGO = 'data:image/png;base64,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';
+const LOGO_FULL = 'data:image/png;base64,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';
+
+/* ---------- palette ---------- */
+const INK = '#101B2D';
+const PAPER = '#FAFAF7';
+const BLUE = '#2456C8';
+const BRASS = '#9C7A2E';
+const LINE = '#E3E1D9';
+const GREEN = '#2E7D5B';
+const RED = '#A8453A';
+
+/* ============================================================
+   DEVELOPMENT UNDERWRITING  (v2 — Sale / Ground-lease, unit mix,
+   affordable set-aside, hard / soft / carrying, NOI, debt, exit)
+   Everything lives in the model JSON; v1 models are upgraded on load.
+   ============================================================ */
+const UNIT_TYPES = [
+  ["studio", "Studio"],
+  ["1br", "1 Bedroom"],
+  ["2br", "2 Bedroom"],
+  ["3br", "3 Bedroom"],
+];
+const UT_SHORT = { studio: "Studio", "1br": "1 BR", "2br": "2 BR", "3br": "3 BR" };
+const AMI_BANDS = ["80", "60", "40"];   // v1 layout, read only when upgrading old models
+
+const AMI_LEVELS = Object.keys(HPD_RENTS).map(Number);
+const hpdRents = (ami) => ({ ...(HPD_RENTS[ami] || HPD_RENTS[60]) });
+
+const REQ_MODES = [["sf", "% of resi floor area"], ["units", "% of units"], ["uap", "UAP bonus floor area"], ["none", "None"]];
+
+const costsFor = (boro) => BORO_COSTS[boro] || DEFAULT_COSTS;
+const typeMap = (fn) => Object.fromEntries(UNIT_TYPES.map(([t]) => [t, fn(t)]));
+const newTier = (ami = DEFAULT_AMI) => ({ ami, units: typeMap(() => 0), rents: hpdRents(ami) });
+
+function blankModel(borough = "") {
+  const bc = costsFor(borough);
+  const units = { studio: 4, "1br": 12, "2br": 7, "3br": 2 };
+  return {
+    v: 2, id: uid(), dealId: null,
+    dealName: "Untitled Site", marketArea: "", borough,
+    structure: "sale", dealType: "rental", program: "market",
+    district: "", street: "narrow", devPath: "aor", overlay: "",
+    lotSF: 5000, far: 4.0, bonusFar: 0, airRightsSF: 0, airRightsPSF: 0,
+    mix: typeMap((t) => ({ sf: UNIT_SF[t], units: units[t], rent: MKT_RENTS[t] })),
+    addonPct: 25, gsfOverride: 0, otherGSF: 0,
+    affMode: "none", affReqPct: 0, tiers: [newTier(DEFAULT_AMI)], utilAllow: typeMap((t) => RENT_DEDUCTION[t] ?? 0),
+    floors: [], massReserveSF: 0,
+    purchasePrice: 3000000, keyMoney: 0, groundRentYr: 0, groundRentFreeMonths: 0,
+    closingCostPct: 3, otherAcqCosts: 50000, creditsAmt: 0, creditsLabel: "Brownfield / other credits",
+    hardCostPerBSF: bc.hard, hardContingencyPct: 0, softCostPct: bc.soft,
+    constructionMonths: 24, ltcPct: 65, interestRatePct: 9.0, avgOutstandingPct: 60, originationFeePct: 1.0,
+    cTaxesYr: 30000, cInsurancePct: 1.5,
+    retailSF: 0, retailPSF: 50, commVacancyPct: 10, retailExpPct: 10, commCapRate: 6.0,
+    parkingSpaces: 0, parkingRent: 200, otherIncomeYr: 0,
+    vacancyPct: 5, opexPerUnit: 6000, mgmtPct: 3, propertyTaxAnnual: 0, exitCapRatePct: 5.5,
+    permLoanPct: 90, permLoanAmt: 0, permRatePct: 6.5, permAmortYrs: 30,
+    marketSellPSF: 1100, affordableSellPSF: 500, sellingCostPct: 6,
+    isPublic: false, updated: new Date().toISOString().slice(0, 10),
+  };
+}
+
+/* ---------- load any saved model (v1 or v2) into the v2 shape ---------- */
+function upgradeModel(raw) {
+  if (!raw) return blankModel();
+  const base = blankModel(raw.borough || "");
+  if (N(raw.v) >= 2) {
+    const tiers = Array.isArray(raw.tiers) && raw.tiers.length ? raw.tiers.map((t) => ({
+      ami: N(t.ami) || 60, units: { ...typeMap(() => 0), ...(t.units || {}) }, rents: { ...hpdRents(N(t.ami) || 60), ...(t.rents || {}) },
+    })) : base.tiers;
+    const mix = typeMap((t) => ({ ...base.mix[t], ...((raw.mix || {})[t] || {}) }));
+    const utilAllow = typeMap((t) => (N((raw.utilAllow || {})[t]) > 0 ? raw.utilAllow[t] : RENT_DEDUCTION[t] ?? 0));  // 0 / missing → default basis
+    return { ...base, ...raw, mix, tiers, utilAllow, floors: Array.isArray(raw.floors) ? raw.floors : [] };
+  }
+  // v1 → v2: keep every number that drove the old result (building SF, costs, opex %, rents)
+  const m = { ...base, ...raw, v: 2, id: raw.id || base.id };
+  const comm = Array.isArray(raw.comm) ? raw.comm : [];
+  const commSF = comm.reduce((s, c) => s + N(c.sf), 0);
+  const commGross = comm.reduce((s, c) => s + N(c.sf) * N(c.rent), 0);
+  const oldNet = Math.max(0, N(raw.actualBuildingSF) - commSF) * N(raw.efficiency ?? 83) / 100;
+  const units = typeMap(() => 0), rents = typeMap((t) => MKT_RENTS[t]);
+  const tiers = [];
+  if (raw.dealType === "condo") {
+    const tot = Math.round(N(raw.totalUnits)), aff = Math.round(tot * N(raw.affordablePct) / 100);
+    units["1br"] = tot;
+    if (aff > 0) { const tr = newTier(60); tr.units["1br"] = aff; tiers.push(tr); }
+  } else {
+    UNIT_TYPES.forEach(([t]) => {
+      const mk = (raw.mkt || {})[t] || {};
+      units[t] += N(mk.u); if (N(mk.r) > 0) rents[t] = N(mk.r);
+    });
+    AMI_BANDS.forEach((b) => {
+      const tr = { ami: Number(b), units: typeMap(() => 0), rents: hpdRents(Number(b)) };
+      let any = 0;
+      UNIT_TYPES.forEach(([t]) => {
+        const a = ((raw.aff || {})[t] || {})[b] || {};
+        tr.units[t] = N(a.u); any += N(a.u); units[t] += N(a.u);
+        if (N(a.r) > 0) tr.rents[t] = N(a.r);
+      });
+      if (any > 0) tiers.push(tr);
+    });
+  }
+  const rawNet = UNIT_TYPES.reduce((s, [t]) => s + UNIT_SF[t] * units[t], 0);
+  const f = oldNet > 0 && rawNet > 0 ? oldNet / rawNet : 1;
+  m.mix = typeMap((t) => ({ sf: Math.round(UNIT_SF[t] * f), units: units[t], rent: rents[t] }));
+  m.tiers = tiers.length ? tiers : [newTier(DEFAULT_AMI)];
+  // old affordable rents were entered as collected rents: keep the same net rent under the default deduction
+  if (tiers.length) tiers.forEach((tr) => UNIT_TYPES.forEach(([t]) => { tr.rents[t] = N(tr.rents[t]) + (RENT_DEDUCTION[t] ?? 0); }));
+  m.utilAllow = typeMap((t) => RENT_DEDUCTION[t] ?? 0);
+  m.gsfOverride = N(raw.actualBuildingSF);           // keeps the old cost basis exactly
+  m.retailSF = commSF; m.retailPSF = commSF > 0 ? Math.round(commGross / commSF) : 50; m.retailExpPct = 0;
+  m.opexPerUnit = 0; m.mgmtPct = N(raw.opexPct);      // v1 opex was a % of EGI
+  m.cTaxesYr = 0; m.cInsurancePct = 0;                // v1 had no construction taxes / insurance
+  m.hardContingencyPct = N(raw.hardContingencyPct);
+  const P = PROGRAMS[raw.program] || PROGRAMS.market;
+  m.affMode = P.mode; m.affReqPct = P.pct;
+  m.structure = "sale"; m.keyMoney = 0; m.groundRentYr = 0;
+  if (raw.permLoanPct == null) m.permLoanPct = 65;  // keep the loan old models were upgraded with
+  delete m.mkt; delete m.aff; delete m.comm;
+  return m;
+}
+
+/* ---------- prefill a model from a Deal Desk deal ---------- */
+function modelFromDeal(deal) {
+  const m = blankModel(deal.borough || "");
+  const district = resolveDistrict(deal.zone) || "";
+  const uapPath = deal.devPath === "uap";
+  m.dealId = deal.id;
+  m.dealName = deal.address || "Untitled Site";
+  m.marketArea = [deal.neighborhood, deal.borough].filter(Boolean).join(", ");
+  m.district = district;
+  m.street = deal.streetWidth === "wide" ? "wide" : "narrow";
+  m.devPath = uapPath ? "uap" : "aor";
+  m.lotSF = N(deal.lotArea) || 0;
+  m.purchasePrice = N(deal.askingPrice) || 0;
+  m.cTaxesYr = Math.round(m.purchasePrice * 0.01);
+  const v = district ? farFor(district, m.street) : null;
+  if (v) {
+    m.far = v.aor;
+    m.bonusFar = uapPath && v.uap ? v.uap : 0;
+    if (uapPath) { m.program = "uap"; m.affMode = "uap"; }
+  } else if (deal.customFar) {
+    m.far = N(deal.customFar);
+  }
+  const target = N(deal.buildableSf) > 0 ? N(deal.buildableSf) : m.lotSF * (N(m.bonusFar) > 0 ? N(m.bonusFar) : N(m.far));
+  if (N(deal.buildableSf) > 0 && m.lotSF > 0) {           // his own buildable number wins
+    const f = Math.round(N(deal.buildableSf) / m.lotSF * 100) / 100;
+    if (uapPath && v) m.bonusFar = f; else { m.far = f; m.bonusFar = 0; }
+  }
+  return fitMix(m, target);
+}
+
+/* scale the unit counts so resi gross + retail ≈ the target buildable SF */
+function fitMix(m, targetBSF) {
+  const target = N(targetBSF) - N(m.retailSF);
+  if (target <= 0) return m;
+  const mix = { ...m.mix };
+  let net = UNIT_TYPES.reduce((s, [t]) => s + N(mix[t].sf) * N(mix[t].units), 0);
+  if (net <= 0) {
+    const d = { studio: 4, "1br": 12, "2br": 7, "3br": 2 };
+    UNIT_TYPES.forEach(([t]) => { mix[t] = { ...mix[t], units: d[t], sf: N(mix[t].sf) || UNIT_SF[t] }; });
+    net = UNIT_TYPES.reduce((s, [t]) => s + N(mix[t].sf) * N(mix[t].units), 0);
+  }
+  const goalNet = target / (1 + N(m.addonPct) / 100);
+  const f = goalNet / net;
+  UNIT_TYPES.forEach(([t]) => { mix[t] = { ...mix[t], units: Math.max(0, Math.floor(N(mix[t].units) * f)) }; });
+  // top up one unit at a time (largest type that still fits) without going over the envelope
+  const netOf = () => UNIT_TYPES.reduce((s, [t]) => s + N(mix[t].sf) * N(mix[t].units), 0);
+  for (let g = 0; g < 200; g++) {
+    const room = goalNet - netOf();
+    const fit = UNIT_TYPES.map(([t]) => t).filter((t) => N(mix[t].sf) > 0 && N(mix[t].sf) <= room);
+    if (!fit.length) break;
+    const t = fit.reduce((best, x) => (N(mix[x].units) * N(mix[best].sf) < N(mix[best].units) * N(mix[x].sf) ? x : best), fit[0]);
+    mix[t] = { ...mix[t], units: N(mix[t].units) + 1 };
+  }
+  return { ...m, mix };
+}
+
+/* ---------- affordable units needed to meet the requirement (fills tier 1) ---------- */
+function autoAffordable(m) {
+  const c = runCalc(m);
+  const tiers = m.tiers.map((t) => ({ ...t, units: { ...t.units } }));
+  const t0 = tiers[0];
+  const others = (t) => tiers.slice(1).reduce((s, x) => s + N(x.units[t]), 0);
+  UNIT_TYPES.forEach(([t]) => { t0.units[t] = 0; });
+  const need = () => {
+    const cc = runCalc({ ...m, tiers });
+    return c.affMode === "units" ? cc.affReqUnits - cc.affUnits : cc.affReqSF - cc.affSF;
+  };
+  if (c.affMode === "none") return { ...m, tiers };
+  // proportional first pass (keeps the bedroom mix proportional), then top up
+  const share = c.affMode === "units"
+    ? (c.totalUnits > 0 ? c.affReqUnits / c.totalUnits : 0)
+    : (c.resiNetSF > 0 ? c.affReqSF / c.resiNetSF : 0);
+  UNIT_TYPES.forEach(([t]) => {
+    const room = Math.max(0, N(m.mix[t].units) - others(t));
+    t0.units[t] = Math.min(room, Math.floor(N(m.mix[t].units) * share));
+  });
+  for (let guard = 0; guard < 400 && need() > 0; guard++) {
+    // add one unit to the type with the lowest affordable share (keeps the bedroom mix proportional)
+    let best = null, bestShare = Infinity;
+    UNIT_TYPES.forEach(([t]) => {
+      const u = N(m.mix[t].units), room = u - others(t) - t0.units[t];
+      const sh = u > 0 ? (others(t) + t0.units[t] + 1) / u : Infinity;
+      if (room > 0 && sh < bestShare) { bestShare = sh; best = t; }
+    });
+    if (!best) break;
+    t0.units[best] += 1;
+  }
+  return { ...m, tiers };
+}
+
+const pmtYr = (loan, ratePct, years) => {
+  const r = N(ratePct) / 100 / 12, n = N(years) * 12;
+  if (loan <= 0 || n <= 0) return 0;
+  if (r === 0) return loan / n * 12;
+  return loan * r / (1 - Math.pow(1 + r, -n)) * 12;
+};
+
+/* ---------- the model math (one set of numbers for screen + report) ---------- */
+function runCalc(m) {
+  const lease = m.structure === "lease";
+  const rental = m.dealType !== "condo";
+  const lotSF = N(m.lotSF);
+  const baseFAR = N(m.far);
+  const effFAR = N(m.bonusFar) > 0 ? N(m.bonusFar) : baseFAR;
+  const baseBSF = lotSF * baseFAR;
+  // UAP: the bonus is (UAP FAR − base FAR) × lot, unless the user typed how much of it they use (m.uapSF)
+  const autoBonusBSF = Math.max(0, lotSF * effFAR - baseBSF);
+  const uapEdited = autoBonusBSF > 0 && m.uapSF !== null && m.uapSF !== undefined && m.uapSF !== "";
+  const bonusBSF = uapEdited ? Math.max(0, N(m.uapSF)) : autoBonusBSF;
+  const zoningBSF = baseBSF + bonusBSF;
+  const airSF = N(m.airRightsSF);
+  const totalBSF = zoningBSF + airSF;
+  const rawFactor = totalBSF / 680;
+  const maxUnitsByZoning = Math.floor(rawFactor) + (rawFactor - Math.floor(rawFactor) >= 0.75 ? 1 : 0);
+
+  // unit mix + affordable tiers
+  const tiers = Array.isArray(m.tiers) ? m.tiers : [];
+  const rows = UNIT_TYPES.map(([t, label]) => {
+    const x = (m.mix || {})[t] || {};
+    const sf = N(x.sf), units = N(x.units), rent = N(x.rent);
+    let affU = 0, affRentM = 0, lostM = 0;
+    const parts = [];
+    const ua = N((m.utilAllow || {})[t]);   // utility allowance: max gross rent − allowance = rent collected
+    tiers.forEach((tr) => {
+      const u = N(tr.units?.[t]), r = N(tr.rents?.[t]), net = r - ua;
+      if (u > 0) { affU += u; affRentM += u * net; lostM += u * (rent - net); parts.push({ u, r, net, ua, ami: N(tr.ami) }); }
+    });
+    const mktU = Math.max(0, units - affU);
+    return { type: t, label, sf, units, rent, affU, mktU, parts, over: affU > units,
+      netSF: sf * units, affSF: sf * Math.min(affU, units), mktSF: sf * mktU, mktRentM: mktU * rent, affRentM, lostM };
+  });
+  const sum = (k) => rows.reduce((s, r) => s + r[k], 0);
+  const totalUnits = sum("units"), affUnits = sum("affU"), marketUnits = sum("mktU");
+  const resiNetSF = sum("netSF"), affSF = sum("affSF"), mktSF = sum("mktSF");
+  const addon = N(m.addonPct) / 100;
+  const resiGSF = resiNetSF * (1 + addon);
+  const retailSF = N(m.retailSF);
+  const zfaUsed = resiGSF + retailSF;
+  const computedGSF = zfaUsed + N(m.otherGSF);
+  const GSF = N(m.gsfOverride) > 0 ? N(m.gsfOverride) : computedGSF;
+  const bsfLeft = totalBSF - zfaUsed;
+  const overAlloc = rows.some((r) => r.over);
+
+  // affordable requirement
+  const affMode = m.affMode || "none";
+  let affReqSF = 0, affReqUnits = 0;
+  if (affMode === "sf") affReqSF = resiNetSF * N(m.affReqPct) / 100;
+  if (affMode === "uap") affReqSF = (1 + addon) > 0 ? bonusBSF / (1 + addon) : 0;   // bonus floor area, on a net basis
+  if (affMode === "units") { affReqUnits = Math.ceil(totalUnits * N(m.affReqPct) / 100 - 1e-9); affReqSF = totalUnits > 0 ? resiNetSF * affReqUnits / totalUnits : 0; }
+  const affSurplusSF = affSF - affReqSF;
+  const affSurplusUnits = affUnits - affReqUnits;
+  const affMet = affMode === "none" ? true : affMode === "units" ? affSurplusUnits >= 0 : affSurplusSF >= -0.5;
+  const affAvgAmi = affUnits > 0 ? tiers.reduce((s, tr) => s + UNIT_TYPES.reduce((a, [t]) => a + N(tr.units?.[t]), 0) * N(tr.ami), 0) / affUnits : 0;
+
+  // income
+  const mktResiM = sum("mktRentM"), affResiM = sum("affRentM"), resiM = mktResiM + affResiM;
+  const lostM = sum("lostM");
+  const retailYr = retailSF * N(m.retailPSF);
+  const parkingM = N(m.parkingSpaces) * N(m.parkingRent);
+  const otherYr = N(m.otherIncomeYr);
+  const resiYr = resiM * 12;
+  const GPI = resiYr + parkingM * 12 + otherYr + retailYr;
+  const resiVac = (resiYr + parkingM * 12 + otherYr) * N(m.vacancyPct) / 100;
+  const retailVac = retailYr * N(m.commVacancyPct) / 100;
+  const vacancy = resiVac + retailVac;
+  const EGI = GPI - vacancy;
+  const exResi = N(m.opexPerUnit) * totalUnits;
+  const exMgmt = EGI * N(m.mgmtPct) / 100;
+  const exRetail = retailYr * N(m.retailExpPct) / 100;
+  const exTax = N(m.propertyTaxAnnual);
+  const exGround = lease ? N(m.groundRentYr) : 0;
+  const opexTotal = exResi + exMgmt + exRetail + exTax + exGround;
+  const NOI = EGI - opexTotal;
+
+  // cost
+  const price = lease ? N(m.keyMoney) : N(m.purchasePrice);
+  const closing = price * N(m.closingCostPct) / 100;
+  const airCost = airSF * N(m.airRightsPSF);
+  const otherAcq = N(m.otherAcqCosts);
+  const totalAcq = price + closing + otherAcq + airCost;
+  const hardBase = GSF * N(m.hardCostPerBSF);
+  const contingency = hardBase * N(m.hardContingencyPct) / 100;
+  const totalHard = hardBase + contingency;
+  const totalSoft = totalHard * N(m.softCostPct) / 100;
+  const months = N(m.constructionMonths);
+  const constrLoan = N(m.ltcPct) / 100 * (totalAcq + totalHard + totalSoft);
+  const cInterest = constrLoan * N(m.interestRatePct) / 100 * (months / 12) * N(m.avgOutstandingPct) / 100;
+  const cFees = constrLoan * N(m.originationFeePct) / 100;
+  const cTaxes = N(m.cTaxesYr) * months / 12;
+  const cInsurance = totalHard * N(m.cInsurancePct) / 100;
+  const cGround = lease ? N(m.groundRentYr) * Math.max(0, months - N(m.groundRentFreeMonths)) / 12 : 0;
+  const totalCarry = cInterest + cFees + cTaxes + cInsurance + cGround;
+  const constrSubtotal = totalHard + totalSoft + totalCarry;
+  const TPC = totalAcq + constrSubtotal;
+  const credits = Math.abs(N(m.creditsAmt));
+  const netCost = TPC - credits;
+  const TDC = TPC;   // v1 name
+
+  const per = (x) => ({ bsf: totalBSF > 0 ? x / totalBSF : 0, gsf: GSF > 0 ? x / GSF : 0, unit: totalUnits > 0 ? x / totalUnits : 0 });
+
+  const cap = N(m.exitCapRatePct);
+  const exitValue = cap > 0 ? NOI / (cap / 100) : 0;
+  const equityCreated = exitValue - netCost;
+  const yieldOnCost = TPC > 0 ? NOI / TPC * 100 : 0;
+  const yieldOnNet = netCost > 0 ? NOI / netCost * 100 : 0;
+  const lostYr = lostM * 12;
+  const lostValue = cap > 0 ? lostYr / (cap / 100) : 0;
+
+  // permanent loan
+  const permLoan = N(m.permLoanAmt) > 0 ? N(m.permLoanAmt) : netCost * N(m.permLoanPct) / 100;
+  const dsAmort = pmtYr(permLoan, m.permRatePct, m.permAmortYrs);
+  const dsIO = permLoan * N(m.permRatePct) / 100;
+  const cfAmort = NOI - dsAmort, cfIO = NOI - dsIO;
+  const dscr = dsAmort > 0 ? NOI / dsAmort : 0;
+  const dscrIO = dsIO > 0 ? NOI / dsIO : 0;
+  const equityIn = netCost - permLoan;               // cash required = all-in − loan
+  const cashPct = netCost > 0 ? equityIn / netCost * 100 : 0;
+  const coc = equityIn > 0 ? cfAmort / equityIn * 100 : 0;
+  const debtYield = permLoan > 0 ? NOI / permLoan * 100 : 0;
+  const constant = permLoan > 0 ? dsAmort / permLoan : 0;
+  const maxLoan125 = constant > 0 ? NOI / 1.25 / constant : 0;
+
+  // condo sellout (main case for condo, "alt exit" for rental)
+  const sellGross = mktSF * N(m.marketSellPSF) + affSF * N(m.affordableSellPSF);
+  const sellCosts = sellGross * N(m.sellingCostPct) / 100;
+  const sellNet = sellGross - sellCosts;
+  const retailNOI = (retailYr - retailVac) - exRetail;
+  const retailValue = N(m.commCapRate) > 0 ? retailNOI / (N(m.commCapRate) / 100) : 0;
+  const condoProfit = sellNet + retailValue - netCost;
+  const condoMargin = netCost > 0 ? condoProfit / netCost * 100 : 0;
+  const condoMarginRev = (sellNet + retailValue) > 0 ? condoProfit / (sellNet + retailValue) * 100 : 0;
+
+  const profit = rental ? equityCreated : condoProfit;
+  const margin = netCost > 0 ? profit / netCost * 100 : 0;
+
+  return {
+    lease, rental, lotSF, baseFAR, effFAR, baseBSF, zoningBSF, bonusBSF, autoBonusBSF, uapEdited, airSF, totalBSF, buildableSF: zoningBSF, maxUnitsByZoning,
+    rows, totalUnits, affUnits, marketUnits, affordableUnits: affUnits, resiNetSF, affSF, mktSF, resiGSF, retailSF, zfaUsed, computedGSF, GSF,
+    actualBuildingSF: GSF, netSF: resiNetSF, bsfLeft, overAlloc,
+    affMode, affReqSF, affReqUnits, affSurplusSF, affSurplusUnits, affMet, affAvgAmi,
+    mktResiM, affResiM, resiM, lostM, lostYr, lostValue, retailYr, parkingM, otherYr, resiYr, GPI, resiVac, retailVac, vacancy, EGI,
+    exResi, exMgmt, exRetail, exTax, exGround, opexTotal, NOI,
+    price, closing, airCost, otherAcq, totalAcq, hardBase, contingency, totalHard, totalSoft,
+    constrLoan, cInterest, cFees, cTaxes, cInsurance, cGround, totalCarry, constrSubtotal, TPC, TDC, credits, netCost, per,
+    cap, exitValue, equityCreated, yieldOnCost, yieldOnNet,
+    permLoan, dsAmort, dsIO, cfAmort, cfIO, dscr, dscrIO, equityIn, cashPct, coc, debtYield, maxLoan125,
+    sellGross, sellCosts, sellNet, retailNOI, retailValue, condoProfit, condoMargin, condoMarginRev,
+    profit, margin,
+    avgRentUnit: totalUnits > 0 ? resiM / totalUnits : 0,
+    avgMktRent: marketUnits > 0 ? mktResiM / marketUnits : 0,
+    avgAffRent: affUnits > 0 ? affResiM / affUnits : 0,
+    rentPSF: resiNetSF > 0 ? resiYr / resiNetSF : 0,
+    mktRentPSF: mktSF > 0 ? mktResiM * 12 / mktSF : 0,
+    affRentPSF: affSF > 0 ? affResiM * 12 / affSF : 0,
+  };
+}
+
+/* ---------- sensitivity: hard cost $/SF × exit cap (rental) or × sellout $/SF (condo) ---------- */
+function sensitivity(m) {
+  const rental = m.dealType !== "condo";
+  const hard = N(m.hardCostPerBSF);
+  const rowsV = [-30, -15, 0, 15, 30].map((d) => Math.max(0, hard + d));
+  const colsV = rental
+    ? [-0.5, -0.25, 0, 0.25, 0.5].map((d) => Math.max(0.25, N(m.exitCapRatePct) + d))
+    : [-0.1, -0.05, 0, 0.05, 0.1].map((d) => Math.round(N(m.marketSellPSF) * (1 + d)));
+  const grid = rowsV.map((h) => colsV.map((cv) => {
+    const mm = rental ? { ...m, hardCostPerBSF: h, exitCapRatePct: cv } : { ...m, hardCostPerBSF: h, marketSellPSF: cv };
+    const c = runCalc(mm);
+    return { profit: c.profit, yoc: c.yieldOnCost };
+  }));
+  return { rental, rowsV, colsV, grid };
+}
+
+/* ---------- formatting helpers ---------- */
+const psf = (n) => (n == null || isNaN(n) || !isFinite(n) ? "—" : "$" + Math.round(n).toLocaleString("en-US"));
+const sMoney = (n) => (n < 0 ? "-" : "") + money(Math.abs(n));
+const kMoney = (n) => {
+  const a = Math.abs(n), s = n < 0 ? "-" : "";
+  if (a >= 1e6) return s + "$" + (a / 1e6).toFixed(a >= 1e7 ? 1 : 2) + "M";
+  if (a >= 1e3) return s + "$" + Math.round(a / 1e3) + "K";
+  return s + "$" + Math.round(a);
+};
+const x2 = (n) => (isFinite(n) && n > 0 ? n.toFixed(2) + "x" : "—");
+
+/* ============================================================ */
+function Underwriting({ initialModel, onExit, exitLabel, notify, userId, userName }) {
+  const [m, setM] = useState(() => upgradeModel(initialModel));
+  const [saved, setSaved] = useState([]);
+  const [sheet, setSheet] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const c = useMemo(() => runCalc(m), [m]);
+  const sens = useMemo(() => sensitivity(m), [m]);
+
+  const set = (k, v) => setM((p) => ({ ...p, [k]: v }));
+  const num = (k, step = "any") => (
+    <input type="number" inputMode="decimal" step={step} value={m[k] ?? ""} onChange={(e) => set(k, e.target.value)} />
+  );
+  const setMix = (t, f, v) => setM((p) => ({ ...p, mix: { ...p.mix, [t]: { ...p.mix[t], [f]: v } } }));
+  const setTier = (i, fn) => setM((p) => ({ ...p, tiers: p.tiers.map((x, j) => (j === i ? fn(x) : x)) }));
+  const setTierU = (i, t, v) => setTier(i, (x) => ({ ...x, units: { ...x.units, [t]: v } }));
+  const setTierR = (i, t, v) => setTier(i, (x) => ({ ...x, rents: { ...x.rents, [t]: v } }));
+  const setTierAmi = (i, ami) => setTier(i, (x) => ({ ...x, ami: Number(ami), rents: hpdRents(Number(ami)) }));
+  const addTier = () => setM((p) => (p.tiers.length >= 3 ? p : { ...p, tiers: [...p.tiers, newTier(p.tiers.some((t) => N(t.ami) === 40) ? 80 : 40)] }));
+  const delTier = (i) => setM((p) => ({ ...p, tiers: p.tiers.length > 1 ? p.tiers.filter((_, j) => j !== i) : [newTier(60)] }));
+  const setFloor = (i, f, v) => setM((p) => ({ ...p, floors: p.floors.map((x, j) => (j === i ? { ...x, [f]: v } : x)) }));
+  const [fill, setFill] = useState({ n: 8, cov: 70, eff: 85 });
+
+  useEffect(() => { loadList(); }, []);
+  const loadList = async () => {
+    const { data } = await supabase.from("models").select("id, data, owner_id, is_public").order("updated_at", { ascending: false });
+    setSaved((data || []).filter((r) => !String(r.id).startsWith(OPPS_PREFIX) && r.data?.kind !== "rental").map((r) => ({ ...r.data, isPublic: !!r.is_public, _owner: r.owner_id })));
+  };
+  const save = async () => {
+    setBusy(true);
+    const rec = { ...m, v: 2, ownerName: m.ownerName || userName, updated: new Date().toISOString().slice(0, 10) };
+    delete rec._owner;
+    setM(rec);
+    const { error } = await supabase.from("models").upsert({
+      id: rec.id, data: rec, owner_id: userId, is_public: !!rec.isPublic, updated_at: new Date().toISOString(),
+    });
+    setBusy(false);
+    if (error) notify?.(error.message || "Save failed.");
+    else { notify?.("Model saved."); loadList(); }
+  };
+  const del = async (id) => {
+    await supabase.from("models").delete().eq("id", id);
+    loadList();
+    if (m.id === id) setM(blankModel());
+  };
+
+  const applyDistrict = (district, street, devPath) => {
+    const v = district ? farFor(district, street) : null;
+    setM((p) => ({
+      ...p, district, street, devPath,
+      uapSF: devPath === "uap" ? p.uapSF : null,
+      far: v ? v.aor : p.far,
+      bonusFar: v ? (devPath === "uap" ? v.uap : 0) : p.bonusFar,
+    }));
+  };
+  const applyProgram = (prog) => {
+    const P = PROGRAMS[prog];
+    setM((p) => {
+      let pct = P.pct;
+      if (prog === "485x") pct = runCalc(p).totalUnits >= 100 ? 25 : 20;
+      const tiers = p.tiers.map((t, i) => (i === 0 ? { ...t, ami: P.ami, rents: hpdRents(P.ami) } : t));
+      const next = { ...p, program: prog, affMode: P.mode, affReqPct: pct, tiers };
+      if (prog === "uap" && p.devPath !== "uap") {
+        const v = p.district ? farFor(p.district, p.street) : null;
+        next.devPath = "uap";
+        if (v && v.uap) next.bonusFar = v.uap;
+      }
+      return next;
+    });
+  };
+  // UAP SF typed (or reset): refit the unit mix to the new envelope and refill the affordable tier to the requirement
+  const refitUap = (p) => {
+    const fitted = fitMix(p, runCalc(p).totalBSF);
+    return fitted.affMode === "uap" ? autoAffordable(fitted) : fitted;
+  };
+  const resetUap = () => setM((p) => refitUap({ ...p, uapSF: null }));
+  const applyBorough = (b) => {
+    const bc = costsFor(b);
+    setM((p) => ({ ...p, borough: b, hardCostPerBSF: bc.hard, softCostPct: bc.soft }));
+    notify?.(`${b || "Default"} costs: hard $${bc.hard}/SF, soft ${bc.soft}% of hard (editable)`);
+  };
+
+  const isSS = streetSensitive.includes(m.district);
+  const rental = c.rental, lease = c.lease;
+  const P = PROGRAMS[m.program] || PROGRAMS.market;
+  const bc = costsFor(m.borough);
+  const tierAmiOK = (m.tiers || []).every((t) => N(t.ami) <= 100);
+
+  return (
+    <div className="uw">
+      <header style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", gap: 14, flexWrap: "wrap", marginBottom: 20 }}>
+        <div>
+          <div className="eyebrow">Underwriting (classic) · compare only, not saved</div>
+          <h1 style={{ margin: "2px 0 8px", fontSize: 26, fontWeight: 800, letterSpacing: "-0.01em" }}>Development Site Model</h1>
+          <div className="dealline">
+            <span>Deal</span>
+            <input value={m.dealName} onChange={(e) => set("dealName", e.target.value)} />
+          </div>
+          <div className="dealline">
+            <span>Market</span>
+            <input value={m.marketArea} onChange={(e) => set("marketArea", e.target.value)} placeholder="Mott Haven, Bronx" />
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {onExit && <button className="ghost" onClick={onExit}>{exitLabel || "← Back to deal"}</button>}
+          <button className="ghost" onClick={() => setM(blankModel())}>New</button>
+          <button className="ghost" onClick={() => setSheet(true)}>Report / PDF</button>
+
+        </div>
+      </header>
+
+      {saved.length > 0 && (
+        <div className="savedStrip">
+          {saved.map((s) => (
+            <span key={s.id} className="savedChip">
+              <span onClick={() => setM(upgradeModel(s))}>{s.dealName}{s._owner && s._owner !== userId ? ` · ${s.ownerName || "shared"}` : ""}</span>
+            </span>
+          ))}
+        </div>
+      )}
+
+      <div className="segRow">
+        <div>
+          <div className="segLabel">Structure</div>
+          <div className="seg">
+            <button data-on={!lease} onClick={() => set("structure", "sale")}>Buy land</button>
+            <button data-on={lease} onClick={() => set("structure", "lease")}>Ground lease</button>
+          </div>
+        </div>
+        <div>
+          <div className="segLabel">Exit</div>
+          <div className="seg">
+            <button data-on={rental} onClick={() => set("dealType", "rental")}>Rental hold</button>
+            <button data-on={!rental} onClick={() => set("dealType", "condo")}>Condo sellout</button>
+          </div>
+        </div>
+        <div>
+          <div className="segLabel">Affordability program</div>
+          <div className="seg">
+            {[["market","Market"],["485x","485-x"],["uap","UAP"],["mih","MIH"]].map(([k, l]) => (
+              <button key={k} data-on={m.program === k} onClick={() => applyProgram(k)}>{l}</button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div className="uwGrid">
+        <div>
+          <Sec n="01" t="Site & Zoning" open>
+            <div className="fg2">
+              <F label="Zoning district" hint="auto-fills FAR">
+                <select value={m.district} onChange={(e) => applyDistrict(e.target.value, m.street, m.devPath)}>
+                  <option value="">Custom / manual FAR</option>
+                  {Object.keys(farDB).map((d) => <option key={d}>{d}</option>)}
+                </select>
+              </F>
+              <F label="Borough" hint="sets cost defaults">
+                <select value={m.borough || ""} onChange={(e) => applyBorough(e.target.value)}>
+                  <option value="">—</option>
+                  {BOROUGHS.map((b) => <option key={b}>{b}</option>)}
+                </select>
+              </F>
+              <F label="Street type" hint={isSS ? "affects FAR here" : "no effect here"}>
+                <select value={m.street} onChange={(e) => applyDistrict(m.district, e.target.value, m.devPath)} style={{ opacity: isSS ? 1 : 0.5 }}>
+                  <option value="narrow">Narrow street</option>
+                  <option value="wide">Wide street</option>
+                </select>
+              </F>
+              <F label="Development path">
+                <select value={m.devPath} onChange={(e) => applyDistrict(m.district, m.street, e.target.value)}>
+                  <option value="aor">As-of-right</option>
+                  <option value="uap">City of Yes — UAP</option>
+                </select>
+              </F>
+              <F label="Lot size" hint="SF">{num("lotSF")}</F>
+              <F label="Base FAR" hint="as-of-right">{num("far", "0.01")}</F>
+              <F label="Bonus FAR" hint="UAP etc · 0 = base">{num("bonusFar", "0.01")}</F>
+              {c.autoBonusBSF > 0 && (
+                <F label="UAP affordable SF" hint={c.uapEdited ? "your number" : "auto"}>
+                  <input type="number" inputMode="decimal" step="any" value={c.uapEdited ? m.uapSF : Math.round(c.autoBonusBSF)}
+                    onChange={(e) => set("uapSF", e.target.value)}
+                    onBlur={() => setM((p) => refitUap(p))}
+                    onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }} />
+                  <div className="uapNote">
+                    {c.uapEdited
+                      ? <>Auto {fmt(c.autoBonusBSF)} · edited <button className="linkBtn inline" onClick={resetUap}>reset to auto</button>
+                          {c.bonusBSF > c.autoBonusBSF + 0.5 && <b style={{ color: RED }}> · above UAP max</b>}</>
+                      : <>UAP affordable SF (auto): {fmt(c.autoBonusBSF)}</>}
+                  </div>
+                </F>
+              )}
+              <F label="Overlay / special" hint="optional">
+                <input value={m.overlay} onChange={(e) => set("overlay", e.target.value)} placeholder="C2-4 overlay" />
+              </F>
+              <F label="Air rights / neighbor transfer" hint="BSF">{num("airRightsSF")}</F>
+              <F label="Air rights price" hint="$ / BSF">{num("airRightsPSF")}</F>
+            </div>
+            <div className="derived">
+              Lot {fmt(c.lotSF)} × FAR {c.baseFAR.toFixed(2)} = {fmt(c.baseBSF)} BSF
+              {c.bonusBSF > 0 && <> + {fmt(c.bonusBSF)} {c.uapEdited ? "UAP (your number)" : "bonus"}</>}
+              {c.airSF > 0 && <> + {fmt(c.airSF)} transfer</>}
+              {" "}= <b>{fmt(c.totalBSF)} total BSF</b> · zoning max ≈ {c.maxUnitsByZoning} units (680 SF factor)
+            </div>
+          </Sec>
+
+          <Sec n="02" t="Unit Mix & Building" open>
+            <div className="tableWrap">
+              <table className="rr">
+                <thead><tr><th>Type</th><th>Avg net SF</th><th>Units</th><th>Market rent / mo</th><th>Mkt · Aff</th></tr></thead>
+                <tbody>
+                  {UNIT_TYPES.map(([t, label]) => {
+                    const r = c.rows.find((x) => x.type === t);
+                    return (
+                      <tr key={t}>
+                        <td>{label}</td>
+                        <td><input type="number" inputMode="decimal" value={m.mix[t].sf} onChange={(e) => setMix(t, "sf", e.target.value)} /></td>
+                        <td><input type="number" inputMode="decimal" value={m.mix[t].units} onChange={(e) => setMix(t, "units", e.target.value)} /></td>
+                        <td><input type="number" inputMode="decimal" value={m.mix[t].rent} onChange={(e) => setMix(t, "rent", e.target.value)} /></td>
+                        <td className={"mono" + (r.over ? " bad" : "")}>{r.mktU} · {r.affU}</td>
+                      </tr>
+                    );
+                  })}
+                  <tr className="tot"><td>Total</td><td>{fmt(c.resiNetSF)} SF</td><td>{fmt(c.totalUnits)}</td><td>{c.totalUnits ? money(c.avgRentUnit) + " avg" : "—"}</td><td className="mono">{c.marketUnits} · {c.affUnits}</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div className="fg2">
+              <F label="Gross-up for walls / common" hint="% on net">{num("addonPct")}</F>
+              <F label="Retail / commercial" hint="SF (zoning floor area)">{num("retailSF")}</F>
+              <F label="Cellar / other gross" hint="SF · cost only">{num("otherGSF")}</F>
+              <F label="Building GSF override" hint="0 = calculated">{num("gsfOverride")}</F>
+            </div>
+            <div className="derived">
+              Resi net {fmt(c.resiNetSF)} SF × {(1 + N(m.addonPct) / 100).toFixed(2)} = {fmt(c.resiGSF)} gross
+              {c.retailSF > 0 && <> + {fmt(c.retailSF)} retail</>} = {fmt(c.zfaUsed)} SF vs {fmt(c.totalBSF)} BSF →{" "}
+              <b style={{ color: c.bsfLeft < -1 ? RED : undefined }}>
+                {c.bsfLeft >= 0 ? `${fmt(c.bsfLeft)} BSF unused` : `${fmt(-c.bsfLeft)} SF over zoning`}
+              </b>
+              <br />Building {fmt(c.GSF)} GSF{N(m.gsfOverride) > 0 ? " (override)" : ""} drives hard cost
+            </div>
+            <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+              <button className="mini tall" onClick={() => setM((p) => fitMix(p, runCalc(p).totalBSF))}>Fit units to BSF</button>
+              {N(m.gsfOverride) > 0 && <button className="mini tall" onClick={() => set("gsfOverride", 0)}>Use calculated GSF</button>}
+            </div>
+          </Sec>
+
+          <Sec n="03" t={`Affordable — ${m.program === "market" ? "set-aside" : m.program.toUpperCase()}`} open>
+            <div className="subnote" style={{ marginTop: 10 }}>{P.label}</div>
+            <div className="fg2">
+              <F label="Requirement basis">
+                <select value={m.affMode} onChange={(e) => set("affMode", e.target.value)}>
+                  {REQ_MODES.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+                </select>
+              </F>
+              {(m.affMode === "sf" || m.affMode === "units") && <F label="Required" hint="%">{num("affReqPct", "1")}</F>}
+              {m.affMode === "uap" && <F label="UAP bonus floor area" hint="from Site"><input readOnly value={fmt(c.bonusBSF) + " BSF"} /></F>}
+            </div>
+            {m.tiers.map((tr, i) => (
+              <div key={i}>
+                <div className="rrHead" style={{ marginTop: 16 }}>
+                  <span>Affordable tier {i + 1}</span>
+                  <span style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                    <select className="amiSel" value={tr.ami} onChange={(e) => setTierAmi(i, e.target.value)}>
+                      {AMI_LEVELS.map((a) => <option key={a} value={a}>{a}% AMI</option>)}
+                    </select>
+                    {m.tiers.length > 1 && <button className="mini" onClick={() => delTier(i)}>✕</button>}
+                  </span>
+                </div>
+                <div className="tableWrap">
+                  <table className="rr">
+                    <thead><tr><th>Type</th><th>Aff. units</th><th>Affordable rent</th><th>vs market</th></tr></thead>
+                    <tbody>
+                      {UNIT_TYPES.map(([t, label]) => (
+                        <tr key={t}>
+                          <td>{label}</td>
+                          <td><input type="number" inputMode="decimal" value={tr.units[t]} onChange={(e) => setTierU(i, t, e.target.value)} /></td>
+                          <td><input type="number" inputMode="decimal" value={N(tr.rents[t]) - N(m.utilAllow?.[t])} onChange={(e) => setTierR(i, t, N(e.target.value) + N(m.utilAllow?.[t]))} /></td>
+                          <td className="mono">{N(m.mix[t].rent) ? "-" + money(N(m.mix[t].rent) - N(tr.rents[t]) + N(m.utilAllow?.[t])) : "—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ))}
+            <details className="hpdRef">
+              <summary>HPD max reference · {RENT_DEDUCTION_LABEL.toLowerCase()}</summary>
+              <div className="tableWrap">
+                <table className="rr">
+                  <thead><tr><th></th>{UNIT_TYPES.map(([t]) => <th key={t}>{UT_SHORT[t]}</th>)}</tr></thead>
+                  <tbody>
+                    {m.tiers.map((tr, i) => <tr key={i}><td className="mono">HPD max {tr.ami}%</td>{UNIT_TYPES.map(([t]) => <td key={t} className="mono">{money(N(tr.rents[t]))}</td>)}</tr>)}
+                    <tr><td className="mono">Deduction</td>{UNIT_TYPES.map(([t]) => (
+                      <td key={t}><input type="number" inputMode="decimal" value={m.utilAllow?.[t] ?? 0} onChange={(e) => setM((p) => ({ ...p, utilAllow: { ...p.utilAllow, [t]: e.target.value } }))} /></td>
+                    ))}</tr>
+                  </tbody>
+                </table>
+              </div>
+            </details>
+            <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+              {m.affMode !== "none" && <button className="mini tall" onClick={() => setM((p) => autoAffordable(p))}>Auto-fill to requirement</button>}
+              {m.tiers.length < 3 && <button className="mini tall" onClick={addTier}>+ AMI tier</button>}
+              <button className="mini tall" onClick={() => setM((p) => ({ ...p, utilAllow: typeMap((t) => RENT_DEDUCTION[t] ?? 0), tiers: p.tiers.map((t) => ({ ...t, rents: hpdRents(N(t.ami)) })) }))}>Reset to default rents</button>
+            </div>
+            <div className="subnote">Affordable rent = your basis: {DEFAULT_AMI}% AMI {UNIT_TYPES.map(([t]) => UT_SHORT[t] + " " + money((HPD_RENTS[DEFAULT_AMI]?.[t] || 0) - (RENT_DEDUCTION[t] || 0))).join(" · ")}. Other AMI levels = HPD max less the same deduction. Edit any rent to match the term sheet.</div>
+            <div className="chk">
+              <div><span>Required</span><b>{m.affMode === "none" ? "—" : m.affMode === "units" ? `${c.affReqUnits} units` : `${fmt(c.affReqSF)} SF`}</b>
+                <em>{m.affMode === "units" ? `≈ ${fmt(c.affReqSF)} SF` : m.affMode === "none" ? "no set-aside" : `${c.resiNetSF ? pct(c.affReqSF / c.resiNetSF * 100) : "—"} of resi net SF`}</em></div>
+              <div><span>Provided</span><b>{fmt(c.affSF)} SF</b><em>{c.affUnits} units · {c.totalUnits ? pct(c.affUnits / c.totalUnits * 100) : "—"} of units</em></div>
+              <div className={c.affMet ? "ok" : "no"}><span>{c.affMet ? "Surplus" : "Shortfall"}</span>
+                <b>{m.affMode === "units" ? `${c.affSurplusUnits > 0 ? "+" : ""}${c.affSurplusUnits} units` : `${c.affSurplusSF > 0 ? "+" : ""}${fmt(c.affSurplusSF)} SF`}</b>
+                <em>{m.affMode === "none" ? "" : c.affMet ? "requirement met" : "add affordable units"}</em></div>
+              <div><span>Weighted avg AMI</span><b>{c.affUnits ? Math.round(c.affAvgAmi) + "%" : "—"}</b><em>{P.avg ? `program target ≤ ${P.avg}%` : "by units"}{!tierAmiOK ? " · a tier is over 100%" : ""}</em></div>
+              <div><span>Revenue given up</span><b>{money(c.lostM)}/mo</b><em>{money(c.lostYr)}/yr vs all-market</em></div>
+              <div><span>Value given up</span><b>{kMoney(c.lostValue)}</b><em>@ {N(m.exitCapRatePct).toFixed(2)}% cap</em></div>
+            </div>
+            {c.overAlloc && <div className="warn">More affordable units than total units for a type — fix the unit mix.</div>}
+          </Sec>
+
+          <Sec n="04" t={lease ? "Acquisition — Ground Lease" : "Acquisition — Land Purchase"} open>
+            <div className="fg2">
+              {lease ? (
+                <>
+                  <F label="Key money" hint="$ upfront">{num("keyMoney")}</F>
+                  <F label="Ground rent" hint="$ / yr (expense)">{num("groundRentYr")}</F>
+                  <F label="Free rent in construction" hint="months">{num("groundRentFreeMonths")}</F>
+                </>
+              ) : (
+                <F label="Purchase price" hint="$">{num("purchasePrice")}</F>
+              )}
+              <F label="Closing costs" hint={`% of ${lease ? "key money" : "price"}`}>{num("closingCostPct", "0.1")}</F>
+              <F label="Other acquisition costs" hint="$">{num("otherAcqCosts")}</F>
+              <F label="Credits / grants" hint="$ — reduces basis">{num("creditsAmt")}</F>
+              <F label="Credit label">
+                <input value={m.creditsLabel || ""} onChange={(e) => set("creditsLabel", e.target.value)} placeholder="Brownfield / other credits" />
+              </F>
+            </div>
+            <div className="derived">
+              Acquisition {money(c.totalAcq)} · {psf(c.per(c.totalAcq).bsf)}/BSF{c.totalUnits ? ` · ${money(c.per(c.totalAcq).unit)}/unit` : ""}
+              {lease && N(m.groundRentYr) > 0 && <><br />Ground rent {money(m.groundRentYr)}/yr · {psf(N(m.groundRentYr) / (c.totalBSF || 1))}/BSF/yr</>}
+            </div>
+          </Sec>
+
+          <Sec n="05" t="Hard, Soft & Carrying Costs" open>
+            <div className="fg2">
+              <F label="Hard cost" hint={`$/gross SF · ${m.borough || "default"} $${bc.hard}`}>{num("hardCostPerBSF")}</F>
+              <F label="Soft cost" hint={`% of hard · default ${bc.soft}%`}>{num("softCostPct", "0.5")}</F>
+              <F label="Hard contingency" hint="% on top">{num("hardContingencyPct", "0.5")}</F>
+              <F label="Construction period" hint="months">{num("constructionMonths")}</F>
+              <F label="Construction loan" hint="% LTC">{num("ltcPct")}</F>
+              <F label="Construction rate" hint="%">{num("interestRatePct", "0.125")}</F>
+              <F label="Avg loan drawn" hint="% over period">{num("avgOutstandingPct")}</F>
+              <F label="Loan fees" hint="% of loan">{num("originationFeePct", "0.25")}</F>
+              <F label="RE taxes in construction" hint="$ / yr">{num("cTaxesYr")}</F>
+              <F label="Insurance (builder's risk + GL)" hint="% of hard">{num("cInsurancePct", "0.25")}</F>
+            </div>
+            <div className="rrHead" style={{ marginTop: 18 }}><span>Development budget</span><em>{fmt(c.totalBSF)} BSF · {fmt(c.GSF)} GSF · {c.totalUnits} units</em></div>
+            <BudgetTable m={m} c={c} />
+          </Sec>
+
+          {rental ? (
+            <Sec n="06" t="Income & Expenses" open>
+              <div className="fg2">
+                <F label="Resi vacancy" hint="%">{num("vacancyPct", "0.5")}</F>
+                <F label="Retail rent" hint="$ / SF / yr">{num("retailPSF")}</F>
+                <F label="Parking spaces">{num("parkingSpaces")}</F>
+                <F label="Parking rent" hint="$ / mo">{num("parkingRent")}</F>
+                <F label="Other income" hint="$ / yr">{num("otherIncomeYr")}</F>
+                <F label="Retail vacancy" hint="%">{num("commVacancyPct", "0.5")}</F>
+                <F label="Resi operating exp." hint="$ / unit / yr">{num("opexPerUnit")}</F>
+                <F label="Mgmt / other" hint="% of EGI">{num("mgmtPct", "0.5")}</F>
+                <F label="Retail expenses" hint="% of retail income">{num("retailExpPct", "0.5")}</F>
+                <F label="RE tax (485-x / abated)" hint="$ / yr">{num("propertyTaxAnnual")}</F>
+                <F label="Exit cap rate" hint="%">{num("exitCapRatePct", "0.05")}</F>
+              </div>
+              <div className="derived">
+                Market resi {money(c.mktResiM)}/mo · affordable {money(c.affResiM)}/mo · avg {money(c.avgRentUnit)}/unit · {psf(c.rentPSF)}/net SF/yr
+                <br />Gross {money(c.GPI)} − vacancy {money(c.vacancy)} − expenses {money(c.opexTotal)}{lease ? " (incl. ground rent)" : ""} = <b>NOI {money(c.NOI)}</b>
+              </div>
+            </Sec>
+          ) : (
+            <Sec n="06" t="Sellout & Retail" open>
+              <div className="fg2">
+                <F label="Market sellout" hint="$ / net SF">{num("marketSellPSF")}</F>
+                <F label="Affordable sellout" hint="$ / net SF">{num("affordableSellPSF")}</F>
+                <F label="Selling costs" hint="% commission + legal">{num("sellingCostPct", "0.5")}</F>
+                <F label="Retail rent" hint="$ / SF / yr">{num("retailPSF")}</F>
+                <F label="Retail vacancy" hint="%">{num("commVacancyPct", "0.5")}</F>
+                <F label="Retail expenses" hint="% of retail income">{num("retailExpPct", "0.5")}</F>
+                <F label="Retail cap rate" hint="values retained retail">{num("commCapRate", "0.05")}</F>
+              </div>
+              <div className="derived">
+                Sellout {money(c.sellGross)} − costs {money(c.sellCosts)} = {money(c.sellNet)}{c.retailValue > 0 ? ` + retail ${money(c.retailValue)}` : ""}
+              </div>
+            </Sec>
+          )}
+
+          {rental && (
+            <Sec n="07" t="Permanent Loan & Cash Flow" open>
+              <div className="fg2">
+                <F label="Loan" hint="% of all-in · cash = rest">{num("permLoanPct")}</F>
+                <F label="Or loan amount" hint="$ · 0 = use %">{num("permLoanAmt")}</F>
+                <F label="Rate" hint="%">{num("permRatePct", "0.125")}</F>
+                <F label="Amortization" hint="years">{num("permAmortYrs")}</F>
+              </div>
+              <div className="tableWrap" style={{ marginTop: 14 }}>
+                <table className="rr num">
+                  <thead><tr><th></th><th>Debt service / yr</th><th>Cash flow</th><th>DSCR</th></tr></thead>
+                  <tbody>
+                    <tr><td>Amortizing</td><td>{money(c.dsAmort)}</td><td>{sMoney(c.cfAmort)}</td><td>{x2(c.dscr)}</td></tr>
+                    <tr><td>Interest-only</td><td>{money(c.dsIO)}</td><td>{sMoney(c.cfIO)}</td><td>{x2(c.dscrIO)}</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <div className="derived">
+                Loan {money(c.permLoan)} · cash required {money(c.equityIn)} ({pct(c.cashPct)}) · cash-on-cash {pct(c.coc)} · debt yield {pct(c.debtYield)}
+                <br />Max loan at 1.25x DSCR ≈ {money(c.maxLoan125)}
+              </div>
+            </Sec>
+          )}
+
+          {rental && (
+            <Sec n="08" t="Condo Exit Check (optional)">
+              <div className="fg2">
+                <F label="Market sellout" hint="$ / net SF">{num("marketSellPSF")}</F>
+                <F label="Affordable sellout" hint="$ / net SF">{num("affordableSellPSF")}</F>
+                <F label="Selling costs" hint="%">{num("sellingCostPct", "0.5")}</F>
+                <F label="Retail cap rate" hint="%">{num("commCapRate", "0.05")}</F>
+              </div>
+              <div className="derived">
+                If sold as condos: {money(c.sellNet + c.retailValue)} net → profit <b style={{ color: c.condoProfit < 0 ? RED : undefined }}>{sMoney(c.condoProfit)}</b> ({pct(c.condoMargin)} on cost) vs rental equity created {sMoney(c.equityCreated)}
+              </div>
+            </Sec>
+          )}
+
+          <Sec n={rental ? "09" : "07"} t="Massing Check (optional)">
+            <div className="fg2" style={{ gridTemplateColumns: "1fr 1fr 1fr" }}>
+              <F label="Floors"><input type="number" inputMode="decimal" value={fill.n} onChange={(e) => setFill({ ...fill, n: e.target.value })} /></F>
+              <F label="Coverage" hint="%"><input type="number" inputMode="decimal" value={fill.cov} onChange={(e) => setFill({ ...fill, cov: e.target.value })} /></F>
+              <F label="Efficiency" hint="%"><input type="number" inputMode="decimal" value={fill.eff} onChange={(e) => setFill({ ...fill, eff: e.target.value })} /></F>
+            </div>
+            <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+              <button className="mini tall" onClick={() => set("floors", Array.from({ length: Math.min(60, Math.max(0, Math.round(N(fill.n)))) }, () => ({ cov: fill.cov, eff: fill.eff })))}>Fill floors</button>
+              <button className="mini tall" onClick={() => set("floors", [...(m.floors || []), { cov: fill.cov, eff: fill.eff }])}>+ Floor</button>
+            </div>
+            {(m.floors || []).length > 0 && (
+              <MassingTable m={m} c={c} setFloor={setFloor} onDel={(i) => set("floors", m.floors.filter((_, j) => j !== i))} onReserve={(v) => set("massReserveSF", v)} />
+            )}
+          </Sec>
+
+          <Sec n={rental ? "10" : "08"} t="Sensitivity" open>
+            <SensTable s={sens} m={m} />
+          </Sec>
+        </div>
+
+        <div className="uwSum">
+          <div className="sumHead">
+            <span>Summary</span>
+            <span>{lease ? "LEASE" : "SALE"} · {rental ? "RENTAL" : "CONDO"} · {m.program.toUpperCase()}</span>
+          </div>
+          <div style={{ padding: "6px 18px 18px" }}>
+            <div className="divLabel">Development cost <i>total · $/BSF</i></div>
+            <Row l="Hard cost" v={money(c.totalHard)} s={psf(c.per(c.totalHard).bsf)} />
+            <Row l="Soft cost" v={money(c.totalSoft)} s={psf(c.per(c.totalSoft).bsf)} />
+            <Row l="Carrying cost" v={money(c.totalCarry)} s={psf(c.per(c.totalCarry).bsf)} />
+            <Row l={lease ? "Key money + acq." : "Acquisition"} v={money(c.totalAcq)} s={psf(c.per(c.totalAcq).bsf)} />
+            <Row l="Total project cost" v={money(c.TPC)} s={psf(c.per(c.TPC).bsf)} total />
+            {c.credits > 0 && <Row l={"Less " + (m.creditsLabel || "credits")} v={"-" + money(c.credits)} />}
+            {c.credits > 0 && <Row l="Net cost (basis)" v={money(c.netCost)} s={psf(c.per(c.netCost).bsf)} total />}
+            <div className="divLabel">{rental ? "Stabilized" : "Sellout"}</div>
+            {rental ? (
+              <>
+                <Row l="Effective gross income" v={money(c.EGI)} />
+                <Row l="Expenses" v={money(c.opexTotal)} />
+                <Row l="Net operating income" v={money(c.NOI)} />
+                <Row l={`Value @ ${N(m.exitCapRatePct).toFixed(2)}% cap`} v={money(c.exitValue)} total />
+                <div className="divLabel">Financing <i>total · % of cost</i></div>
+                <Row l="Loan" v={money(c.permLoan)} s={pct(100 - c.cashPct)} />
+                <Row l="Cash required" v={money(c.equityIn)} s={pct(c.cashPct) + (c.totalUnits ? " · " + kMoney(c.equityIn / c.totalUnits) + "/unit" : "")} total />
+              </>
+            ) : (
+              <>
+                <Row l="Gross sellout" v={money(c.sellGross)} />
+                <Row l="Net sellout + retail" v={money(c.sellNet + c.retailValue)} total />
+              </>
+            )}
+            <div className={"profit" + (c.profit < 0 ? " neg" : "")}>
+              <div className="pl">{rental ? "Equity created" : "Projected profit"}</div>
+              <div className="pv">{sMoney(c.profit)}</div>
+            </div>
+            <div className="mcards">
+              {rental ? (
+                <>
+                  <MC l="Yield on cost" v={pct(c.yieldOnCost)} good={c.yieldOnCost >= N(m.exitCapRatePct)} />
+                  <MC l={c.credits > 0 ? "Yield on net cost" : "Margin on cost"} v={pct(c.credits > 0 ? c.yieldOnNet : c.margin)} />
+                  <MC l="DSCR (amort.)" v={x2(c.dscr)} good={c.dscr >= 1.25} />
+                  <MC l="Cash-on-cash" v={pct(c.coc)} />
+                </>
+              ) : (
+                <>
+                  <MC l="Margin on cost" v={pct(c.condoMargin)} good={c.condoMargin >= 0} />
+                  <MC l="Margin on revenue" v={pct(c.condoMarginRev)} />
+                </>
+              )}
+              <MC l="All-in / BSF" v={psf(c.per(c.netCost).bsf)} />
+              <MC l="All-in / unit" v={c.totalUnits > 0 ? kMoney(c.per(c.netCost).unit) : "—"} />
+              <MC l="Affordable" v={m.affMode === "none" ? "None" : c.affMet ? "Met ✓" : "Short"} good={m.affMode === "none" ? undefined : c.affMet} />
+              <MC l="Units" v={`${c.marketUnits}+${c.affUnits}`} />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="foot">Editable defaults, not advice — verify 485-x / UAP / MIH rules, HPD rents and costs before circulating.</div>
+      {sheet && <ClientSheet m={m} c={c} sens={sens} onClose={() => setSheet(false)} />}
+    </div>
+  );
+}
+
+/* ---------- shared tables (screen + report) ---------- */
+function budgetRows(m, c) {
+  const L = c.lease;
+  return [
+    { l: `Hard cost — ${fmt(c.GSF)} GSF × $${fmt(N(m.hardCostPerBSF))}`, v: c.hardBase, sub: true, hide: !c.contingency },
+    { l: `Contingency (${N(m.hardContingencyPct)}%)`, v: c.contingency, sub: true, hide: !c.contingency },
+    { l: c.contingency ? "Hard cost" : `Hard cost (${fmt(c.GSF)} GSF × $${fmt(N(m.hardCostPerBSF))})`, v: c.totalHard, k: "head" },
+    { l: `Soft cost (${N(m.softCostPct)}% of hard)`, v: c.totalSoft, k: "head" },
+    { l: `Interest — ${N(m.interestRatePct)}% on ${money(c.constrLoan)} loan, ${N(m.constructionMonths)} mo, ${N(m.avgOutstandingPct)}% avg drawn`, v: c.cInterest, sub: true },
+    { l: `Loan fees (${N(m.originationFeePct)}%)`, v: c.cFees, sub: true, hide: !c.cFees },
+    { l: `RE taxes during construction (${N(m.constructionMonths)} mo)`, v: c.cTaxes, sub: true },
+    { l: `Insurance (${N(m.cInsurancePct)}% of hard)`, v: c.cInsurance, sub: true },
+    { l: `Ground rent during construction`, v: c.cGround, sub: true, hide: !L },
+    { l: "Carrying cost", v: c.totalCarry, k: "head" },
+    { l: "Construction subtotal (hard + soft + carrying)", v: c.constrSubtotal, k: "sub2" },
+    { l: L ? "Key money" : "Land purchase", v: c.price, sub: true },
+    { l: `Closing costs (${N(m.closingCostPct)}%)`, v: c.closing, sub: true, hide: !c.closing },
+    { l: "Other acquisition costs", v: c.otherAcq, sub: true, hide: !c.otherAcq },
+    { l: `Air rights (${fmt(c.airSF)} SF × $${fmt(N(m.airRightsPSF))})`, v: c.airCost, sub: true, hide: !c.airCost },
+    { l: L ? "Acquisition (ground lease)" : "Acquisition", v: c.totalAcq, k: "head" },
+    { l: "TOTAL PROJECT COST", v: c.TPC, k: "tot" },
+    { l: "Less: " + (m.creditsLabel || "credits"), v: -c.credits, k: "head", hide: !c.credits },
+    { l: "NET PROJECT COST (basis)", v: c.netCost, k: "tot", hide: !c.credits },
+  ].filter((r) => !r.hide);
+}
+function BudgetTable({ m, c, sheet }) {
+  const rows = budgetRows(m, c);
+  return (
+    <div className={sheet ? "shWrap" : "tableWrap"}>
+      <table className={(sheet ? "shTable bud" : "rr bud")}>
+        <thead><tr><th>Line</th><th>Total</th><th>$/BSF</th><th>$/GSF</th><th>Per unit</th><th>%</th></tr></thead>
+        <tbody>
+          {rows.map((r, i) => {
+            const p = c.per(r.v);
+            return (
+              <tr key={i} className={r.sub ? "sub" : r.k || ""}>
+                <td>{r.l}</td>
+                <td>{sMoney(r.v)}</td>
+                <td>{r.sub ? "" : psf(p.bsf)}</td>
+                <td>{r.sub ? "" : psf(p.gsf)}</td>
+                <td>{r.sub || !c.totalUnits ? "" : psf(p.unit)}</td>
+                <td>{r.sub || !c.TPC ? "" : pct(r.v / c.TPC * 100)}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+function MassingTable({ m, c, setFloor, onDel, onReserve }) {
+  const lot = c.lotSF;
+  let gross = 0, net = 0;
+  const rows = (m.floors || []).map((f) => { const plate = lot * N(f.cov) / 100; const n = plate * N(f.eff) / 100; gross += plate; net += n; return { plate, n }; });
+  const resiNet = net - N(m.massReserveSF);
+  return (
+    <>
+      <div className="tableWrap" style={{ marginTop: 12 }}>
+        <table className="rr">
+          <thead><tr><th>Floor</th><th>Coverage %</th><th>Plate SF</th><th>Eff. %</th><th>Net SF</th><th></th></tr></thead>
+          <tbody>
+            {(m.floors || []).map((f, i) => (
+              <tr key={i}>
+                <td>{i + 1}</td>
+                <td><input type="number" inputMode="decimal" value={f.cov} onChange={(e) => setFloor(i, "cov", e.target.value)} /></td>
+                <td className="mono">{fmt(rows[i].plate)}</td>
+                <td><input type="number" inputMode="decimal" value={f.eff} onChange={(e) => setFloor(i, "eff", e.target.value)} /></td>
+                <td className="mono">{fmt(rows[i].n)}</td>
+                <td><button className="mini" onClick={() => onDel(i)}>✕</button></td>
+              </tr>
+            ))}
+            <tr className="tot"><td>Total</td><td></td><td className="mono">{fmt(gross)}</td><td></td><td className="mono">{fmt(net)}</td><td></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div className="fg2"><F label="Reserve (bulkhead, amenities)" hint="net SF"><input type="number" inputMode="decimal" value={m.massReserveSF} onChange={(e) => onReserve(e.target.value)} /></F></div>
+      <div className="derived">
+        Massing {fmt(gross)} SF vs {fmt(c.totalBSF)} BSF → <b style={{ color: gross - c.totalBSF > 1 ? RED : undefined }}>{gross <= c.totalBSF ? `${fmt(c.totalBSF - gross)} under` : `${fmt(gross - c.totalBSF)} over`}</b>
+        <br />Net {fmt(net)} − reserve {fmt(N(m.massReserveSF))} = {fmt(resiNet)} SF vs unit mix {fmt(c.resiNetSF)} SF
+      </div>
+    </>
+  );
+}
+function SensTable({ s, m, sheet }) {
+  const base = (i, j) => i === 2 && j === 2;
+  return (
+    <>
+      <div className={sheet ? "" : "subnote"} style={sheet ? { fontSize: 12, color: "#6a6558", marginBottom: 8 } : { marginTop: 10 }}>
+        {s.rental ? "Equity created (value − net cost) by hard cost $/GSF (rows) × exit cap rate (columns); yield on cost under each." : "Profit by hard cost $/GSF (rows) × market sellout $/SF (columns)."}
+      </div>
+      <div className={sheet ? "shWrap" : "tableWrap"} style={{ marginTop: 8 }}>
+        <table className={(sheet ? "shTable" : "rr") + " sens"}>
+          <thead><tr><th>Hard \ {s.rental ? "Cap" : "$/SF"}</th>{s.colsV.map((v, j) => <th key={j}>{s.rental ? v.toFixed(2) + "%" : "$" + fmt(v)}</th>)}</tr></thead>
+          <tbody>
+            {s.rowsV.map((h, i) => (
+              <tr key={i}>
+                <td>${fmt(h)}</td>
+                {s.grid[i].map((g, j) => (
+                  <td key={j} className={(g.profit < 0 ? "neg" : "pos") + (base(i, j) ? " base" : "")}>
+                    {kMoney(g.profit)}{s.rental && <small>{pct(g.yoc)}</small>}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
+/* ---------- little pieces ---------- */
+function Sec({ n, t, open, children }) {
+  const [o, setO] = useState(!!open);
+  return (
+    <div className="sec">
+      <div className="secHead" onClick={() => setO(!o)}>
+        <span className="secNum">{n}</span>
+        <span className="secTitle">{t}</span>
+        <span className="secChev" style={{ transform: o ? "rotate(90deg)" : "none" }}>▸</span>
+      </div>
+      {o && <div className="secBody">{children}</div>}
+    </div>
+  );
+}
+function F({ label, hint, children }) {
+  return (
+    <div className="uwField">
+      <label>{label}{hint && <em>{hint}</em>}</label>
+      {children}
+    </div>
+  );
+}
+function Row({ l, v, s, total }) {
+  return <div className={"ledger" + (total ? " total" : "")}><span>{l}</span><b>{v}{s && <small>{s}</small>}</b></div>;
+}
+function MC({ l, v, good }) {
+  return (
+    <div className="mcard">
+      <div className="ml">{l}</div>
+      <div className="mv" data-good={good === undefined ? undefined : good}>{v}</div>
+    </div>
+  );
+}
+
+/* ---------- report sheet (screen → Print / Save as PDF) ---------- */
+function ClientSheet({ m, c, sens, onClose }) {
+  const rental = c.rental, lease = c.lease;
+  const P = PROGRAMS[m.program] || PROGRAMS.market;
+  const zdLabel = m.district
+    ? m.district + (streetSensitive.includes(m.district) ? ` — ${m.street === "wide" ? "Wide street" : "Narrow street"}` : "")
+    : "—";
+  const openClean = () => {
+    const html = document.getElementById("uw-sheet")?.outerHTML || "";
+    const css = document.getElementById("jrg-styles")?.textContent || "";
+    const w = window.open("", "_blank");
+    if (w) {
+      w.document.open();
+      w.document.write(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${m.dealName}</title><style>${css}
+body{background:#f2efe6;margin:0;padding:24px;}
+#uw-sheet{box-shadow:none;margin:0 auto;max-width:860px}</style></head><body>${html}</body></html>`);
+      w.document.close();
+    }
+  };
+  const IR = ({ l, mo, yr, neg, b }) => (
+    <tr className={b ? "tot" : ""}><td>{l}</td><td>{mo == null ? "" : sMoney(neg ? -mo : mo)}</td><td>{sMoney(neg ? -yr : yr)}</td></tr>
+  );
+  const affRows = c.rows.filter((r) => r.parts.length);
+  useEffect(() => { document.body.classList.add("uwPrint"); return () => document.body.classList.remove("uwPrint"); }, []);
+  return createPortal(<div className="uwPortal">
+    <div className="modalWrap" onClick={onClose}>
+      <div style={{ width: 860, maxWidth: "100%" }} onClick={(e) => e.stopPropagation()}>
+        <div className="sheet" id="uw-sheet">
+          <div className="shTop">
+            <div>
+              <img className="shLogo" src={LOGO_FULL} alt="J Stone Realty Group" />
+              <div className="shBrand">Development Underwriting</div>
+              <div className="shTitle">{m.dealName}</div>
+              <div className="shSub">
+                {[m.marketArea, lease ? "Ground lease" : "Land purchase", rental ? "Rental hold" : "Condo sellout", m.program === "market" ? "Free market" : m.program.toUpperCase()].filter(Boolean).join(" · ")}
+              </div>
+            </div>
+            <div className="shDate">{new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })}</div>
+          </div>
+
+          <div className="shKpis">
+            <div><span>Total project cost</span><b>{kMoney(c.TPC)}</b><em>{psf(c.per(c.TPC).bsf)}/BSF · {c.totalUnits ? kMoney(c.per(c.TPC).unit) + "/unit" : ""}</em></div>
+            {rental ? (
+              <>
+                <div><span>NOI</span><b>{kMoney(c.NOI)}</b><em>yield on cost {pct(c.yieldOnCost)}</em></div>
+                <div><span>Value @ {N(m.exitCapRatePct).toFixed(2)}% cap</span><b>{kMoney(c.exitValue)}</b><em>{c.totalUnits ? kMoney(c.exitValue / c.totalUnits) + "/unit" : ""}</em></div>
+                <div><span>Equity created</span><b className={c.equityCreated < 0 ? "neg" : ""}>{kMoney(c.equityCreated)}</b><em>{pct(c.margin)} on {c.credits ? "net " : ""}cost</em></div>
+              </>
+            ) : (
+              <>
+                <div><span>Net sellout</span><b>{kMoney(c.sellNet + c.retailValue)}</b><em>{psf(N(m.marketSellPSF))}/SF market</em></div>
+                <div><span>Profit</span><b className={c.condoProfit < 0 ? "neg" : ""}>{kMoney(c.condoProfit)}</b><em>{pct(c.condoMargin)} on cost</em></div>
+              </>
+            )}
+          </div>
+
+          <div className="shSec">
+            <div className="shH">Site & Zoning</div>
+            <div className="shGrid">
+              <SR l="Zoning district" v={zdLabel} />
+              <SR l="Development path" v={m.devPath === "uap" ? "City of Yes — UAP" : "As-of-right"} />
+              {m.overlay && <SR l="Overlay" v={m.overlay} />}
+              {m.borough && <SR l="Borough" v={m.borough} />}
+              <SR l="Lot size" v={fmt(c.lotSF) + " SF"} />
+              <SR l="FAR (base / with bonus)" v={c.baseFAR.toFixed(2) + " / " + c.effFAR.toFixed(2)} />
+              <SR l="Base BSF" v={fmt(c.baseBSF)} />
+              {c.bonusBSF > 0 && <SR l={c.uapEdited ? "UAP affordable BSF (edited)" : "Bonus BSF"} v={fmt(c.bonusBSF) + (c.uapEdited ? ` of ${fmt(c.autoBonusBSF)} max` : "")} />}
+              {c.airSF > 0 && <SR l="Air rights / transfer" v={fmt(c.airSF) + " SF"} />}
+              <SR l="Total BSF" v={fmt(c.totalBSF)} />
+              <SR l="Resi net SF" v={fmt(c.resiNetSF)} />
+              <SR l={`Resi gross (+${N(m.addonPct)}%)`} v={fmt(c.resiGSF)} />
+              {c.retailSF > 0 && <SR l="Retail SF" v={fmt(c.retailSF)} />}
+              <SR l="Building GSF (cost basis)" v={fmt(c.GSF)} />
+              <SR l="BSF used / unused" v={c.bsfLeft >= 0 ? `${fmt(c.zfaUsed)} / ${fmt(c.bsfLeft)}` : `${fmt(-c.bsfLeft)} SF over`} />
+              <SR l="Units (market + affordable)" v={`${c.totalUnits} (${c.marketUnits} + ${c.affUnits})`} />
+            </div>
+          </div>
+
+          <div className="shSec">
+            <div className="shH">Unit Mix & Rents</div>
+            <div className="shWrap">
+              <table className="shTable">
+                <thead><tr><th>Type</th><th>Avg SF</th><th>Units</th><th>Market</th><th>Affordable</th><th>Net SF</th></tr></thead>
+                <tbody>
+                  {c.rows.filter((r) => r.units > 0).map((r) => (
+                    <tr key={r.type}>
+                      <td>{r.label}</td><td>{fmt(r.sf)}</td><td>{r.units}</td>
+                      <td>{r.mktU > 0 ? `${r.mktU} @ ${money(r.rent)}` : "—"}</td>
+                      <td>{r.parts.map((p) => `${p.u} @ ${money(p.net)} (${p.ami}%)`).join(" · ") || "—"}</td>
+                      <td>{fmt(r.netSF)}</td>
+                    </tr>
+                  ))}
+                  <tr className="tot"><td>Total</td><td>{c.totalUnits ? fmt(c.resiNetSF / c.totalUnits) : "—"}</td><td>{c.totalUnits}</td><td>{c.marketUnits} · avg {money(c.avgMktRent)}</td><td>{c.affUnits} · avg {money(c.avgAffRent)}</td><td>{fmt(c.resiNetSF)}</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="shSec">
+            <div className="shH">Affordable Set-Aside — {m.program === "market" ? "none" : m.program.toUpperCase()}</div>
+            <div className="shNote">{P.label}</div>
+            <div className="shGrid">
+              <SR l="Requirement" v={m.affMode === "none" ? "None" : m.affMode === "units" ? `${N(m.affReqPct)}% of units = ${c.affReqUnits} units` : m.affMode === "uap" ? `UAP bonus ${fmt(c.bonusBSF)} BSF ≈ ${fmt(c.affReqSF)} net SF` : `${N(m.affReqPct)}% of resi = ${fmt(c.affReqSF)} SF`} />
+              <SR l="Provided" v={`${fmt(c.affSF)} SF · ${c.affUnits} units (${c.totalUnits ? pct(c.affUnits / c.totalUnits * 100) : "—"})`} />
+              <SR l={c.affMet ? "Surplus" : "Shortfall"} v={m.affMode === "units" ? `${c.affSurplusUnits} units` : `${fmt(c.affSurplusSF)} SF`} />
+              <SR l="Weighted avg AMI" v={c.affUnits ? Math.round(c.affAvgAmi) + "%" + (P.avg ? ` (target ≤ ${P.avg}%)` : "") : "—"} />
+              <SR l="Rent given up vs market" v={`${money(c.lostM)}/mo · ${money(c.lostYr)}/yr`} />
+              <SR l={`Value given up @ ${N(m.exitCapRatePct).toFixed(2)}% cap`} v={money(c.lostValue)} />
+            </div>
+            {affRows.length > 0 && (
+              <div className="shWrap" style={{ marginTop: 10 }}>
+                <table className="shTable">
+                  <thead><tr><th>Type</th><th>Units</th><th>AMI</th><th>Affordable rent</th><th>Market rent</th><th>Lost / yr</th></tr></thead>
+                  <tbody>
+                    {affRows.flatMap((r) => r.parts.map((p, k) => (
+                      <tr key={r.type + k}><td>{r.label}</td><td>{p.u}</td><td>{p.ami}%</td><td>{money(p.net)}</td><td>{money(r.rent)}</td><td>{money(p.u * (r.rent - p.net) * 12)}</td></tr>
+                    )))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            <div className="shSrc">Affordable rent = J Stone basis (HPD max less utility deduction; ref. {HPD_RENT_SRC}).</div>
+          </div>
+
+          <div className="shSec">
+            <div className="shH">Development Budget</div>
+            <BudgetTable m={m} c={c} sheet />
+            <div className="shSrc">BSF = {fmt(c.totalBSF)} buildable SF · GSF = {fmt(c.GSF)} gross building SF · {c.totalUnits} units. Hard ${fmt(N(m.hardCostPerBSF))}/GSF{m.borough ? ` (${m.borough} default $${costsFor(m.borough).hard})` : ""}; soft {N(m.softCostPct)}% of hard; construction loan {N(m.ltcPct)}% LTC at {N(m.interestRatePct)}%.</div>
+          </div>
+
+          {rental ? (
+            <div className="shSec">
+              <div className="shH">Stabilized Income & Expenses</div>
+              <div className="shWrap">
+                <table className="shTable inc">
+                  <thead><tr><th>Income</th><th>Monthly</th><th>Yearly</th></tr></thead>
+                  <tbody>
+                    <IR l={`Market residential (${c.marketUnits} units)`} mo={c.mktResiM} yr={c.mktResiM * 12} />
+                    <IR l={`Affordable residential (${c.affUnits} units)`} mo={c.affResiM} yr={c.affResiM * 12} />
+                    {c.retailYr > 0 && <IR l={`Retail (${fmt(c.retailSF)} SF × $${fmt(N(m.retailPSF))})`} mo={c.retailYr / 12} yr={c.retailYr} />}
+                    {c.parkingM > 0 && <IR l={`Parking (${N(m.parkingSpaces)} × $${fmt(N(m.parkingRent))}/mo)`} mo={c.parkingM} yr={c.parkingM * 12} />}
+                    {c.otherYr > 0 && <IR l="Other income" mo={c.otherYr / 12} yr={c.otherYr} />}
+                    <IR l="Gross potential income" mo={c.GPI / 12} yr={c.GPI} b />
+                    <IR l={`Vacancy (resi ${N(m.vacancyPct)}%${c.retailYr > 0 ? `, retail ${N(m.commVacancyPct)}%` : ""})`} mo={c.vacancy / 12} yr={c.vacancy} neg />
+                    <IR l="Effective gross income" mo={c.EGI / 12} yr={c.EGI} b />
+                    <tr className="hd"><td colSpan={3}>Expenses</td></tr>
+                    <IR l={`Residential opex ($${fmt(N(m.opexPerUnit))}/unit/yr)`} mo={c.exResi / 12} yr={c.exResi} neg />
+                    {c.exMgmt > 0 && <IR l={`Management / other (${N(m.mgmtPct)}% of EGI)`} mo={c.exMgmt / 12} yr={c.exMgmt} neg />}
+                    {c.exRetail > 0 && <IR l={`Retail expenses (${N(m.retailExpPct)}%)`} mo={c.exRetail / 12} yr={c.exRetail} neg />}
+                    <IR l="Real estate tax (485-x / abated)" mo={c.exTax / 12} yr={c.exTax} neg />
+                    {lease && <IR l="Ground lease payment" mo={c.exGround / 12} yr={c.exGround} neg />}
+                    <IR l="Total expenses" mo={c.opexTotal / 12} yr={c.opexTotal} neg b />
+                    <IR l="NET OPERATING INCOME" mo={c.NOI / 12} yr={c.NOI} b />
+                  </tbody>
+                </table>
+              </div>
+              <div className="shSrc">Avg rent {money(c.avgRentUnit)}/unit/mo ({psf(c.rentPSF)}/net SF/yr) · market {money(c.avgMktRent)} ({psf(c.mktRentPSF)}/SF) · affordable {money(c.avgAffRent)} ({psf(c.affRentPSF)}/SF) · expense ratio {c.EGI ? pct(c.opexTotal / c.EGI * 100) : "—"}</div>
+            </div>
+          ) : (
+            <div className="shSec">
+              <div className="shH">Sellout</div>
+              <div className="shGrid">
+                <SR l={`Market (${fmt(c.mktSF)} SF × $${fmt(N(m.marketSellPSF))})`} v={money(c.mktSF * N(m.marketSellPSF))} />
+                <SR l={`Affordable (${fmt(c.affSF)} SF × $${fmt(N(m.affordableSellPSF))})`} v={money(c.affSF * N(m.affordableSellPSF))} />
+                <SR l={`Selling costs (${N(m.sellingCostPct)}%)`} v={"-" + money(c.sellCosts)} />
+                {c.retailValue > 0 && <SR l={`Retail value @ ${N(m.commCapRate)}% cap`} v={money(c.retailValue)} />}
+                <SR l="Net revenue" v={money(c.sellNet + c.retailValue)} />
+                <SR l="Profit / margin on cost" v={`${sMoney(c.condoProfit)} · ${pct(c.condoMargin)}`} />
+              </div>
+            </div>
+          )}
+
+          {rental && (
+            <div className="shSec">
+              <div className="shH">Returns & Debt</div>
+              <div className="shGrid">
+                <SR l="Yield on total cost" v={pct(c.yieldOnCost)} />
+                {c.credits > 0 && <SR l="Yield on net cost (after credits)" v={pct(c.yieldOnNet)} />}
+                <SR l={`Value @ ${N(m.exitCapRatePct).toFixed(2)}% cap`} v={money(c.exitValue)} />
+                <SR l="Value / BSF · / unit" v={`${psf(c.per(c.exitValue).bsf)} · ${c.totalUnits ? kMoney(c.per(c.exitValue).unit) : "—"}`} />
+                <SR l={c.credits > 0 ? "Net project cost" : "Total project cost"} v={money(c.netCost)} />
+                <SR l="Equity created" v={sMoney(c.equityCreated)} />
+                <SR l="Loan" v={`${money(c.permLoan)} (${pct(100 - c.cashPct)} of cost) @ ${N(m.permRatePct)}%, ${N(m.permAmortYrs)} yr`} />
+                <SR l="CASH REQUIRED" v={`${money(c.equityIn)} · ${pct(c.cashPct)} of cost${c.totalUnits ? " · " + kMoney(c.equityIn / c.totalUnits) + "/unit" : ""}`} />
+                <SR l="Debt service (amort. / IO)" v={`${money(c.dsAmort)} / ${money(c.dsIO)}`} />
+                <SR l="Cash flow after debt (amort. / IO)" v={`${sMoney(c.cfAmort)} / ${sMoney(c.cfIO)}`} />
+                <SR l="DSCR (amort. / IO)" v={`${x2(c.dscr)} / ${x2(c.dscrIO)}`} />
+                <SR l="Cash-on-cash · debt yield" v={`${pct(c.coc)} · ${pct(c.debtYield)}`} />
+                {N(m.marketSellPSF) > 0 && <SR l={`Alt: sell as condo @ $${fmt(N(m.marketSellPSF))}/SF`} v={`${sMoney(c.condoProfit)} profit`} />}
+              </div>
+              <div className="shHl">
+                <span>Yield on cost</span>
+                <b>{pct(c.yieldOnCost)}</b>
+              </div>
+            </div>
+          )}
+
+          <div className="shSec">
+            <div className="shH">Sensitivity</div>
+            <SensTable s={sens} m={m} sheet />
+          </div>
+
+          <div className="shFoot">
+            Prepared by J Stone Realty Group. Preliminary underwriting estimates based on the assumptions stated above
+            (construction {N(m.constructionMonths)} months, {N(m.avgOutstandingPct)}% average draw, RE taxes during construction ${fmt(N(m.cTaxesYr))}/yr,
+            insurance {N(m.cInsurancePct)}% of hard{lease ? `, ground rent ${money(m.groundRentYr)}/yr with ${N(m.groundRentFreeMonths)} free months` : ""}).
+            Subject to due diligence, final zoning analysis, program rules (485-x / UAP / MIH) and market verification.
+            Not an offer or guarantee of financing, pricing, or returns.
+          </div>
+        </div>
+        <div className="sheetActions">
+          <button className="ghost" onClick={onClose}>Close</button>
+          <button className="ghost" onClick={openClean}>Open clean copy</button>
+          <button className="primary" onClick={() => window.print()}>Print / Save as PDF</button>
+        </div>
+      </div>
+    </div>
+  </div>, document.body);
+}
+function SR({ l, v }) {
+  return <div className="shRow"><span>{l}</span><b>{v}</b></div>;
+}
+
+/* ============================================================
+   DEAL DESK
+   ============================================================ */
+
+export { Underwriting as ClassicUnderwriting, blankModel as classicBlankModel, modelFromDeal as classicModelFromDeal };
