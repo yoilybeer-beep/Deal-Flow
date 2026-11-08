@@ -296,6 +296,7 @@ const newTier = (ami = DEFAULT_AMI) => ({ ami, units: typeMap(() => 0), rents: h
 /* Round-2 fields. New models start with these; a saved model that predates them opens with OLD_MODEL_NEUTRAL
    so its numbers do not move (see upgradeModel). */
 const NEW_MODEL_DEFAULTS = {
+  mktUnitSF: null,         // avg net SF per market unit you typed (display only — the mix sizes are scaled to it)
   uapUnits: null,          // affordable units you give away under UAP — null = auto (fill to the UAP floor area)
   affUnitSF: null,         // avg net SF of an affordable unit — null = same as the unit mix
   sellEffPct: 100,         // condo: sellable SF as % of residential net SF (def.)
@@ -304,7 +305,7 @@ const NEW_MODEL_DEFAULTS = {
   condoPacePerMo: 0,       // condo: absorption, units sold per month — 0 = use the sellout months
   condoDepositPct: 10,     // condo: contract deposits, % of gross, released at completion to pay down the construction loan (def.)
 };
-const OLD_MODEL_NEUTRAL = { uapUnits: null, affUnitSF: null, sellEffPct: 100, condoTransferPct: 0, condoAffMode: "sell", condoPacePerMo: 0, condoDepositPct: 0 };
+const OLD_MODEL_NEUTRAL = { mktUnitSF: null, uapUnits: null, affUnitSF: null, sellEffPct: 100, condoTransferPct: 0, condoAffMode: "sell", condoPacePerMo: 0, condoDepositPct: 0 };
 const withNeutral = (raw, m) => { Object.keys(OLD_MODEL_NEUTRAL).forEach((k) => { if (raw[k] === undefined) m[k] = OLD_MODEL_NEUTRAL[k]; }); return m; };
 
 function blankModel(borough = "") {
@@ -935,11 +936,20 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
   const applyMktSize = () => {
     const v = N(draft.mktSF); setDraft((d) => ({ ...d, mktSF: undefined }));
     if (!(v > 0) || !(c.mktAvgSF > 0)) return;
-    const f = v / c.mktAvgSF;
-    setM((p) => refit({ ...p, mix: typeMap((t) => ({ ...p.mix[t], sf: Math.max(150, Math.round(N(p.mix[t].sf) * f)) })) }));
+    setM((p) => {   // scale every unit type, refit, and repeat so the market average lands on your number
+      let x = { ...p, mktUnitSF: v };
+      for (let k = 0; k < 3; k++) {
+        const cur = runCalc(x).mktAvgSF;
+        if (!(cur > 0) || Math.abs(cur - v) < 0.5) break;
+        const f = v / cur;
+        x = refit({ ...x, mix: typeMap((t) => ({ ...x.mix[t], sf: Math.max(150, Math.round(N(x.mix[t].sf) * f)) })) });
+      }
+      return x;
+    });
   };
   const mixIsDefaultSize = UNIT_TYPES.every(([t]) => N(m.mix[t].sf) === UNIT_SF[t]);
-  const resetMktSize = () => setM((p) => refit({ ...p, mix: typeMap((t) => ({ ...p.mix[t], sf: UNIT_SF[t] })) }));
+  const resetMktSize = () => setM((p) => refit({ ...p, mktUnitSF: null, mix: typeMap((t) => ({ ...p.mix[t], sf: UNIT_SF[t] })) }));
+  const mktTyped = N(m.mktUnitSF) > 0 && Math.abs(c.mktAvgSF - N(m.mktUnitSF)) <= N(m.mktUnitSF) * 0.05 ? N(m.mktUnitSF) : null;
   const applyMktRent = () => {
     const v = N(draft.rent); setDraft((d) => ({ ...d, rent: undefined }));
     const cur = c.marketUnits > 0 ? c.avgMktRent : 0;
@@ -962,7 +972,9 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
       bonusFar: path === "aor" ? 0 : (v && v.uap ? v.uap : m.bonusFar),
       uapSF: path === "uap" ? m.uapSF : null, uapUnits: path === "uap" ? m.uapUnits : null,
     };
-    setM(refit(next));
+    let out = refit(next);
+    if (next.affMode === "none" && m.affMode !== "none") out = autoAffordable(out);   // no requirement → clear the affordable tier
+    setM(out);
   };
   const [full, setFull] = useState(() => { try { return localStorage.getItem("uwFull") === "1"; } catch (e) { return false; } });
   const toggleFull = () => setFull((f) => { try { localStorage.setItem("uwFull", f ? "0" : "1"); } catch (e) {} return !f; });
@@ -997,10 +1009,10 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
   // unit sizes: market average (rescales the mix) and affordable average (its own number, or same as the mix)
   const sizeControls = () => (
     <>
-      <F label="Avg SF / market unit" hint={mixIsDefaultSize ? "def. J Stone mix" : "your mix"}>
-        <input type="number" inputMode="decimal" step="any" value={draft.mktSF ?? Math.round(c.mktAvgSF)}
+      <F label="Avg SF / market unit" hint={mixIsDefaultSize ? "def. J Stone mix" : mktTyped ? "your number" : "your mix"}>
+        <input type="number" inputMode="decimal" step="any" value={draft.mktSF ?? mktTyped ?? Math.round(c.mktAvgSF)}
           onChange={(e) => setDraft((d) => ({ ...d, mktSF: e.target.value }))} onBlur={applyMktSize} onKeyDown={blurOnEnter} />
-        <div className="uapNote">{mixIsDefaultSize ? <>Net SF · drives the unit count</> : <>Edited · <button className="linkBtn inline" onClick={resetMktSize}>reset to default sizes</button></>}</div>
+        <div className="uapNote">{mixIsDefaultSize ? <>Net SF · drives the unit count</> : <>Mix avg {fmt(c.mktAvgSF)} · <button className="linkBtn inline" onClick={resetMktSize}>reset to default sizes</button></>}</div>
       </F>
       {m.affMode !== "none" && (
         <F label="Avg SF / affordable unit" hint={c.affSizeEdited ? "your number" : "auto"}>
@@ -1491,7 +1503,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
             <Row l="Total project cost" v={money(c.TPC)} s={psf(c.per(c.TPC).bsf)} total />
             {c.credits > 0 && <Row l={"Less " + (m.creditsLabel || "credits")} v={"-" + money(c.credits)} />}
             {c.credits > 0 && <Row l="Net cost (basis)" v={money(c.netCost)} s={psf(c.per(c.netCost).bsf)} total />}
-            <div className="divLabel">{rental ? "Stabilized" : "Sellout"}</div>
+            <div className="divLabel">{rental ? "Stabilized" : <>Sellout <i>{fmt(c.sellMktSF + c.sellAffSF)} sellable SF</i></>}</div>
             {rental ? (
               <>
                 <Row l="Effective gross income" v={money(c.EGI)} />
@@ -1504,7 +1516,6 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
               </>
             ) : (
               <>
-                <div className="divLabel">Sellout <i>{fmt(c.sellMktSF + c.sellAffSF)} sellable SF</i></div>
                 <Row l="Gross sellout" v={money(c.sellGross)} s={psf(N(m.marketSellPSF)) + "/SF mkt"} />
                 <Row l={`Broker + marketing (${N(m.sellingCostPct)}%)`} v={"-" + money(c.sellBroker)} />
                 {c.sellTransfer > 0 && <Row l={`Transfer tax + closing (${N(m.condoTransferPct)}%)`} v={"-" + money(c.sellTransfer)} />}
