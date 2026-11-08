@@ -219,7 +219,7 @@ export function runRental(m) {
   const negLeverage = constant > 0 && capIn > 0 && capIn < constant * 100;
 
   const flags = [];
-  if (loan > 0 && dscrIn < N(m.minDscr)) flags.push(`DSCR on in-place NOI is ${dscrIn.toFixed(2)}x, under your ${N(m.minDscr).toFixed(2)}x minimum`);
+  if (loan > 0 && dscrIn < N(m.minDscr) - 0.005) flags.push(`DSCR on in-place NOI is ${dscrIn.toFixed(2)}x, under your ${N(m.minDscr).toFixed(2)}x minimum`);
   if (negLeverage) flags.push(`Negative leverage: going-in cap ${capIn.toFixed(2)}% is below the loan constant ${(constant * 100).toFixed(2)}%`);
   if (breakEven > 85) flags.push(`Break-even occupancy ${breakEven.toFixed(0)}% leaves little room`);
   if (rsShare >= 50) flags.push(`${rsShare.toFixed(0)}% of units are rent stabilized: upside is limited to RGB increases`);

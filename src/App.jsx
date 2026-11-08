@@ -3559,8 +3559,16 @@ table.sens td.base{outline:2px solid #9C7A2E;outline-offset:-2px;font-weight:700
 .chk>div.no b{color:${RED}}
 .warn{margin-top:10px;font-size:12px;color:${RED};font-weight:600}
 .rentFlags{margin-top:14px;padding:10px 12px;border:1px solid #C47764;border-radius:8px;background:rgba(196,119,100,.1);font-size:11.5px;line-height:1.5;color:#F0C9BE}
-table.rr.rroll{min-width:560px}
-table.rr.rroll input{min-width:64px}
+table.rr.rroll{min-width:0}
+table.rr.rroll td,table.rr.rroll th{padding:5px 2px}
+table.rr.rroll td:first-child,table.rr.rroll th:first-child{padding-left:6px}
+table.rr.rroll select{padding:4px 2px;font-size:12px}
+table.rr.cflow{min-width:0}
+table.rr.rsens{min-width:0}
+table.rr.rsens td,table.rr.rsens th{padding:6px 3px}
+table.rr.cflow td,table.rr.cflow th{padding:6px 3px}
+table.rr.cflow td{font-size:11px}
+table.rr.rroll input{min-width:0;width:58px;padding:5px 2px}
 .ledger b small{font-size:10.5px;opacity:.5;margin-left:7px;font-weight:400}
 .divLabel i{font-style:normal;opacity:.5;letter-spacing:.06em;margin-left:6px;color:#EDEDE8}
 .shKpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:-6px 0 26px}

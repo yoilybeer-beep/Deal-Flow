@@ -137,12 +137,12 @@ export default function RentalUW({ initialModel, onExit, notify, userId, userNam
             {m.sampleRoll && <div className="warn" style={{ marginTop: 6 }}>Sample rent roll — replace it, add units, or paste yours below.</div>}
             <div className="tableWrap" style={{ marginTop: 10 }}>
               <table className="rr rroll">
-                <thead><tr><th>Unit</th><th>Beds</th><th>Type</th><th>Current / mo</th><th>{"Market / legal"}</th><th>Lease end</th><th>Vac</th><th></th></tr></thead>
+                <thead><tr><th>Unit</th><th>Beds</th><th>Type</th><th>Now / mo</th><th>Market / legal</th><th>Lease</th><th>Vac</th><th></th></tr></thead>
                 <tbody>
                   {m.units.map((u, i) => (
                     <tr key={u.id}>
-                      <td><input value={u.unit} onChange={(e) => setU(i, "unit", e.target.value)} style={{ width: 52 }} /></td>
-                      <td><input type="number" inputMode="decimal" value={u.beds} onChange={(e) => setU(i, "beds", e.target.value)} style={{ width: 44, minWidth: 44 }} /></td>
+                      <td><input value={u.unit} onChange={(e) => setU(i, "unit", e.target.value)} style={{ width: 40, minWidth: 40 }} /></td>
+                      <td><input type="number" inputMode="decimal" value={u.beds} onChange={(e) => setU(i, "beds", e.target.value)} style={{ width: 32, minWidth: 32 }} /></td>
                       <td>
                         <select className="amiSel" value={u.status} onChange={(e) => setU(i, "status", e.target.value)}>
                           {UNIT_STATUS.map(([k]) => <option key={k} value={k}>{STATUS_SHORT[k]}</option>)}
@@ -150,7 +150,7 @@ export default function RentalUW({ initialModel, onExit, notify, userId, userNam
                       </td>
                       <td><input type="number" inputMode="decimal" value={u.vacant ? "" : u.current} placeholder={u.vacant ? "vacant" : ""} disabled={u.vacant} onChange={(e) => setU(i, "current", e.target.value)} /></td>
                       <td><input type="number" inputMode="decimal" value={u.market} onChange={(e) => setU(i, "market", e.target.value)} /></td>
-                      <td><input value={u.leaseEnd || ""} onChange={(e) => setU(i, "leaseEnd", e.target.value)} placeholder="mm/yy" style={{ width: 62 }} /></td>
+                      <td><input value={u.leaseEnd || ""} onChange={(e) => setU(i, "leaseEnd", e.target.value)} placeholder="mm/yy" style={{ width: 52, minWidth: 52 }} /></td>
                       <td><input type="checkbox" checked={!!u.vacant} onChange={(e) => setU(i, "vacant", e.target.checked)} style={{ minWidth: 0 }} /></td>
                       <td><button className="mini" onClick={() => setM((p) => ({ ...p, units: p.units.filter((_, j) => j !== i) }))}>✕</button></td>
                     </tr>
@@ -321,7 +321,7 @@ export default function RentalUW({ initialModel, onExit, notify, userId, userNam
             </div>
             <div className="mcards">
               <MC l="Unlevered IRR" v={ir(c.unlevIRR)} />
-              <MC l="Equity multiple" v={c.equityMultiple ? c.equityMultiple.toFixed(2) + "x" : "—"} good={c.equityMultiple >= 1.5} />
+              <MC l="Equity multiple" v={c.equityMultiple ? c.equityMultiple.toFixed(2) + "x" : "—"} good={c.equityMultiple >= 1.5 ? true : c.equityMultiple < 1 ? false : undefined} />
               <MC l="Cash-on-cash yr 1" v={pct(c.coc)} good={c.coc >= 0 ? undefined : false} />
               <MC l="DSCR yr 1" v={x2(c.dscrY1)} good={c.dscrY1 >= N(m.minDscr)} />
               <MC l="Debt yield" v={pct(c.debtYield)} />
@@ -348,24 +348,25 @@ function CashFlowTable({ c, sheet }) {
   const rows = c.flows;
   return (
     <div className={sheet ? "shWrap" : "tableWrap"} style={{ marginTop: sheet ? 0 : 10 }}>
-      <table className={sheet ? "shTable inc" : "rr num"}>
-        <thead><tr><th>Year</th><th>Rent + other</th><th>Vac & credit</th><th>Expenses</th><th>NOI</th><th>Debt service</th><th>Cash flow</th><th>DSCR</th></tr></thead>
+      <table className={sheet ? "shTable inc" : "rr num cflow"}>
+        <thead><tr><th>Year</th><th>EGI</th><th>Expenses</th><th>NOI</th><th>Debt svc</th><th>Cash flow</th><th>DSCR</th></tr></thead>
         <tbody>
-          <tr><td>In-place</td><td>{kMoney(c.inPlace.GPI)}</td><td>{kMoney(-c.inPlace.vac)}</td><td>{kMoney(-c.inPlace.opex)}</td><td>{kMoney(c.inPlace.NOI)}</td><td></td><td></td><td></td></tr>
+          <tr><td>Now</td><td>{kMoney(c.inPlace.EGI)}</td><td>{kMoney(-c.inPlace.opex)}</td><td>{kMoney(c.inPlace.NOI)}</td><td></td><td></td><td></td></tr>
           {rows.map((r) => (
-            <tr key={r.y}><td>{r.y}</td><td>{kMoney(r.GPI)}</td><td>{kMoney(-r.vac)}</td><td>{kMoney(-r.opex)}</td><td>{kMoney(r.NOI)}</td><td>{kMoney(-r.ds)}</td><td>{kMoney(r.cf)}</td><td>{x2(r.dscr)}</td></tr>
+            <tr key={r.y}><td>{r.y}</td><td>{kMoney(r.EGI)}</td><td>{kMoney(-r.opex)}</td><td>{kMoney(r.NOI)}</td><td>{kMoney(-r.ds)}</td><td>{kMoney(r.cf)}</td><td>{x2(r.dscr)}</td></tr>
           ))}
-          <tr className="tot"><td>Sale yr {c.hold}</td><td colSpan={3}>{kMoney(c.exitValue)} − selling {kMoney(c.sellCosts)}</td><td>{kMoney(c.netSale)}</td><td>{kMoney(-c.loanPayoff)}</td><td>{kMoney(c.netSale - c.loanPayoff)}</td><td></td></tr>
+          <tr className="tot"><td>Sale yr {c.hold}</td><td colSpan={2}>{kMoney(c.exitValue)} − {kMoney(c.sellCosts)}</td><td>{kMoney(c.netSale)}</td><td>{kMoney(-c.loanPayoff)}</td><td>{kMoney(c.netSale - c.loanPayoff)}</td><td></td></tr>
         </tbody>
       </table>
     </div>
   );
 }
+/* EGI = rent + other income − vacancy & credit loss */
 
 function RentSens({ s, sheet }) {
   const base = (i, j) => i === 2 && j === 2;
   const cls = (v, i, j) => (v < 0 || !isFinite(v) ? "neg" : "pos") + (base(i, j) ? " base" : "");
-  const T = sheet ? "shTable sens" : "rr sens";
+  const T = sheet ? "shTable sens" : "rr sens rsens";
   return (
     <>
       <div className={sheet ? "shNote" : "subnote"} style={{ marginTop: sheet ? 0 : 10 }}>Levered IRR by free-market rent growth (rows) × exit cap (columns).</div>
