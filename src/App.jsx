@@ -1405,7 +1405,7 @@ function Underwriting({ initialModel, onExit, notify, userId, userName }) {
                 <F label="Sellable SF" hint="% of resi net · def. 100">{num("sellEffPct", "1")}</F>
                 <F label="Affordable units">
                   <select value={m.condoAffMode || "sell"} onChange={(e) => set("condoAffMode", e.target.value)}>
-                    <option value="sell">Sold (affordable $/SF)</option>
+                    <option value="sell">Sold</option>
                     <option value="rent">Kept as rentals</option>
                   </select>
                 </F>
