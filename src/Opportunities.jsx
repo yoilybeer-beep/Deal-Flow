@@ -1,27 +1,30 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { supabase } from "./supabaseClient";
 import { QuickActions } from "./crmKit";
+import {
+  ACTIVE_STAGES, BOARD_BOROUGHS, CLOSED_STAGES, addressBorough, boroughName, clearCall, hasCall,
+  moveProspect, neighborBorough, ownerPhone, parcelMetrics, prospectBorough, prospectKey as pkey, prospectPhone, recordCall,
+  prospectStage, researchTag, street, withBorough,
+} from "./opportunityBoard";
 
 /* ============================================================
-   NEW OPPORTUNITIES — daily Bronx assemblage prospects + a mini CRM
+   NEW OPPORTUNITIES — borough prospect boards + a mini CRM
    Storage (no schema change, no data in this repo):
    - daily batches : public.models rows, id "opps-batch-YYYY-MM-DD",
                      data = { kind: "opps_batch", date, prospects: [...] }
    - your statuses : public.models row "opps-state-<user id>",
-                     data = { kind: "opps_state", prospects: {key: {status, note}},
+                     data = { kind: "opps_state", prospects: {key: {stage, stageAt, called, calledAt, note, …legacy}},
                               contacts: {contactId: {role, status, callbackAt, prospectKey}} }
    - people + notes: public.contacts + public.contact_notes (same as Contacts),
                      call-back date mirrors into contacts.follow_up_date (shows on Home > Today)
    ============================================================ */
 
 export const OPPS_PREFIX = "opps-";
-const P_STATUSES = ["New", "Interested", "Calling", "Follow-up", "Pass"];
 const C_STATUSES = ["Lead", "Follow-up", "Not interested", "Converted"];
 const ROLES = [["owner", "Owner"], ["neighbor", "Neighbor"], ["broker", "Broker"]];
 
 const fmt = (n) => (Number(n) || 0).toLocaleString("en-US", { maximumFractionDigits: 0 });
 const far = (n) => (Number(n) ? String(Math.round(Number(n) * 100) / 100) : "—");
-const pkey = (p) => `${p.date}|${(p.base && (p.base.bbl || p.base.address)) || p.rank}`;
 const pad = (n) => String(n).padStart(2, "0");
 const localISO = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 const todayStr = () => localISO(new Date()).slice(0, 10);
@@ -60,8 +63,6 @@ const noteTime = (iso) => {
   return isNaN(d) ? "" : d.toLocaleDateString("en-US", { month: "short", day: "numeric" }) + " · " + d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
 };
 const newId = () => (crypto.randomUUID ? crypto.randomUUID() : "x" + Date.now().toString(36) + Math.random().toString(36).slice(2));
-const street = (a) => String(a || "").replace(/,\s*(Bronx|New York|NY)\b.*$/i, "").trim();   // "121 East 169 Street, Bronx, NY 10452" -> "121 East 169 Street"
-const withBoro = (a) => (/bronx/i.test(a || "") ? a : a ? `${a}, Bronx` : "");
 const appId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);   // same as uid() in App.jsx
 
 export default function Opportunities({ userId, userName, notify, onGo }) {
@@ -72,8 +73,12 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
   const [contacts, setContacts] = useState([]);
   const [tab, setTab] = useState("prospects");
   const [q, setQ] = useState("");
-  const [pFilter, setPFilter] = useState("All");
-  const [dFilter, setDFilter] = useState("All");
+  const [boroFilter, setBoroFilter] = useState("Manhattan");
+  const [callFilter, setCallFilter] = useState("all");
+  const [lane, setLane] = useState("");
+  const [announcement, setAnnouncement] = useState("");
+  const [saveErr, setSaveErr] = useState(false);
+  const [archived, setArchived] = useState(false);
   const [cFilter, setCFilter] = useState("All");
   const [form, setForm] = useState(null);
   const stRef = useRef(st);
@@ -86,31 +91,35 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
       supabase.from("models").select("id, data").eq("id", STATE_ID).maybeSingle(),
       supabase.from("contacts").select("id, name, phone, email, address, area, type, follow_up_date, last_contacted, converted_deal_id, owner_id, updated_at, contact_notes(id, body, noted_at, author_name, owner_id)"),
     ]);
-    if (b.error || c.error) setLoadErr((b.error || c.error).message || "Couldn't load.");
+    if (b.error || c.error || s.error) setLoadErr((b.error || c.error || s.error).message || "Couldn't load.");
     const bs = (b.data || []).map((r) => ({ date: r.data?.date || String(r.id).slice(-10), prospects: Array.isArray(r.data?.prospects) ? r.data.prospects : [] }))
       .sort((x, y) => (x.date < y.date ? 1 : -1));
     setBatches(bs);
     const sd = s.data?.data || {};
-    const next = { prospects: sd.prospects || {}, contacts: sd.contacts || {} };
+    const next = { ...sd, prospects: sd.prospects || {}, contacts: sd.contacts || {} };
     stRef.current = next; setSt(next);
     setContacts(c.data || []);
-    setLoaded(true);
+    setLoaded(s.error ? "state-error" : true);
   };
   useEffect(() => { load(); }, []);
 
+  const queueState = () => {
+    saving.current = saving.current.then(async () => {
+      const { error } = await supabase.from("models").upsert({
+        id: STATE_ID, data: { ...stRef.current, kind: "opps_state" }, owner_id: userId, is_public: false, updated_at: new Date().toISOString(),
+      });
+      if (error) throw error;
+      setSaveErr(false);
+    }).catch(() => setSaveErr(true));
+  };
   const putState = (fn) => {
     const next = fn(stRef.current);
     stRef.current = next; setSt(next);
-    saving.current = saving.current.then(async () => {
-      const { error } = await supabase.from("models").upsert({
-        id: STATE_ID, data: { kind: "opps_state", ...stRef.current }, owner_id: userId, is_public: false, updated_at: new Date().toISOString(),
-      });
-      if (error) notify?.(error.message || "Couldn't save.");
-    });
+    queueState();
     return next;
   };
-  const setPStatus = (k, status) => putState((s) => ({ ...s, prospects: { ...s.prospects, [k]: { ...(s.prospects[k] || {}), status, at: new Date().toISOString() } } }));
-  const setPNote = (k, note) => putState((s) => ({ ...s, prospects: { ...s.prospects, [k]: { ...(s.prospects[k] || {}), note } } }));
+  const editProspect = (key, edit) => putState((s) => ({ ...s, prospects: { ...s.prospects, [key]: edit(s.prospects[key] || {}) } }));
+  const setPStatus = (key, stage) => editProspect(key, (entry) => moveProspect(entry, stage, new Date().toISOString()));
 
   const allP = useMemo(() => batches.flatMap((b) => b.prospects.map((p) => ({ ...p, date: p.date || b.date }))), [batches]);
   const pByKey = useMemo(() => Object.fromEntries(allP.map((p) => [pkey(p), p])), [allP]);
@@ -124,9 +133,8 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
   const openNew = (seed = {}) => setForm({ id: null, name: "", role: "owner", phone: "", email: "", address: "", prospectKey: "", status: "Lead", callbackAt: "", notes: [], ...seed });
   const fromProspect = (p, n) => {
     const k = pkey(p);
-    if (n) openNew({ name: titleCase(n.owner), role: "neighbor", address: withBoro(n.address), prospectKey: k });
-    else openNew({ name: titleCase(p.base.owner), role: "owner", address: withBoro(p.base.address), prospectKey: k });
-    setTab("crm");
+    if (n) openNew({ name: titleCase(n.owner), role: "neighbor", address: withBorough(n.address, neighborBorough(n, p)), prospectKey: k });
+    else openNew({ name: titleCase(p.base?.owner), role: "owner", address: withBorough(p.base?.address, prospectBorough(p)), prospectKey: k });
     window.scrollTo(0, 0);
   };
 
@@ -136,9 +144,15 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
     const isNew = !f.id;
     const id = f.id || newId();
     const prev = contacts.find((c) => c.id === id) || {};
+    const p = pByKey[f.prospectKey];
+    const neighbor = f.role === "neighbor" && p?.neighbors?.find((n) => street(n.address).toLowerCase() === street(f.address).toLowerCase());
+    const source = neighbor || (f.role !== "neighbor" ? p?.base : null);
+    const linkedBorough = neighbor ? neighborBorough(neighbor, p) : prospectBorough(p);
+    const address = source && street(source.address).toLowerCase() === street(f.address).toLowerCase()
+      ? withBorough(f.address, linkedBorough) : f.address;
     const row = {
-      name, phone: f.phone || null, email: f.email || null, address: f.address || null,
-      area: f.prospectKey || /bronx/i.test(f.address || "") ? "Bronx" : (prev.area || null),
+      name, phone: f.phone || null, email: f.email || null, address: address || null,
+      area: addressBorough(address) || linkedBorough || prev.area || null,
       type: f.role === "broker" ? "broker" : "owner",
       follow_up_date: f.callbackAt ? f.callbackAt.slice(0, 10) : null,
       updated_at: new Date().toISOString(),
@@ -147,10 +161,10 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
       ? await supabase.from("contacts").insert({ id, ...row, owner_id: userId, is_public: false })
       : await supabase.from("contacts").update(row).eq("id", id);
     if (error) { notify?.(error.message || "Couldn't save the contact."); return null; }
-    putState((s) => ({ ...s, contacts: { ...s.contacts, [id]: { role: f.role, status: f.status || "Lead", callbackAt: f.callbackAt || "", prospectKey: f.prospectKey || "" } } }));
+    putState((s) => ({ ...s, contacts: { ...s.contacts, [id]: { ...s.contacts[id], role: f.role, status: f.status || "Lead", callbackAt: f.callbackAt || "", prospectKey: f.prospectKey || "" } } }));
     setContacts((cs) => isNew ? [{ id, ...row, owner_id: userId, converted_deal_id: null, contact_notes: [] }, ...cs] : cs.map((c) => (c.id === id ? { ...c, ...row } : c)));
-    const saved = { ...f, id, name };
-    setForm((cur) => (cur && (cur.id === f.id) ? { ...cur, id, name } : cur));
+    const saved = { ...f, id, name, area: row.area, address };
+    setForm((cur) => (cur && (cur.id === f.id) ? { ...cur, id, name, area: row.area, address } : cur));
     if (!quiet) notify?.(isNew ? `${name} added.` : "Saved.");
     return saved;
   };
@@ -198,21 +212,25 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
     const b = p?.base || {};
     const id = appId();
     const notesText = [...(f.notes || [])].reverse().map((n) => `${noteTime(n.noted_at)}: ${n.body}`).join("\n");
+    const metrics = parcelMetrics(b);
+    const assembly = assemblyLabel(p);
     const summary = p ? [
-      `New Opportunities ${p.date} #${p.rank}: assemblage at ${street(b.address)} (${b.zoning}, ${b.front_ft}×${b.depth_ft}, ${fmt(b.lot_sf)} SF lot).`,
-      `Combined buildable ~${fmt(p.combined_buildable_gsf)} GSF / ~${fmt(p.est_units)} units (UAP ~${fmt(p.combined_buildable_gsf_uap)} GSF / ~${fmt(p.est_units_uap)} units).`,
-      ...(p.neighbors || []).map((n) => `Neighbor ${n.side}: ${street(n.address)} (${titleCase(n.owner)}), ~${fmt(n.unused_sf)} SF unused.`),
+      `New Opportunities ${p.date} #${p.rank}: ${street(b.address)}${b.zoning ? ` (${b.zoning})` : ""}.`,
+      metrics.lot ? `Lot area: ${fmt(metrics.lot)} SF.` : "",
+      metrics.aor ? `This lot: ~${fmt(metrics.aor)} SF buildable as of right (estimate).` : "Standalone as-of-right buildable was not supplied.",
+      assembly ? `Optional assemblage: ${assembly}.` : "",
+      ...(p.neighbors || []).map((n) => `Optional neighbor ${n.side || "adjacent"}: ${street(n.address)}${validUrl(n.zola) ? ` (${validUrl(n.zola)})` : ""}.`),
       f.role === "neighbor" ? `Contact is a neighbor: ${f.address}.` : "",
     ].filter(Boolean).join("\n") : "";
     const data = {   // blankDeal() defaults + what we already know
-      id, address: street(p ? b.address : f.address), borough: "Bronx", neighborhood: p?.neighborhood || "",
-      zone: (p && b.zoning) || "R6", photos: [], streetWidth: "narrow", devPath: "aor",
-      lotArea: p && b.lot_sf ? String(b.lot_sf) : "", customFar: p && b.max_far ? String(b.max_far) : "", askingPrice: "",
+      id, address: street(p ? b.address : f.address), borough: prospectBorough(p) || addressBorough(f.address) || boroughName(f.area), neighborhood: p?.neighborhood || "",
+      zone: b.zoning || "", photos: [], streetWidth: "narrow", devPath: "aor",
+      lotArea: metrics.lot ? String(metrics.lot) : "", customFar: metrics.aor && metrics.far ? String(metrics.far) : "", askingPrice: "",
       sellerNumber: f.phone || "", vacancy: "TBD", existingSf: p && b.existing_bldg_sf ? String(b.existing_bldg_sf) : "",
       contactName: f.name, contactPhone: f.phone || "", contactEmail: f.email || "",
-      notes: [summary, notesText].filter(Boolean).join("\n\n"),
+      notes: [summary, p && stRef.current.prospects[pkey(p)]?.note, notesText].filter(Boolean).join("\n\n"),
       followUpDate: f.callbackAt ? f.callbackAt.slice(0, 10) : "", followUpNotes: "",
-      isPublic: false, stage: "New", assetType: "Development / Land", buildableSf: p && p.combined_buildable_gsf ? String(Math.round(p.combined_buildable_gsf)) : "",
+      isPublic: false, stage: "New", assetType: "Development / Land", buildableSf: metrics.aor ? String(Math.round(metrics.aor)) : "",
       lot: null, autoFilled: {}, created: todayStr(), ownerName: userName, contactId: f.id,
     };
     const { error } = await supabase.from("deals").upsert({ id, data, owner_id: userId, is_public: false, updated_at: new Date().toISOString() });
@@ -220,7 +238,7 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
     await supabase.from("contacts").update({ converted_deal_id: id, updated_at: new Date().toISOString() }).eq("id", f.id);
     setContacts((cs) => cs.map((c) => (c.id === f.id ? { ...c, converted_deal_id: id } : c)));
     putState((s) => ({ ...s, contacts: { ...s.contacts, [f.id]: { ...(s.contacts[f.id] || {}), status: "Converted" } } }));
-    if (p && (stRef.current.prospects[pkey(p)]?.status || "New") === "New") setPStatus(pkey(p), "Interested");
+    if (p) setPStatus(pkey(p), "Converted");
     setForm(null);
     notify?.(`Deal created for ${data.address || f.name}.`);
     onGo?.("deals", id);
@@ -228,18 +246,30 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
 
   /* ---------------- filters ---------------- */
   const t = q.trim().toLowerCase();
-  const pStatus = (p) => st.prospects[pkey(p)]?.status || "New";
-  const dates = batches.map((b) => b.date);
-  const pList = allP.filter((p) =>
-    (dFilter === "All" || p.date === dFilter) &&
-    (pFilter === "All" || pStatus(p) === pFilter) &&
-    (!t || [p.base?.address, p.neighborhood, p.base?.zoning, p.base?.owner, p.why, ...(p.neighbors || []).flatMap((n) => [n.address, n.owner])].join(" ").toLowerCase().includes(t)));
-  const groups = [];
-  for (const p of [...pList].sort((a, b) => (a.date === b.date ? (a.rank || 0) - (b.rank || 0) : a.date < b.date ? 1 : -1))) {
-    const g = groups[groups.length - 1];
-    if (g && g.date === p.date) g.items.push(p); else groups.push({ date: p.date, items: [p] });
-  }
-  const pCount = (s) => allP.filter((p) => (dFilter === "All" || p.date === dFilter) && (s === "All" || pStatus(p) === s)).length;
+  const boards = useMemo(() => {
+    const linked = new Map();
+    for (const c of crm) if (c.prospectKey) {
+      if (!linked.has(c.prospectKey)) linked.set(c.prospectKey, []);
+      linked.get(c.prospectKey).push(c);
+    }
+    return allP.map((p) => {
+      const key = pkey(p), entry = st.prospects[key] || {}, people = linked.get(key) || [];
+      const phone = prospectPhone(p, people), borough = prospectBorough(p);
+      return { p, key, entry, people, phone, borough, priority: !!researchTag(p), called: hasCall(entry), stage: prospectStage(entry, phone, people) };
+    }).sort((a, b) => String(b.p.date).localeCompare(String(a.p.date)) || (a.p.rank || 0) - (b.p.rank || 0));
+  }, [allP, crm, st.prospects]);
+  const boroughCounts = Object.fromEntries([...BOARD_BOROUGHS, "Other"].map((b) => [b, 0]));
+  const boroughBucket = (b) => BOARD_BOROUGHS.includes(b) ? b : "Other";
+  for (const item of boards) boroughCounts[boroughBucket(item.borough)]++;
+  const found = boards.filter(({ p, borough, people, entry }) => boroughBucket(borough) === boroFilter &&
+    (!t || [p.base?.address, p.base?.bbl, p.neighborhood, p.base?.zoning, p.base?.owner, p.why, entry.note,
+      ...people.flatMap((c) => [c.name, c.phone]), ...(p.neighbors || []).flatMap((n) => [n.address, n.owner])].join(" ").toLowerCase().includes(t)));
+  const calledCount = found.filter((item) => item.called).length;
+  const byStage = Object.fromEntries([...ACTIVE_STAGES, ...CLOSED_STAGES].map((stage) => [stage, []]));
+  for (const item of found) if (callFilter === "all" || item.called === (callFilter === "called")) byStage[item.stage].push(item);
+  for (const stage of ["To Call", "No Number"]) byStage[stage].sort((a, b) => Number(b.priority) - Number(a.priority));
+  const selectedLane = lane || ACTIVE_STAGES.find((stage) => byStage[stage].length) || "To Call";
+  const archivedCount = CLOSED_STAGES.reduce((count, stage) => count + byStage[stage].length, 0);
 
   const rank = (c) => ({ overdue: 0, today: 1, upcoming: 2, "": 3 })[dueState(c.callbackAt)];
   const cList = crm.filter((c) =>
@@ -252,9 +282,9 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
       if (a.callbackAt && b.callbackAt && a.callbackAt !== b.callbackAt) return a.callbackAt < b.callbackAt ? -1 : 1;
       return String(b.updated_at || "") < String(a.updated_at || "") ? -1 : 1;
     });
-  const linked = (k) => crm.filter((c) => c.prospectKey === k);
 
   if (!loaded) return <div style={{ padding: 40, opacity: 0.6 }}>Loading opportunities…</div>;
+  if (loaded === "state-error") return <div className="notice">Couldn't load your saved opportunity activity. <button onClick={() => { setLoaded(false); setLoadErr(""); load(); }}>Retry</button></div>;
 
   if (form) return (
     <div className="op">
@@ -272,46 +302,67 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
       <style>{OP_CSS}</style>
       <header className="pageHead">
         <h1>New Opportunities</h1>
-        <button className="primary" onClick={() => openNew()}>+ New lead</button>
+        <button className="primary" onClick={() => { setTab("crm"); openNew(); }}>+ New lead</button>
       </header>
       {loadErr && <div className="notice">{loadErr}</div>}
+      {saveErr && <div className="notice" role="alert">Opportunity changes couldn't be saved. <button onClick={queueState}>Retry save</button></div>}
+      <span className="opSR" role="status">{announcement}</span>
 
       <div className="opTabs">
         <button data-on={tab === "prospects"} onClick={() => setTab("prospects")}>Prospects <span>{allP.length}</span></button>
         <button data-on={tab === "crm"} onClick={() => setTab("crm")}>Leads <span data-due={dueCount > 0}>{dueCount ? `${dueCount} due` : crm.length}</span></button>
       </div>
-      <input className="opSearch" value={q} onChange={(e) => setQ(e.target.value)}
+      <input className="opSearch" aria-label={tab === "prospects" ? "Search prospects" : "Search leads"} type="search" value={q} onChange={(e) => { setQ(e.target.value); setLane(""); }}
         placeholder={tab === "prospects" ? "Search address, owner, neighborhood…" : "Search name, phone, address, notes…"} />
 
       {tab === "prospects" && (
         <>
-          <div className="opFilters">
-            <div className="chips">
-              {["All", ...P_STATUSES].map((s) => (
-                <button key={s} className="chip small" data-on={pFilter === s} onClick={() => setPFilter(s)}>{s} <i>{pCount(s)}</i></button>
+          <div className="opBoroughs" role="group" aria-label="Borough">
+            {[...BOARD_BOROUGHS, ...(boroughCounts.Other ? ["Other"] : [])].map((b) => (
+              <button key={b} type="button" aria-pressed={boroFilter === b} onClick={() => { setBoroFilter(b); setArchived(false); setLane(""); setCallFilter("all"); }}>
+                {b} <span>{boroughCounts[b]}</span>
+              </button>
+            ))}
+          </div>
+          <div className="opBoardBar">
+            <div className="opCallFilters" role="group" aria-label="Call activity">
+              {[["all", "All", found.length], ["called", "Called", calledCount], ["unlogged", "Not logged", found.length - calledCount]].map(([id, label, count]) => (
+                <button className="chip small" type="button" key={id} data-on={callFilter === id} aria-pressed={callFilter === id} onClick={() => {
+                  setCallFilter(id); setLane("");
+                }}>{label} <span>{count}</span></button>
               ))}
             </div>
-            {dates.length > 0 && (
-              <select className="opDate" value={dFilter} onChange={(e) => setDFilter(e.target.value)}>
-                <option value="All">All dates</option>
-                {dates.map((d) => <option key={d} value={d}>{dayLabel(d)}</option>)}
-              </select>
-            )}
+            <button className="opArchive" type="button" aria-pressed={archived} onClick={() => setArchived(!archived)}>
+              {archived ? "← Active board" : `Archive · ${archivedCount}`}
+            </button>
           </div>
-          {!allP.length && <div className="empty">No prospects yet. Each day's list of Bronx assemblage prospects lands here, newest first.</div>}
-          {allP.length > 0 && !pList.length && <div className="empty">Nothing matches these filters.</div>}
-          {groups.map((g) => (
-            <section key={g.date} className="opGroup">
-              <div className="opGroupHead">{dayLabel(g.date)} <span>{g.items.length} prospect{g.items.length === 1 ? "" : "s"}</span></div>
-              <div className="opGrid">
-                {g.items.map((p) => (
-                  <Prospect key={pkey(p)} p={p} status={pStatus(p)} note={st.prospects[pkey(p)]?.note || ""}
-                    contacts={linked(pkey(p))} onStatus={(s) => setPStatus(pkey(p), s)} onNote={(v) => setPNote(pkey(p), v)}
-                    onAdd={(n) => fromProspect(p, n)} onOpen={(c) => setForm({ ...c })} />
+          {!boroughCounts[boroFilter] ? <div className="empty">No prospects in {boroFilter === "Other" ? "other areas" : boroFilter} yet.</div> : (
+            <>
+              {!archived && <div className="opLanePicker" role="group" aria-label="Prospect stages">
+                {ACTIVE_STAGES.map((stage) => (
+                  <button key={stage} type="button" aria-pressed={selectedLane === stage} onClick={() => setLane(stage)}>
+                    {stage} <span>{byStage[stage].length}</span>
+                  </button>
+                ))}
+              </div>}
+              <div className="opBoard" data-archive={archived}>
+                {(archived ? CLOSED_STAGES.filter((stage) => stage !== "Other status" || byStage[stage].length) : ACTIVE_STAGES).map((stage) => (
+                  <section key={stage} className="opLane" data-stage={stage} data-shown={archived || selectedLane === stage} aria-label={stage}>
+                    <h2>{stage} <span>{byStage[stage].length}</span></h2>
+                    {!byStage[stage].length && <div className="opLaneEmpty">{t ? "No matches" : stage === "To Call" ? "No prospects to call" : "No prospects here"}</div>}
+                    {byStage[stage].map(({ p, key, entry, people, phone, called }) => (
+                      <Prospect key={key} p={p} stage={stage} entry={entry} people={people} phone={phone} called={called}
+                        onStatus={(next) => { setLane(stage); setPStatus(key, next); setAnnouncement(`${street(p.base?.address)} moved to ${next}.`); }}
+                        onLogCall={() => { editProspect(key, (e) => recordCall(e, new Date().toISOString())); setAnnouncement(`Call logged for ${street(p.base?.address)}.`); }}
+                        onClearCall={() => editProspect(key, (e) => clearCall(e, stage, phone, new Date().toISOString()))}
+                        onNote={(note) => editProspect(key, (e) => ({ ...e, note }))}
+                        onAdd={(n) => fromProspect(p, n)} onOpen={(c) => setForm({ ...c })} />
+                    ))}
+                  </section>
                 ))}
               </div>
-            </section>
-          ))}
+            </>
+          )}
         </>
       )}
 
@@ -353,68 +404,117 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
   );
 }
 
-function Prospect({ p, status, note, contacts, onStatus, onNote, onAdd, onOpen }) {
-  const b = p.base || {};
-  const [more, setMore] = useState(false);
-  const [n, setN] = useState(note);
-  useEffect(() => setN(note), [note]);
-  const bldg = [b.bldg_class, b.floors ? `${b.floors} fl` : "", b.units ? `${b.units} unit${b.units === 1 ? "" : "s"}` : "", b.existing_bldg_sf ? `${fmt(b.existing_bldg_sf)} SF` : "", b.year_built ? `built ${b.year_built}` : ""].filter(Boolean).join(" · ");
+const validUrl = (value) => {
+  if (typeof value !== "string" || !value) return "";
+  try {
+    const url = new URL(value);
+    return ["http:", "https:"].includes(url.protocol) && !url.username && !url.password ? url.href : "";
+  } catch { return ""; }
+};
+const sizeLabel = (value) => Number(value) > 0 && Number.isFinite(Number(value)) ? `${fmt(value)} SF` : "";
+const unitsLabel = (value) => Number(value) > 0 && Number.isFinite(Number(value)) ? `~${fmt(value)} units` : "";
+const assemblyLabel = (p) => p?.neighbors?.length
+  ? [sizeLabel(p.combined_buildable_gsf) && `~${sizeLabel(p.combined_buildable_gsf)} combined buildable`, unitsLabel(p.est_units)].filter(Boolean).join(" · ")
+  : "";
+
+function ZoLa({ url, small }) {
+  const href = validUrl(url);
+  return href ? <a className={`opZola${small ? " sm" : ""}`} href={href} target="_blank" rel="noopener noreferrer">ZoLa</a> : null;
+}
+
+function Prospect({ p, stage, entry, people, phone, called, onStatus, onLogCall, onClearCall, onNote, onAdd, onOpen }) {
+  const b = p.base || {}, m = parcelMetrics(b), pick = researchTag(p), assembly = assemblyLabel(p);
+  const [note, setNote] = useState(entry.note || "");
+  useEffect(() => setNote(entry.note || ""), [entry.note]);
+  const bldg = [b.bldg_class, b.floors > 0 && `${b.floors} fl`, b.units > 0 && `${b.units} unit${Number(b.units) === 1 ? "" : "s"}`,
+    sizeLabel(b.existing_bldg_sf), b.year_built > 0 && `built ${b.year_built}`].filter(Boolean).join(" · ");
+  const owner = people.find((c) => c.role === "owner");
+  const callback = people.find((c) => c.callbackAt && c.status !== "Converted" && c.status !== "Not interested");
+  const active = ACTIVE_STAGES.includes(stage);
+  const waiting = stage === "To Call" || stage === "No Number";
+  const publicContact = p.owner_contact;
+  const publicSource = validUrl(publicContact?.source_url);
+  const publicUrl = validUrl(publicContact?.url);
+  const publicTel = ownerPhone(publicContact?.phone);
   return (
-    <div className="opCard" data-s={status}>
+    <article className="opCard" data-stage={stage} aria-label={street(b.address) || "Prospect"}>
       <div className="opCardTop">
-        <span className="opRank">#{p.rank}</span>
         <div className="opAddrWrap">
-          <div className="opAddr">{street(b.address)}</div>
-          <div className="opSub">{[p.neighborhood, b.zoning, b.front_ft && b.depth_ft ? `${far(b.front_ft)}×${far(b.depth_ft)}` : "", b.lot_sf ? `${fmt(b.lot_sf)} SF lot` : ""].filter(Boolean).join(" · ")}</div>
+          <h3 className="opAddr">{street(b.address) || "Address unavailable"}</h3>
+          <div className="opSub">{[p.neighborhood || prospectBorough(p), b.zoning].filter(Boolean).join(" · ")}</div>
         </div>
-        {b.zola && <a className="opZola" href={b.zola} target="_blank" rel="noopener noreferrer">ZoLa</a>}
+        <ZoLa url={b.zola} />
       </div>
-      <div className="opLine"><label>Existing</label>{bldg || (b.existing_bldg_sf === 0 ? "Vacant" : "—")}</div>
-      <div className="opLine"><label>Owner</label><span className="opOwner">{titleCase(b.owner) || "—"}</span>
-        <button className="opAdd" onClick={() => onAdd(null)}>+ Contact</button></div>
-
       <div className="opNums">
-        <div><label>Combined</label><b>~{fmt(p.est_units)} units</b><small>{fmt(p.combined_buildable_gsf)} GSF</small></div>
-        <div><label>With UAP</label><b>~{fmt(p.est_units_uap)} units</b><small>{fmt(p.combined_buildable_gsf_uap)} GSF</small></div>
+        <div><span>Lot area</span><b>{sizeLabel(m.lot) || "—"}</b></div>
+        <div><span>Buildable · this lot</span><b>{m.aor ? `~${sizeLabel(m.aor)}` : "—"}</b><small>{m.aor ? "Est. as of right" : "Not available"}</small></div>
       </div>
-      <div className="opSmall">Base unused {fmt(b.unused_sf)} SF · FAR {far(b.max_far)} / UAP {far(b.max_far_uap)}</div>
-
-      {(p.neighbors || []).length > 0 && (
-        <div className="opNbrs">
-          {(p.neighbors || []).map((x, i) => (
-            <div key={i} className="opNbr">
-              <span className="opSide">{x.side || "adj."}</span>
-              <div className="opNbrMain">
-                <div><b>{street(x.address)}</b> <span className="opPlus">+{fmt(x.unused_sf)} SF</span></div>
-                <div className="opNbrOwner">{titleCase(x.owner) || "—"}</div>
-              </div>
-              <div className="opNbrActs">
-                {x.zola && <a className="opZola sm" href={x.zola} target="_blank" rel="noopener noreferrer">ZoLa</a>}
-                <button className="opAdd" onClick={() => onAdd(x)}>+ Contact</button>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {(p.why || p.risks) && (
-        <div className="opWhy" data-more={more} onClick={() => setMore(!more)}>
+      <div className="opCardFlags">
+        {pick && <span className="opPick" title={pick}>Call First</span>}
+        <span className="opCallFlag" data-called={called}>{called ? "✓ Called" : "Call not logged"}</span>
+      </div>
+      <div className="opOwnerLine">
+        <span className="opOwner">{owner?.name || titleCase(b.owner) || "Owner not listed"}</span>
+        {phone && <a className="opAdd" href={`tel:${phone}`}>Call</a>}
+        <button className="opAdd" onClick={() => owner ? onOpen(owner) : onAdd(null)}>{owner ? (phone ? "Contact" : "Add number") : "+ Contact"}</button>
+      </div>
+      {callback && <div className="followTag">Call back {whenLabel(callback.callbackAt)}</div>}
+      <div className="opCardBtns">
+        {!called && active && (waiting || stage === "Called"
+          ? <button className="opMark" type="button" onClick={() => onStatus("Called")}>Mark Called</button>
+          : <button className="opMark" type="button" onClick={onLogCall}>Log call</button>)}
+        <select className="opMove" aria-label="Move to stage" value="" onChange={(e) => onStatus(e.target.value)}>
+          <option value="" disabled>Move to…</option>
+          {[...ACTIVE_STAGES, ...CLOSED_STAGES.slice(0, 2)].filter((next) => next !== stage).map((next) => <option key={next}>{next}</option>)}
+        </select>
+      </div>
+      <details className="opDetails">
+        <summary>Details{entry.note ? " · Note saved" : ""}</summary>
+        <div className="opMeta">{[p.rank && `#${p.rank}`, p.date && `Added ${dayLabel(p.date)}`, b.bbl && `BBL ${b.bbl}`].filter(Boolean).join(" · ")}</div>
+        {entry.status && entry.status !== "New" && <div className="opMeta">Previous status: {entry.status}</div>}
+        {called && <div className="opMeta">{entry.calledAt ? `Call logged ${noteTime(entry.calledAt)}` : "Call date not recorded"} · <button type="button" className="opTxt" onClick={onClearCall}>Undo call log</button></div>}
+        {pick && <div className="opMeta">{pick} is a research recommendation, not seller interest.</div>}
+        <div className="opDetailsCopy">
+          {bldg && <div><b>Existing</b> {bldg}</div>}
+          {b.front_ft > 0 && <div><b>Frontage</b> {far(b.front_ft)} ft{b.depth_ft > 0 && ` · ${far(b.depth_ft)} ft deep`}</div>}
+          {m.legacy && <div><b>Estimate basis</b> Lot area × {far(m.far)} FAR from the original list.</div>}
+          {sizeLabel(b.unused_sf) && <div><b>Unused on this lot</b> ~{sizeLabel(b.unused_sf)}</div>}
+          {m.uap && <div><b>This lot with UAP</b> ~{sizeLabel(m.uap)} if applicable</div>}
+          {typeof p.why_now === "string" && <div><b>Why now</b> {p.why_now}</div>}
           {p.why && <div><b>Why</b> {p.why}</div>}
           {p.risks && <div className="opRisk"><b>Risks</b> {p.risks}</div>}
         </div>
-      )}
-
-      {contacts.length > 0 && (
-        <div className="opLinked">
-          {contacts.map((c) => <button key={c.id} className="opPerson" onClick={() => onOpen(c)}>{c.name}{c.callbackAt ? ` · ${whenLabel(c.callbackAt)}` : ""}</button>)}
-        </div>
-      )}
-
-      <div className="opStatus">
-        {P_STATUSES.map((s) => <button key={s} data-s={s} data-on={status === s} onClick={() => onStatus(s)}>{s}</button>)}
-      </div>
-      <input className="opNote" value={n} onChange={(e) => setN(e.target.value)} onBlur={() => n !== note && onNote(n)} placeholder="Quick note…" />
-    </div>
+        {publicSource && (publicContact.name || publicUrl || publicTel) && (
+          <div className="opDetailsCopy opPublicContact">
+            <b>Public owner contact route</b>
+            <div>{[publicContact.name, publicContact.role].filter(Boolean).join(" · ")}</div>
+            {publicTel && <a href={`tel:${publicTel}`}>{publicContact.phone}</a>}
+            {publicUrl && <a href={publicUrl} target="_blank" rel="noopener noreferrer">Contact page</a>}
+            <a href={publicSource} target="_blank" rel="noopener noreferrer">Source{publicContact.checked_date ? ` · ${publicContact.checked_date}` : ""}</a>
+          </div>
+        )}
+        {!!p.neighbors?.length && (
+          <div className="opNbrs">
+            <h4>Optional assemblage</h4>
+            {assembly && <div className="opMeta">{assembly} (estimate)</div>}
+            {p.neighbors.map((n, i) => (
+              <div key={`${n.bbl || n.address}-${i}`} className="opNbr">
+                <div className="opNbrMain">
+                  <b>{street(n.address)}</b>
+                  <div className="opMeta">{[n.side || "Adjacent", titleCase(n.owner), sizeLabel(n.unused_sf) && `~${sizeLabel(n.unused_sf)} unused`].filter(Boolean).join(" · ")}</div>
+                </div>
+                <div className="opNbrActs"><ZoLa url={n.zola} small /><button className="opAdd" onClick={() => onAdd(n)}>+ Contact</button></div>
+              </div>
+            ))}
+          </div>
+        )}
+        {!!people.length && <div className="opLinked">
+          {people.map((c) => <button key={c.id} className="opPerson" onClick={() => onOpen(c)}>{c.name}{c.callbackAt ? ` · ${whenLabel(c.callbackAt)}` : ""}</button>)}
+        </div>}
+        <input className="opNote" aria-label="Quick note" value={note} onChange={(e) => setNote(e.target.value)}
+          onBlur={() => note !== (entry.note || "") && onNote(note)} placeholder="Quick note…" />
+      </details>
+    </article>
   );
 }
 
@@ -436,21 +536,21 @@ function ContactCard({ f, setF, prospects, pByKey, onSave, onBack, onAddNote, on
 
       <div className="fgroup">
         <div className="frow">
-          <div className="field"><label className="flabel">Name</label><input value={f.name} onChange={set("name")} placeholder="Owner name" /></div>
+          <div className="field"><label className="flabel" htmlFor="opContactName">Name</label><input id="opContactName" value={f.name} onChange={set("name")} placeholder="Owner name" /></div>
           <div className="field opRoleF"><label className="flabel">Role</label>
             <select value={f.role} onChange={set("role")}>{ROLES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}</select></div>
         </div>
         <div className="frow">
-          <div className="field"><label className="flabel">Phone</label><input type="tel" value={f.phone || ""} onChange={set("phone")} placeholder="(718) 555-0100" /></div>
+          <div className="field"><label className="flabel" htmlFor="opContactPhone">Phone</label><input id="opContactPhone" type="tel" value={f.phone || ""} onChange={set("phone")} placeholder="(718) 555-0100" /></div>
           <div className="field"><label className="flabel">Email</label><input type="email" value={f.email || ""} onChange={set("email")} /></div>
         </div>
-        <div className="field"><label className="flabel">Property address</label><input value={f.address || ""} onChange={set("address")} placeholder="123 Main St, Bronx" /></div>
+        <div className="field"><label className="flabel" htmlFor="opContactAddress">Property address</label><input id="opContactAddress" value={f.address || ""} onChange={set("address")} placeholder="Street address, borough" /></div>
         <div className="field"><label className="flabel">Linked prospect</label>
           <select value={f.prospectKey || ""} onChange={set("prospectKey")}>
             <option value="">None</option>
             {prospects.map((x) => { const k = pkey(x); return <option key={k} value={k}>#{x.rank} {street(x.base?.address)} · {dayLabel(x.date)}</option>; })}
           </select>
-          {p && <div className="hintline">{p.base?.zoning} · ~{fmt(p.est_units)} units combined ({fmt(p.combined_buildable_gsf)} GSF){p.base?.zola ? <> · <a href={p.base.zola} target="_blank" rel="noopener noreferrer">ZoLa</a></> : null}</div>}
+          {p && <div className="hintline">{[prospectBorough(p), p.base?.zoning, parcelMetrics(p.base || {}).aor && `~${fmt(parcelMetrics(p.base || {}).aor)} SF on this lot`].filter(Boolean).join(" · ")}{validUrl(p.base?.zola) ? <> · <ZoLa url={p.base.zola} /></> : null}</div>}
         </div>
         <QuickActions phone={f.phone} email={f.email} />
       </div>
@@ -527,55 +627,69 @@ const OP_CSS = `
 .opFilters .chip{white-space:nowrap}
 .opFilters .chip i{font-style:normal;opacity:.55;margin-left:3px;font-weight:600}
 .opFilters .chip i.dueI{background:${RED};color:#fff;opacity:1;border-radius:9px;padding:0 6px;font-size:11px}
-.opDate{width:auto;font-size:14px;padding:6px 9px}
-.opGroup{margin-bottom:22px}
-.opGroupHead{font-size:11px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;color:${BRASS};margin:0 0 8px}
-.opGroupHead span{color:${INK};opacity:.45;margin-left:6px}
-.opGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px}
-.opCard{background:#fff;border:1px solid ${LINE};border-radius:10px;padding:12px 13px;font-size:13px;border-left:3px solid ${LINE};min-width:0}
-.opCard[data-s="Interested"]{border-left-color:${GREEN}}
-.opCard[data-s="Calling"]{border-left-color:${BLUE}}
-.opCard[data-s="Follow-up"]{border-left-color:${BRASS}}
-.opCard[data-s="Pass"]{opacity:.55}
-.opCardTop{display:flex;gap:9px;align-items:flex-start;margin-bottom:6px}
-.opRank{background:${INK};color:#fff;font-weight:800;font-size:12px;border-radius:6px;padding:3px 6px;flex-shrink:0;margin-top:1px}
+.opSR{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+.op button:focus-visible,.op a:focus-visible,.op summary:focus-visible{outline:2px solid ${BLUE};outline-offset:2px}
+.opBoroughs,.opLanePicker{display:flex;gap:7px;min-width:0;flex-wrap:wrap}
+.opBoroughs{margin:4px 0 12px}
+.opBoroughs button,.opLanePicker button{border:1px solid ${LINE};background:#fff;color:${INK};font-weight:750;border-radius:8px;padding:9px 13px;white-space:nowrap;min-height:40px}
+.opBoroughs button[aria-pressed="true"],.opLanePicker button[aria-pressed="true"]{background:${INK};color:#fff;border-color:${INK}}
+.opBoroughs span,.opLanePicker span,.opCallFilters span{font-size:.86em;margin-left:3px;font-weight:700;opacity:.77}
+.opBoardBar{display:flex;gap:8px;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap}
+.opCallFilters{display:flex;gap:5px;flex-wrap:wrap}
+.opCallFilters .chip{padding:6px 9px;min-height:34px;white-space:nowrap}
+.opArchive{border:1px solid ${LINE};background:#fff;color:${INK};min-height:34px;font-weight:700;border-radius:18px;padding:5px 10px;white-space:nowrap}
+.opLanePicker{display:none}
+.opBoard{display:grid;grid-template-columns:repeat(5,minmax(206px,1fr));align-items:start;gap:8px;max-width:100%;overflow-x:auto;scroll-snap-type:x proximity;padding-bottom:10px;margin-bottom:14px}
+.opBoard[data-archive="true"]{grid-template-columns:repeat(auto-fit,minmax(206px,1fr))}
+.opLane{min-width:0;min-height:125px;background:#EFEBDF;border-radius:10px;padding:7px;scroll-snap-align:start}
+.opLane h2{display:flex;align-items:center;justify-content:space-between;gap:6px;color:#514B3E;font-size:11px;font-weight:800;letter-spacing:.075em;text-transform:uppercase;margin:0;padding:4px 3px 8px}
+.opLane h2 span{border-radius:12px;background:#fff;font-size:11px;padding:2px 7px;letter-spacing:0}
+.opLaneEmpty{font-size:12px;color:#675D4C;text-align:center;padding:19px 5px}
+.opCard{background:#fff;border:1px solid ${LINE};border-top:3px solid ${BLUE};border-radius:9px;padding:10px;font-size:13px;min-width:0;overflow-wrap:anywhere}
+.opCard+.opCard{margin-top:8px}
+.opCard[data-stage="No Number"],.opCard[data-stage="Pass"],.opCard[data-stage="Other status"]{border-top-color:#8A8374}
+.opCard[data-stage="Follow Up"]{border-top-color:${BRASS}}
+.opCard[data-stage="Called"],.opCard[data-stage="Hot Lead"],.opCard[data-stage="Converted"]{border-top-color:${GREEN}}
+.opCardTop{display:flex;gap:5px;align-items:flex-start;margin-bottom:7px}
 .opAddrWrap{flex:1;min-width:0}
-.opAddr{font-size:15.5px;font-weight:800;line-height:1.2}
-.opSub{font-size:12px;opacity:.6;margin-top:2px}
-.opZola{flex-shrink:0;font-size:12px;font-weight:700;color:${BLUE};text-decoration:none;border:1px solid ${LINE};border-radius:20px;padding:4px 10px}
-.opZola.sm{padding:2px 8px;font-size:11.5px}
-.opLine{display:flex;gap:8px;align-items:center;padding:2px 0;line-height:1.35}
-.opLine label,.opNums label{font-size:10px;text-transform:uppercase;letter-spacing:.08em;opacity:.5;flex:0 0 58px}
-.opOwner{flex:1;min-width:0;font-weight:600}
-.opAdd{background:none;border:none;color:${BLUE};font-weight:700;font-size:12px;padding:2px 0;white-space:nowrap}
-.opNums{display:grid;grid-template-columns:1fr 1fr;gap:6px;background:#F4F6FB;border-radius:8px;padding:8px 10px;margin:8px 0 4px}
-.opNums label{display:block}
-.opNums b{font-size:15px;font-weight:700;display:block;line-height:1.25}
-.opNums small{font-size:12px;opacity:.65}
-.opNums > div:last-child b{color:${BRASS}}
-.opSmall{font-size:11.5px;opacity:.6}
-.opNbrs{margin-top:8px;border-top:1px solid ${LINE}}
-.opNbr{display:flex;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid ${LINE}}
-.opSide{flex:0 0 46px;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;color:${BRASS}}
+.opAddr{font-size:15px;font-weight:800;line-height:1.25;margin:0}
+.opSub{font-size:11.5px;color:#5D6472;margin-top:2px}
+.opZola{display:inline-block;flex-shrink:0;font-size:11px;font-weight:750;color:${BLUE};text-decoration:none;border:1px solid ${LINE};border-radius:20px;padding:5px 7px}
+.opZola.sm{padding:4px 7px}
+.opNums{display:grid;grid-template-columns:4fr 5fr;gap:5px;background:#F5F3EC;border-radius:7px;padding:7px 6px;margin:5px 0 8px}
+.opNums span,.opNums small{display:block;font-size:10px;color:#595447;line-height:1.23}
+.opNums b{font-size:14px;font-weight:800;display:block;line-height:1.25;margin:2px 0 1px}
+.opNums > div:last-child b{color:#765721}
+.opCardFlags,.opOwnerLine,.opCardBtns{display:flex;align-items:center;flex-wrap:wrap;gap:5px;margin-top:5px}
+.opCallFlag,.opPick{display:inline-block;border-radius:14px;background:#F0F1F3;color:#455063;padding:3px 6px;font-size:10.5px;font-weight:750;line-height:1.15}
+.opCallFlag[data-called="true"]{background:#E6F2EC;color:#215F45}
+.opPick{background:#F7EDCF;color:#715014}
+.opOwner{flex:1 1 58px;min-width:0;font-size:12px;font-weight:650}
+.opAdd{background:none;border:none;color:${BLUE};font-weight:750;font-size:12px;padding:6px 1px;white-space:nowrap;text-decoration:none}
+.opCardBtns{margin:6px 0 1px}
+.opMark,.opMove{min-height:34px;font-weight:750;font-size:12px;border-radius:7px;padding:6px 7px}
+.opMark{background:${INK};border:1px solid ${INK};color:white;flex:0 1 auto;white-space:nowrap}
+.opMove{flex:1 1 73px;min-width:72px;width:auto;background:#fff;border:1px solid ${LINE}}
+.opDetails{margin-top:8px;border-top:1px solid ${LINE};color:${INK}}
+.opDetails summary{cursor:pointer;font-size:12px;font-weight:750;padding:7px 0 1px;color:#3F4C61}
+.opDetails[open] summary{margin-bottom:5px}
+.opMeta{font-size:11px;color:#5D6472;line-height:1.35}
+.opDetailsCopy{font-size:12px;line-height:1.45;margin-top:7px;display:grid;gap:4px}
+.opRisk{color:${RED}}
+.opPublicContact a{color:${BLUE}}
+.opNbrs{margin-top:8px;border-top:1px solid ${LINE};padding-top:7px}
+.opNbrs h4{margin:0 0 3px;font-size:12px}
+.opNbr{display:flex;gap:6px;align-items:center;padding:6px 0;border-bottom:1px solid ${LINE}}
 .opNbrMain{flex:1;min-width:0;font-size:12.5px}
-.opNbrMain b{font-weight:700}
-.opPlus{color:${GREEN};font-weight:700;font-size:12px;white-space:nowrap}
-.opNbrOwner{font-size:11.5px;opacity:.6;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .opNbrActs{display:flex;flex-direction:column;align-items:flex-end;gap:3px}
-.opWhy{margin-top:8px;font-size:12.5px;line-height:1.4;cursor:pointer}
-.opWhy b{font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin-right:4px;opacity:.55}
-.opWhy > div{overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
-.opWhy[data-more="true"] > div{display:block}
-.opRisk{color:${RED};margin-top:2px}
 .opLinked{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
 .opPerson{background:#EAF0FB;color:${BLUE};border:none;border-radius:20px;padding:3px 10px;font-size:12px;font-weight:700}
 .opStatus{display:flex;gap:4px;margin-top:9px;flex-wrap:wrap}
 .opStatus button{flex:1 1 auto;background:#fff;border:1px solid ${LINE};border-radius:20px;padding:5px 8px;font-size:12px;font-weight:600;color:${INK};white-space:nowrap}
 .opStatus button[data-on="true"]{background:${INK};color:#fff;border-color:${INK}}
-.opStatus button[data-on="true"][data-s="Interested"],.opStatus button[data-on="true"][data-cs="Converted"]{background:${GREEN};border-color:${GREEN}}
-.opStatus button[data-on="true"][data-s="Calling"]{background:${BLUE};border-color:${BLUE}}
-.opStatus button[data-on="true"][data-s="Follow-up"],.opStatus button[data-on="true"][data-cs="Follow-up"]{background:${BRASS};border-color:${BRASS}}
-.opStatus button[data-on="true"][data-s="Pass"],.opStatus button[data-on="true"][data-cs="Not interested"]{background:#6A6558;border-color:#6A6558}
+.opStatus button[data-on="true"][data-cs="Converted"]{background:${GREEN};border-color:${GREEN}}
+.opStatus button[data-on="true"][data-cs="Follow-up"]{background:${BRASS};border-color:${BRASS}}
+.opStatus button[data-on="true"][data-cs="Not interested"]{background:#6A6558;border-color:#6A6558}
 .opStatus.wide button{padding:8px 10px;font-size:13px}
 .opNote{margin-top:8px;font-size:14px;padding:7px 10px}
 .opLeads{display:flex;flex-direction:column;gap:8px;max-width:760px}
@@ -608,8 +722,23 @@ const OP_CSS = `
 .opTxt.danger2{color:${RED};font-size:13px;margin-left:auto}
 .opFormActs{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:4px 0 30px}
 .opConvert{border-color:${GREEN};color:${GREEN};font-weight:700}
+@media (max-width:820px){
+  .opLanePicker{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:6px;margin:0 0 9px}
+  .opLanePicker button{grid-column:span 2;padding:7px 4px;font-size:12px;min-height:38px}
+  .opLanePicker button:nth-last-child(-n+2){grid-column:span 3}
+  .opBoroughs button{flex:1 1 auto;padding:8px;font-size:13px}
+  .opBoard,.opBoard[data-archive="true"]{grid-template-columns:minmax(0,1fr);overflow:visible;scroll-snap-type:none}
+  .opLane[data-shown="false"]{display:none}
+  .opCard{padding:12px}
+  .opCardTop{gap:8px}
+  .opNums{padding:8px 10px}
+  .opNums span,.opNums small{font-size:11px}
+  .opNums b{font-size:18px}
+  .opMark,.opMove,.opAdd,.opZola,.opDetails summary{min-height:40px}
+  .opAdd,.opZola{display:inline-flex;align-items:center}
+  .opDetails summary{padding:11px 0 4px}
+}
 @media (max-width:760px){
-  .opGrid{grid-template-columns:1fr}
   .op .pageHead h1{font-size:22px}
   .opFormActs .primary,.opFormActs .opConvert{flex:1 1 45%}
 }
