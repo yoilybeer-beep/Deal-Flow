@@ -1,9 +1,12 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { supabase } from "./supabaseClient";
 import { QuickActions } from "./crmKit";
+import OpportunityEditor from "./OpportunityEditor";
+import { applyCardEdits, conversionParcel, opportunityCard } from "./opportunityEdits";
+import { commitOpportunityState, readOpportunityState } from "./opportunityState";
 import {
   ACTIVE_STAGES, BOARD_BOROUGHS, CLOSED_STAGES, addressBorough, boroughName, clearCall, hasCall, lotDimensions,
-  moveProspect, neighborBorough, ownerPhone, parcelMetrics, prospectBorough, prospectKey as pkey, prospectPhone, recordCall,
+  moveProspect, ownerPhone, parcelMetrics, prospectKey as pkey, recordCall,
   prospectStage, researchTag, street, withBorough,
 } from "./opportunityBoard";
 
@@ -12,8 +15,8 @@ import {
    Storage (no schema change, no data in this repo):
    - daily batches : public.models rows, id "opps-batch-YYYY-MM-DD",
                      data = { kind: "opps_batch", date, prospects: [...] }
-   - your statuses : public.models row "opps-state-<user id>",
-                     data = { kind: "opps_state", prospects: {key: {stage, stageAt, called, calledAt, note, …legacy}},
+   - your activity + card edits: public.models row "opps-state-<user id>",
+                     data = { kind: "opps_state", prospects: {key: {stage, stageAt, called, calledAt, note, cardEdits, …legacy}},
                               contacts: {contactId: {role, status, callbackAt, prospectKey}} }
    - people + notes: public.contacts + public.contact_notes (same as Contacts),
                      call-back date mirrors into contacts.follow_up_date (shows on Home > Today)
@@ -28,7 +31,6 @@ const far = (n) => (Number(n) ? String(Math.round(Number(n) * 100) / 100) : "—
 const pad = (n) => String(n).padStart(2, "0");
 const localISO = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 const todayStr = () => localISO(new Date()).slice(0, 10);
-const titleCase = (s) => String(s || "").toLowerCase().replace(/\b([a-z])/g, (m) => m.toUpperCase()).replace(/\bLlc\b/g, "LLC").replace(/\bInc\b/g, "Inc").replace(/\bCorp\b/g, "Corp");
 const dayLabel = (iso) => {
   const d = new Date(String(iso).slice(0, 10) + "T12:00:00");
   return isNaN(d) ? iso : d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
@@ -65,7 +67,11 @@ const noteTime = (iso) => {
 const newId = () => (crypto.randomUUID ? crypto.randomUUID() : "x" + Date.now().toString(36) + Math.random().toString(36).slice(2));
 const appId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);   // same as uid() in App.jsx
 
-export default function Opportunities({ userId, userName, notify, onGo }) {
+export default function Opportunities(props) {
+  return props.userId ? <OpportunityWorkspace key={props.userId} {...props} /> : null;
+}
+
+function OpportunityWorkspace({ userId, userName, notify, onGo }) {
   const [loaded, setLoaded] = useState(false);
   const [loadErr, setLoadErr] = useState("");
   const [batches, setBatches] = useState([]);          // [{date, prospects}]
@@ -81,60 +87,108 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
   const [archived, setArchived] = useState(false);
   const [cFilter, setCFilter] = useState("All");
   const [form, setForm] = useState(null);
+  const [editor, setEditor] = useState(null);
   const stRef = useRef(st);
   const saving = useRef(Promise.resolve());
-  const STATE_ID = `${OPPS_PREFIX}state-${userId}`;
+  const lifetime = useRef(null);
 
-  const load = async () => {
-    const [b, s, c] = await Promise.all([
-      supabase.from("models").select("id, data, updated_at").like("id", `${OPPS_PREFIX}batch-%`),
-      supabase.from("models").select("id, data").eq("id", STATE_ID).maybeSingle(),
-      supabase.from("contacts").select("id, name, phone, email, address, area, type, follow_up_date, last_contacted, converted_deal_id, owner_id, updated_at, contact_notes(id, body, noted_at, author_name, owner_id)"),
-    ]);
-    if (b.error || c.error || s.error) setLoadErr((b.error || c.error || s.error).message || "Couldn't load.");
-    const bs = (b.data || []).map((r) => ({ date: r.data?.date || String(r.id).slice(-10), prospects: Array.isArray(r.data?.prospects) ? r.data.prospects : [] }))
-      .sort((x, y) => (x.date < y.date ? 1 : -1));
-    setBatches(bs);
-    const sd = s.data?.data || {};
-    const next = { ...sd, prospects: sd.prospects || {}, contacts: sd.contacts || {} };
-    stRef.current = next; setSt(next);
-    setContacts(c.data || []);
-    setLoaded(s.error ? "state-error" : true);
+  const observeState = (next, signal) => {
+    if (signal.aborted) return;
+    stRef.current = next;
+    setSt(next);
   };
-  useEffect(() => { load(); }, []);
+  const load = async (signal) => {
+    try {
+      const [b, next, c] = await Promise.all([
+        supabase.from("models").select("id, data, updated_at").like("id", `${OPPS_PREFIX}batch-%`).abortSignal(signal),
+        readOpportunityState(supabase, userId, signal),
+        supabase.from("contacts").select("id, name, phone, email, address, area, type, follow_up_date, last_contacted, converted_deal_id, owner_id, updated_at, contact_notes(id, body, noted_at, author_name, owner_id)").abortSignal(signal),
+      ]);
+      if (signal.aborted) return;
+      if (b.error || c.error) setLoadErr((b.error || c.error).message || "Couldn't load.");
+      const bs = (b.data || []).map((r) => ({ date: r.data?.date || String(r.id).slice(-10), prospects: Array.isArray(r.data?.prospects) ? r.data.prospects : [] }))
+        .sort((x, y) => (x.date < y.date ? 1 : -1));
+      setBatches(bs);
+      observeState(next, signal);
+      setContacts(c.data || []);
+      setLoaded(true);
+    } catch { if (!signal.aborted) setLoaded("state-error"); }
+  };
+  useEffect(() => {
+    const controller = new AbortController();
+    lifetime.current = controller;
+    load(controller.signal);
+    return () => controller.abort();
+  }, [userId]);
 
-  const queueState = () => {
-    saving.current = saving.current.then(async () => {
-      const { error } = await supabase.from("models").upsert({
-        id: STATE_ID, data: { ...stRef.current, kind: "opps_state" }, owner_id: userId, is_public: false, updated_at: new Date().toISOString(),
-      });
-      if (error) throw error;
-      setSaveErr(false);
-    }).catch(() => setSaveErr(true));
+  const commitState = (change) => {
+    const signal = lifetime.current.signal;
+    const job = saving.current.then(async () => {
+      const next = await commitOpportunityState(supabase, userId, signal, change, (before) => observeState(before, signal));
+      observeState(next, signal);
+      if (!signal.aborted) setSaveErr(false);
+      return next;
+    });
+    saving.current = job.catch(() => {});
+    return job;
   };
-  const putState = (fn) => {
-    const next = fn(stRef.current);
-    stRef.current = next; setSt(next);
-    queueState();
-    return next;
+  const putState = (change) => commitState(change).catch(() => {
+    if (!lifetime.current.signal.aborted) setSaveErr(true);
+    return null;
+  });
+  const changeProspect = (key, edit) => (s) => {
+    const before = s.prospects[key] || {};
+    const next = edit(before);
+    return next === before ? s : { ...s, prospects: { ...s.prospects, [key]: next } };
   };
-  const editProspect = (key, edit) => putState((s) => ({ ...s, prospects: { ...s.prospects, [key]: edit(s.prospects[key] || {}) } }));
-  const setPStatus = (key, stage) => editProspect(key, (entry) => moveProspect(entry, stage, new Date().toISOString()));
+  const editProspect = (key, edit) => putState(changeProspect(key, edit));
+  const setPStatus = (key, stage) => {
+    const at = new Date().toISOString();
+    return editProspect(key, (entry) => moveProspect(entry, stage, at));
+  };
 
   const allP = useMemo(() => batches.flatMap((b) => b.prospects.map((p) => ({ ...p, date: p.date || b.date }))), [batches]);
-  const pByKey = useMemo(() => Object.fromEntries(allP.map((p) => [pkey(p), p])), [allP]);
   const crm = useMemo(() => contacts.filter((c) => st.contacts[c.id]).map((c) => ({
     ...c, ...st.contacts[c.id],
     notes: [...(c.contact_notes || [])].sort((a, b) => (a.noted_at < b.noted_at ? 1 : -1)),
   })), [contacts, st]);
+  const boards = useMemo(() => {
+    const linked = new Map();
+    for (const c of crm) if (c.prospectKey) {
+      if (!linked.has(c.prospectKey)) linked.set(c.prospectKey, []);
+      linked.get(c.prospectKey).push(c);
+    }
+    return allP.map((source) => {
+      const key = pkey(source), entry = st.prospects[key] || {}, people = linked.get(key) || [];
+      const card = opportunityCard(source, entry, people);
+      return { p: card.display, card, key, entry, people, phone: card.phone, borough: card.borough,
+        priority: !!researchTag(source), called: hasCall(entry), stage: prospectStage(entry, card.phone, people) };
+    }).sort((a, b) => String(b.p.date).localeCompare(String(a.p.date)) || (a.p.rank || 0) - (b.p.rank || 0));
+  }, [allP, crm, st.prospects]);
+  const byKey = useMemo(() => Object.fromEntries(boards.map((item) => [item.key, item])), [boards]);
+  const saveCard = async (changes) => {
+    const { key, card } = editor;
+    const next = await commitState(changeProspect(key, (entry) => applyCardEdits(entry, card.edits, changes)));
+    if (lifetime.current.signal.aborted) return;
+    const item = byKey[key];
+    const entry = next.prospects[key] || {};
+    const saved = opportunityCard(card.source, entry, item.people);
+    const stage = prospectStage(entry, saved.phone, item.people);
+    setBoroFilter(BOARD_BOROUGHS.includes(saved.borough) ? saved.borough : "Other");
+    setLane(stage); setArchived(CLOSED_STAGES.includes(stage));
+    // Keep the saved card in sight if its changed address/phone no longer matches the old query.
+    if (q && !matchesCard({ card: saved, p: saved.display, entry, people: item.people }, q.trim().toLowerCase())) setQ("");
+    setEditor(null);
+    notify?.(editor.phoneOnly ? (saved.phone ? "Phone saved." : "Phone cleared.") : "Card saved.");
+  };
   const dueCount = crm.filter((c) => c.status !== "Converted" && c.status !== "Not interested" && ["overdue", "today"].includes(dueState(c.callbackAt))).length;
 
   /* ---------------- contacts ---------------- */
   const openNew = (seed = {}) => setForm({ id: null, name: "", role: "owner", phone: "", email: "", address: "", prospectKey: "", status: "Lead", callbackAt: "", notes: [], ...seed });
-  const fromProspect = (p, n) => {
-    const k = pkey(p);
-    if (n) openNew({ name: titleCase(n.owner), role: "neighbor", address: withBorough(n.address, neighborBorough(n, p)), prospectKey: k });
-    else openNew({ name: titleCase(p.base?.owner), role: "owner", address: withBorough(p.base?.address, prospectBorough(p)), prospectKey: k });
+  const fromProspect = (key, card, n) => {
+    if (n) openNew({ name: n.owner || "", role: "neighbor", address: withBorough(n.address, n.displayBorough), prospectKey: key });
+    else openNew({ name: card.values.name, role: "owner", phone: card.values.phone, email: card.values.email,
+      address: withBorough(card.values.address, card.borough), prospectKey: key });
     window.scrollTo(0, 0);
   };
 
@@ -144,15 +198,16 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
     const isNew = !f.id;
     const id = f.id || newId();
     const prev = contacts.find((c) => c.id === id) || {};
-    const p = pByKey[f.prospectKey];
-    const neighbor = f.role === "neighbor" && p?.neighbors?.find((n) => street(n.address).toLowerCase() === street(f.address).toLowerCase());
-    const source = neighbor || (f.role !== "neighbor" ? p?.base : null);
-    const linkedBorough = neighbor ? neighborBorough(neighbor, p) : prospectBorough(p);
-    const address = source && street(source.address).toLowerCase() === street(f.address).toLowerCase()
+    const linked = byKey[f.prospectKey];
+    const neighbor = f.role === "neighbor" && linked?.p.neighbors.find((n) => street(n.address).toLowerCase() === street(f.address).toLowerCase());
+    const source = neighbor || (f.role !== "neighbor" ? linked?.p.base : null);
+    const linkedBorough = neighbor ? neighbor.displayBorough : linked?.borough;
+    // Do not replace a saved CRM address/borough when a linked card is edited.
+    const address = (isNew || f.address !== prev.address) && source && street(source.address).toLowerCase() === street(f.address).toLowerCase()
       ? withBorough(f.address, linkedBorough) : f.address;
     const row = {
       name, phone: f.phone || null, email: f.email || null, address: address || null,
-      area: addressBorough(address) || linkedBorough || prev.area || null,
+      area: addressBorough(address) || prev.area || linkedBorough || null,
       type: f.role === "broker" ? "broker" : "owner",
       follow_up_date: f.callbackAt ? f.callbackAt.slice(0, 10) : null,
       updated_at: new Date().toISOString(),
@@ -208,27 +263,29 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
     if (f0.converted_deal_id) return onGo?.("deals", f0.converted_deal_id);
     const f = await saveContact(f0, true);
     if (!f) return;
-    const p = f.prospectKey ? pByKey[f.prospectKey] : null;
-    const b = p?.base || {};
+    const item = byKey[f.prospectKey], card = item?.card, p = item?.p;
+    const b = conversionParcel(card);
     const id = appId();
     const notesText = [...(f.notes || [])].reverse().map((n) => `${noteTime(n.noted_at)}: ${n.body}`).join("\n");
     const metrics = parcelMetrics(b);
     const assembly = assemblyLabel(p);
     const summary = p ? [
-      `New Opportunities ${p.date} #${p.rank}: ${street(b.address)}${b.zoning ? ` (${b.zoning})` : ""}.`,
+      `New Opportunities ${p.date} #${p.rank}: ${withBorough(card.values.address, card.borough)}${b.zoning ? ` (${b.zoning})` : ""}.`,
+      card.addressChanged ? `Card address was entered manually and is not verified. Original research: ${card.baseline.address}${card.source.base?.bbl ? ` (BBL ${card.source.base.bbl})` : ""}.` : "",
+      Object.keys(card.edits).length ? "Card edits are user-entered; verify before underwriting." : "",
       metrics.lot ? `Lot area: ${fmt(metrics.lot)} SF.` : "",
       metrics.aor ? `This lot: ~${fmt(metrics.aor)} SF buildable as of right (estimate).` : "Standalone as-of-right buildable was not supplied.",
-      assembly ? `Optional assemblage: ${assembly}.` : "",
-      ...(p.neighbors || []).map((n) => `Optional neighbor ${n.side || "adjacent"}: ${street(n.address)}${validUrl(n.zola) ? ` (${validUrl(n.zola)})` : ""}.`),
+      assembly ? `Optional assemblage${card.addressChanged ? " (original research unless edited)" : ""}: ${assembly}.` : "",
+      ...(p.neighbors || []).map((n) => `Optional neighbor ${n.side || "adjacent"}: ${street(n.address)}${!n.changedAddress && !card.addressChanged && validUrl(n.zola) ? ` (${validUrl(n.zola)})` : ""}.`),
       f.role === "neighbor" ? `Contact is a neighbor: ${f.address}.` : "",
     ].filter(Boolean).join("\n") : "";
     const data = {   // blankDeal() defaults + what we already know
-      id, address: street(p ? b.address : f.address), borough: prospectBorough(p) || addressBorough(f.address) || boroughName(f.area), neighborhood: p?.neighborhood || "",
+      id, address: street(card ? card.values.address : f.address), borough: card ? card.borough : addressBorough(f.address) || boroughName(f.area), neighborhood: card?.addressChanged && !Object.hasOwn(card.edits, "neighborhood") ? "" : p?.neighborhood || "",
       zone: b.zoning || "", photos: [], streetWidth: "narrow", devPath: "aor",
-      lotArea: metrics.lot ? String(metrics.lot) : "", customFar: metrics.aor && metrics.far ? String(metrics.far) : "", askingPrice: "",
+      lotArea: metrics.lot ? String(metrics.lot) : "", customFar: metrics.far && (metrics.aor || Object.hasOwn(card?.edits || {}, "max_far")) ? String(metrics.far) : "", askingPrice: card && (!card.addressChanged || Object.hasOwn(card.edits, "askingPrice")) ? String(card.values.askingPrice) : "",
       sellerNumber: f.phone || "", vacancy: "TBD", existingSf: p && b.existing_bldg_sf ? String(b.existing_bldg_sf) : "",
       contactName: f.name, contactPhone: f.phone || "", contactEmail: f.email || "",
-      notes: [summary, p && stRef.current.prospects[pkey(p)]?.note, notesText].filter(Boolean).join("\n\n"),
+      notes: [summary, item && stRef.current.prospects[item.key]?.note, notesText].filter(Boolean).join("\n\n"),
       followUpDate: f.callbackAt ? f.callbackAt.slice(0, 10) : "", followUpNotes: "",
       isPublic: false, stage: "New", assetType: "Development / Land", buildableSf: metrics.aor ? String(Math.round(metrics.aor)) : "",
       lot: null, autoFilled: {}, created: todayStr(), ownerName: userName, contactId: f.id,
@@ -237,8 +294,11 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
     if (error) return notify?.(error.message || "Couldn't create the deal.");
     await supabase.from("contacts").update({ converted_deal_id: id, updated_at: new Date().toISOString() }).eq("id", f.id);
     setContacts((cs) => cs.map((c) => (c.id === f.id ? { ...c, converted_deal_id: id } : c)));
-    putState((s) => ({ ...s, contacts: { ...s.contacts, [f.id]: { ...(s.contacts[f.id] || {}), status: "Converted" } } }));
-    if (p) setPStatus(pkey(p), "Converted");
+    const at = new Date().toISOString();
+    await putState((s) => {
+      const updated = { ...s, contacts: { ...s.contacts, [f.id]: { ...(s.contacts[f.id] || {}), status: "Converted" } } };
+      return item ? changeProspect(item.key, (entry) => moveProspect(entry, "Converted", at))(updated) : updated;
+    });
     setForm(null);
     notify?.(`Deal created for ${data.address || f.name}.`);
     onGo?.("deals", id);
@@ -246,24 +306,10 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
 
   /* ---------------- filters ---------------- */
   const t = q.trim().toLowerCase();
-  const boards = useMemo(() => {
-    const linked = new Map();
-    for (const c of crm) if (c.prospectKey) {
-      if (!linked.has(c.prospectKey)) linked.set(c.prospectKey, []);
-      linked.get(c.prospectKey).push(c);
-    }
-    return allP.map((p) => {
-      const key = pkey(p), entry = st.prospects[key] || {}, people = linked.get(key) || [];
-      const phone = prospectPhone(p, people), borough = prospectBorough(p);
-      return { p, key, entry, people, phone, borough, priority: !!researchTag(p), called: hasCall(entry), stage: prospectStage(entry, phone, people) };
-    }).sort((a, b) => String(b.p.date).localeCompare(String(a.p.date)) || (a.p.rank || 0) - (b.p.rank || 0));
-  }, [allP, crm, st.prospects]);
   const boroughCounts = Object.fromEntries([...BOARD_BOROUGHS, "Other"].map((b) => [b, 0]));
   const boroughBucket = (b) => BOARD_BOROUGHS.includes(b) ? b : "Other";
   for (const item of boards) boroughCounts[boroughBucket(item.borough)]++;
-  const found = boards.filter(({ p, borough, people, entry }) => boroughBucket(borough) === boroFilter &&
-    (!t || [p.base?.address, p.base?.bbl, p.neighborhood, p.base?.zoning, p.base?.owner, p.why, entry.note,
-      ...people.flatMap((c) => [c.name, c.phone]), ...(p.neighbors || []).flatMap((n) => [n.address, n.owner])].join(" ").toLowerCase().includes(t)));
+  const found = boards.filter((item) => boroughBucket(item.borough) === boroFilter && matchesCard(item, t));
   const calledCount = found.filter((item) => item.called).length;
   const byStage = Object.fromEntries([...ACTIVE_STAGES, ...CLOSED_STAGES].map((stage) => [stage, []]));
   for (const item of found) if (callFilter === "all" || item.called === (callFilter === "called")) byStage[item.stage].push(item);
@@ -284,12 +330,12 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
     });
 
   if (!loaded) return <div style={{ padding: 40, opacity: 0.6 }}>Loading opportunities…</div>;
-  if (loaded === "state-error") return <div className="notice">Couldn't load your saved opportunity activity. <button onClick={() => { setLoaded(false); setLoadErr(""); load(); }}>Retry</button></div>;
+  if (loaded === "state-error") return <div className="notice">Couldn't load your saved opportunity activity. <button onClick={() => { setLoaded(false); setLoadErr(""); load(lifetime.current.signal); }}>Retry</button></div>;
 
   if (form) return (
     <div className="op">
       <style>{OP_CSS}</style>
-      <ContactCard f={form} setF={setForm} prospects={allP} pByKey={pByKey}
+      <ContactCard f={form} setF={setForm} prospects={boards} byKey={byKey}
         onSave={async () => { const s = await saveContact(form); if (s) setForm(null); }}
         onBack={() => setForm(null)} onAddNote={(body) => addNote(form, body)}
         onEditNote={(nid, body) => editNote(form.id, nid, body)} onDelNote={(nid) => delNote(form.id, nid)}
@@ -305,7 +351,8 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
         <button className="primary" onClick={() => { setTab("crm"); openNew(); }}>+ New lead</button>
       </header>
       {loadErr && <div className="notice">{loadErr}</div>}
-      {saveErr && <div className="notice" role="alert">Opportunity changes couldn't be saved. <button onClick={queueState}>Retry save</button></div>}
+      {saveErr && <div className="notice" role="alert">An opportunity change wasn’t confirmed. Review the board and try that action again.</div>}
+      {editor && <OpportunityEditor card={editor.card} phoneOnly={editor.phoneOnly} onSave={saveCard} onClose={() => setEditor(null)} />}
       <span className="opSR" role="status">{announcement}</span>
 
       <div className="opTabs">
@@ -350,13 +397,14 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
                   <section key={stage} className="opLane" data-stage={stage} data-shown={archived || selectedLane === stage} aria-label={stage}>
                     <h2>{stage} <span>{byStage[stage].length}</span></h2>
                     {!byStage[stage].length && <div className="opLaneEmpty">{t ? "No matches" : stage === "To Call" ? "No prospects to call" : "No prospects here"}</div>}
-                    {byStage[stage].map(({ p, key, entry, people, phone, called }) => (
-                      <Prospect key={key} p={p} stage={stage} entry={entry} people={people} phone={phone} called={called}
-                        onStatus={(next) => { setLane(stage); setPStatus(key, next); setAnnouncement(`${street(p.base?.address)} moved to ${next}.`); }}
-                        onLogCall={() => { editProspect(key, (e) => recordCall(e, new Date().toISOString())); setAnnouncement(`Call logged for ${street(p.base?.address)}.`); }}
+                    {byStage[stage].map(({ p, card, key, entry, people, phone, called }) => (
+                      <Prospect key={key} card={card} stage={stage} entry={entry} people={people} phone={phone} called={called}
+                        onStatus={async (next) => { setLane(stage); if (await setPStatus(key, next)) setAnnouncement(`${street(p.base?.address)} moved to ${next}.`); }}
+                        onLogCall={async () => { if (await editProspect(key, (e) => recordCall(e, new Date().toISOString()))) setAnnouncement(`Call logged for ${street(p.base?.address)}.`); }}
                         onClearCall={() => editProspect(key, (e) => clearCall(e, stage, phone, new Date().toISOString()))}
                         onNote={(note) => editProspect(key, (e) => ({ ...e, note }))}
-                        onAdd={(n) => fromProspect(p, n)} onOpen={(c) => setForm({ ...c })} />
+                        onEdit={(phoneOnly) => setEditor({ key, card, phoneOnly })}
+                        onAdd={(n) => fromProspect(key, card, n)} onOpen={(c) => setForm({ ...c })} />
                     ))}
                   </section>
                 ))}
@@ -382,7 +430,7 @@ export default function Opportunities({ userId, userName, notify, onGo }) {
           <div className="opLeads">
             {cList.map((c) => {
               const ds = c.status === "Converted" || c.status === "Not interested" ? "" : dueState(c.callbackAt);
-              const p = c.prospectKey ? pByKey[c.prospectKey] : null;
+              const p = c.prospectKey ? byKey[c.prospectKey]?.p : null;
               return (
                 <div key={c.id} className="opLead" data-due={ds} onClick={() => setForm({ ...c })}>
                   <div className="opLeadTop">
@@ -417,13 +465,29 @@ const assemblyLabel = (p) => p?.neighbors?.length
   ? [sizeLabel(p.combined_buildable_gsf) && `~${sizeLabel(p.combined_buildable_gsf)} combined buildable`, unitsLabel(p.est_units)].filter(Boolean).join(" · ")
   : "";
 
-function ZoLa({ url, small }) {
-  const href = validUrl(url);
-  return href ? <a className={`opZola${small ? " sm" : ""}`} href={href} target="_blank" rel="noopener noreferrer">ZoLa</a> : null;
+function matchesCard({ p, card, entry, people }, term) {
+  if (!term) return true;
+  const { values, borough } = card;
+  const haystack = [values.address, card.baseline.address, p.base?.bbl, borough, p.neighborhood, p.base?.zoning, values.name,
+    values.phone, values.email, p.why, entry.note, ...people.flatMap((c) => [c.name, c.phone]),
+    ...(p.neighbors || []).flatMap((n) => [n.address, n.owner])];
+  const digits = term.replace(/\D/g, "");
+  return haystack.join(" ").toLowerCase().includes(term) ||
+    (/^[+\d(). -]+$/.test(term) && digits.length >= 4 && String(values.phone || "").replace(/\D/g, "").includes(digits));
 }
 
-function Prospect({ p, stage, entry, people, phone, called, onStatus, onLogCall, onClearCall, onNote, onAdd, onOpen }) {
-  const b = p.base || {}, m = parcelMetrics(b), pick = researchTag(p), assembly = assemblyLabel(p);
+function ZoLa({ url, small, label = "ZoLa" }) {
+  const href = validUrl(url);
+  return href ? <a className={`opZola${small ? " sm" : ""}`} href={href} target="_blank" rel="noopener noreferrer">{label}</a> : null;
+}
+
+function Prospect({ card, stage, entry, people, phone, called, onStatus, onLogCall, onClearCall, onNote, onEdit, onAdd, onOpen }) {
+  const { source, display: p, values, borough, addressChanged, edits } = card;
+  const b = p.base || {}, m = parcelMetrics(b), pick = researchTag(source), assembly = assemblyLabel(p);
+  const original = source.base || {}, originalMetrics = parcelMetrics(original), originalDims = lotDimensions(original);
+  const edited = Object.keys(edits).length > 0;
+  const lotEdited = ["lot_sf", "front_ft", "depth_ft", "irregular_lot"].some((field) => Object.hasOwn(edits, field));
+  const buildableEdited = Object.hasOwn(edits, "buildable_sf_aor");
   const dimensions = lotDimensions(b);
   const [note, setNote] = useState(entry.note || "");
   useEffect(() => setNote(entry.note || ""), [entry.note]);
@@ -442,9 +506,12 @@ function Prospect({ p, stage, entry, people, phone, called, onStatus, onLogCall,
       <div className="opCardTop">
         <div className="opAddrWrap">
           <h3 className="opAddr">{street(b.address) || "Address unavailable"}</h3>
-          <div className="opSub">{[p.neighborhood || prospectBorough(p), b.zoning].filter(Boolean).join(" · ")}</div>
+          <div className="opSub">{(addressChanged
+            ? [borough, Object.hasOwn(edits, "neighborhood") && p.neighborhood, Object.hasOwn(edits, "zoning") && b.zoning]
+            : [p.neighborhood || borough, b.zoning]).filter(Boolean).join(" · ")}</div>
+          {addressChanged && <div className="opAddressEdit">Edited address · not verified</div>}
         </div>
-        <ZoLa url={b.zola} />
+        <button className="opAdd opEditLink" type="button" onClick={() => onEdit(false)}>Edit card</button>
       </div>
       <div className="opNums">
         <div>
@@ -454,18 +521,25 @@ function Prospect({ p, stage, entry, people, phone, called, onStatus, onLogCall,
             {dimensions.label && <>{" "}<small>({dimensions.label})</small></>}
           </div>
           {b.irregular_lot === true && <small>Irregular lot</small>}
+          {lotEdited ? <small>Includes edits</small> : addressChanged && <small>Original parcel</small>}
         </div>
-        <div><span>Buildable · this lot</span><b>{m.aor ? `~${sizeLabel(m.aor)}` : "—"}</b><small>{m.aor ? "Est. as of right" : "Not available"}</small></div>
+        <div><span>Buildable · this lot</span><b>{m.aor ? `~${sizeLabel(m.aor)}` : "—"}</b><small>{buildableEdited ? "Entered by you" : m.aor ? (addressChanged ? "Original parcel estimate" : "Est. as of right") : "Not available"}</small></div>
       </div>
       <div className="opCardFlags">
         {pick && <span className="opPick" title={pick}>Call First</span>}
         <span className="opCallFlag" data-called={called}>{called ? "✓ Called" : "Call not logged"}</span>
       </div>
       <div className="opOwnerLine">
-        <span className="opOwner">{owner?.name || titleCase(b.owner) || "Owner not listed"}</span>
-        {phone && <a className="opAdd" href={`tel:${phone}`}>Call</a>}
-        <button className="opAdd" onClick={() => owner ? onOpen(owner) : onAdd(null)}>{owner ? (phone ? "Contact" : "Add number") : "+ Contact"}</button>
+        <span className="opOwner">{values.name || "Owner not listed"}</span>
+        <button className="opAdd" type="button" onClick={() => owner ? onOpen(owner) : onAdd(null)}>{owner ? "Contact" : "+ Contact"}</button>
       </div>
+      <div className="opCardPhone">
+        <button className="opAdd opPhoneEdit" type="button" aria-label={phone ? `Edit phone ${values.phone}` : "Add phone"} onClick={() => onEdit(true)}>
+          {phone ? <><span>{values.phone}</span><small>Edit</small></> : "+ Add phone"}
+        </button>
+        {phone && <a className="opAdd opPhoneCall" href={`tel:${phone}`}>Call</a>}
+      </div>
+      {Number(values.askingPrice) > 0 && <div className="opMeta opAsking">Ask ${fmt(values.askingPrice)}{Object.hasOwn(edits, "askingPrice") ? " · entered by you" : ""}</div>}
       {callback && <div className="followTag">Call back {whenLabel(callback.callbackAt)}</div>}
       <div className="opCardBtns">
         {!called && active && (waiting || stage === "Called"
@@ -478,23 +552,42 @@ function Prospect({ p, stage, entry, people, phone, called, onStatus, onLogCall,
       </div>
       <details className="opDetails">
         <summary>Details{entry.note ? " · Note saved" : ""}</summary>
-        <div className="opMeta">{[p.rank && `#${p.rank}`, p.date && `Added ${dayLabel(p.date)}`, b.bbl && `BBL ${b.bbl}`].filter(Boolean).join(" · ")}</div>
+        <div className="opMeta">{[p.rank && `#${p.rank}`, p.date && `Added ${dayLabel(p.date)}`].filter(Boolean).join(" · ")}</div>
+        {edited && <div className="opDetailsCopy">
+          <div><b>Your card</b> {withBorough(values.address, borough) || "Address unavailable"}</div>
+          {Object.hasOwn(edits, "phone") && <div><b>Card phone</b> {phone ? `${values.phone} · entered by you` : "Cleared by you"}</div>}
+          {values.email && <div><b>Contact email</b> {values.email}{Object.hasOwn(edits, "email") ? " · entered by you" : ""}</div>}
+        </div>}
+        <div className="opOriginal">
+          <b>{edited ? "Original parcel research" : "Researched parcel"}</b>
+          <div>{[withBorough(card.baseline.address, card.baseline.borough), original.bbl && `BBL ${original.bbl}`].filter(Boolean).join(" · ")}</div>
+          {edited && <div>{[card.baseline.neighborhood, original.zoning, original.owner, sizeLabel(originalMetrics.lot), originalDims.label,
+            originalMetrics.aor && `~${sizeLabel(originalMetrics.aor)} as of right`].filter(Boolean).join(" · ")}</div>}
+          {edited && Object.hasOwn(edits, "phone") && card.baseline.phone && <div>Original contact phone: {card.baseline.phone}</div>}
+          <ZoLa url={original.zola} small label={addressChanged ? "Original ZoLa" : "ZoLa"} />
+        </div>
         {entry.status && entry.status !== "New" && <div className="opMeta">Previous status: {entry.status}</div>}
         {called && <div className="opMeta">{entry.calledAt ? `Call logged ${noteTime(entry.calledAt)}` : "Call date not recorded"} · <button type="button" className="opTxt" onClick={onClearCall}>Undo call log</button></div>}
         {pick && <div className="opMeta">{pick} is a research recommendation, not seller interest.</div>}
         <div className="opDetailsCopy">
+          {addressChanged && <div className="opMeta">Unedited figures below still describe the original parcel.</div>}
           {bldg && <div><b>Existing</b> {bldg}</div>}
           {dimensions.front && <div><b>Frontage</b> {dimensions.front} ft{dimensions.depth && ` · ${dimensions.depth} ft deep`}</div>}
           {m.legacy && <div><b>Estimate basis</b> Lot area × {far(m.far)} FAR from the original list.</div>}
           {sizeLabel(b.unused_sf) && <div><b>Unused on this lot</b> ~{sizeLabel(b.unused_sf)}</div>}
           {m.uap && <div><b>This lot with UAP</b> ~{sizeLabel(m.uap)} if applicable</div>}
+          {Number(p.estimated_homes) > 0 && <div><b>Estimated homes</b> {fmt(p.estimated_homes)}</div>}
+          {m.far && <div><b>FAR</b> {far(m.far)}{Object.hasOwn(edits, "max_far") ? " · entered by you" : ""}</div>}
+        </div>
+        {(p.why_now || p.why || p.risks) && <div className="opDetailsCopy">
+          <b>Research notes · original parcel</b>
           {typeof p.why_now === "string" && <div><b>Why now</b> {p.why_now}</div>}
           {p.why && <div><b>Why</b> {p.why}</div>}
           {p.risks && <div className="opRisk"><b>Risks</b> {p.risks}</div>}
-        </div>
+        </div>}
         {publicSource && (publicContact.name || publicUrl || publicTel) && (
           <div className="opDetailsCopy opPublicContact">
-            <b>Public owner contact route</b>
+            <b>Researched owner contact route</b>
             <div>{[publicContact.name, publicContact.role].filter(Boolean).join(" · ")}</div>
             {publicTel && <a href={`tel:${publicTel}`}>{publicContact.phone}</a>}
             {publicUrl && <a href={publicUrl} target="_blank" rel="noopener noreferrer">Contact page</a>}
@@ -504,14 +597,15 @@ function Prospect({ p, stage, entry, people, phone, called, onStatus, onLogCall,
         {!!p.neighbors?.length && (
           <div className="opNbrs">
             <h4>Optional assemblage</h4>
-            {assembly && <div className="opMeta">{assembly} (estimate)</div>}
+            {assembly && <div className="opMeta">{assembly} (estimate){addressChanged ? " · check against original research" : ""}</div>}
             {p.neighbors.map((n, i) => (
               <div key={`${n.bbl || n.address}-${i}`} className="opNbr">
                 <div className="opNbrMain">
                   <b>{street(n.address)}</b>
-                  <div className="opMeta">{[n.side || "Adjacent", titleCase(n.owner), sizeLabel(n.unused_sf) && `~${sizeLabel(n.unused_sf)} unused`].filter(Boolean).join(" · ")}</div>
+                  <div className="opMeta">{[n.side || "Adjacent", n.owner, sizeLabel(n.unused_sf) && `~${sizeLabel(n.unused_sf)} unused`].filter(Boolean).join(" · ")}</div>
+                  {n.changedAddress && <div className="opMeta">Edited · original: {source.neighbors[i].address}</div>}
                 </div>
-                <div className="opNbrActs"><ZoLa url={n.zola} small /><button className="opAdd" onClick={() => onAdd(n)}>+ Contact</button></div>
+                <div className="opNbrActs"><ZoLa url={n.zola} small label={n.changedAddress ? "Original ZoLa" : "ZoLa"} /><button className="opAdd" onClick={() => onAdd(n)}>+ Contact</button></div>
               </div>
             ))}
           </div>
@@ -526,13 +620,13 @@ function Prospect({ p, stage, entry, people, phone, called, onStatus, onLogCall,
   );
 }
 
-function ContactCard({ f, setF, prospects, pByKey, onSave, onBack, onAddNote, onEditNote, onDelNote, onConvert, onRemove }) {
+function ContactCard({ f, setF, prospects, byKey, onSave, onBack, onAddNote, onEditNote, onDelNote, onConvert, onRemove }) {
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
   const [draft, setDraft] = useState("");
   const [editing, setEditing] = useState(null);   // {id, body}
   const [custom, setCustom] = useState(false);
   const cbRef = useRef(null);
-  const p = f.prospectKey ? pByKey[f.prospectKey] : null;
+  const linked = byKey[f.prospectKey], p = linked?.p;
   const ds = dueState(f.callbackAt);
   const setCb = (v) => setF({ ...f, callbackAt: v, status: v && f.status === "Lead" ? "Follow-up" : f.status });
   return (
@@ -556,9 +650,9 @@ function ContactCard({ f, setF, prospects, pByKey, onSave, onBack, onAddNote, on
         <div className="field"><label className="flabel">Linked prospect</label>
           <select value={f.prospectKey || ""} onChange={set("prospectKey")}>
             <option value="">None</option>
-            {prospects.map((x) => { const k = pkey(x); return <option key={k} value={k}>#{x.rank} {street(x.base?.address)} · {dayLabel(x.date)}</option>; })}
+            {prospects.map(({ key, p: x }) => <option key={key} value={key}>#{x.rank} {street(x.base?.address)} · {dayLabel(x.date)}</option>)}
           </select>
-          {p && <div className="hintline">{[prospectBorough(p), p.base?.zoning, parcelMetrics(p.base || {}).aor && `~${fmt(parcelMetrics(p.base || {}).aor)} SF on this lot`].filter(Boolean).join(" · ")}{validUrl(p.base?.zola) ? <> · <ZoLa url={p.base.zola} /></> : null}</div>}
+          {p && <div className="hintline">{[linked.borough, linked.card.addressChanged ? "Edited address · not verified" : p.base?.zoning, !linked.card.addressChanged && parcelMetrics(p.base || {}).aor && `~${fmt(parcelMetrics(p.base || {}).aor)} SF on this lot`].filter(Boolean).join(" · ")}{validUrl(p.base?.zola) ? <> · <ZoLa url={p.base.zola} label={linked.card.addressChanged ? "Original ZoLa" : "ZoLa"} /></> : null}</div>}
         </div>
         <QuickActions phone={f.phone} email={f.email} />
       </div>
@@ -676,6 +770,14 @@ const OP_CSS = `
 .opPick{background:#F7EDCF;color:#715014}
 .opOwner{flex:1 1 58px;min-width:0;font-size:12px;font-weight:650}
 .opAdd{background:none;border:none;color:${BLUE};font-weight:750;font-size:12px;padding:6px 1px;white-space:nowrap;text-decoration:none}
+.opEditLink{border:1px solid ${LINE};border-radius:7px;padding:5px 7px;flex-shrink:0}
+.opAddressEdit{color:#765721;font-size:11px;font-weight:700;margin-top:3px}
+.opCardPhone{display:flex;gap:5px;align-items:center;justify-content:space-between;background:#F1F5FC;border-radius:7px;padding:0 7px;margin-top:2px}
+.opPhoneEdit{min-width:0;text-align:left;white-space:normal;overflow-wrap:anywhere;display:flex;gap:5px;align-items:baseline;font-variant-numeric:tabular-nums}
+.opPhoneEdit small{color:#516686;font-weight:650;font-size:10px}
+.opPhoneCall{border-left:1px solid #CFD9EC;padding-left:7px;flex-shrink:0}
+.opAsking{margin:6px 0 2px}
+.opOriginal{display:grid;justify-items:start;gap:3px;background:#F6F4EE;color:#514B3E;padding:7px;border-radius:7px;margin:7px 0;font-size:11px}
 .opCardBtns{margin:6px 0 1px}
 .opMark,.opMove{min-height:34px;font-weight:750;font-size:12px;border-radius:7px;padding:6px 7px}
 .opMark{background:${INK};border:1px solid ${INK};color:white;flex:0 1 auto;white-space:nowrap}
@@ -732,6 +834,37 @@ const OP_CSS = `
 .opTxt.danger2{color:${RED};font-size:13px;margin-left:auto}
 .opFormActs{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:4px 0 30px}
 .opConvert{border-color:${GREEN};color:${GREEN};font-weight:700}
+.opEditDialog{padding:0;border:1px solid ${LINE};border-radius:14px;color:${INK};background:#fff;box-shadow:0 16px 70px #101B2D4D;width:min(100% - 28px,620px);max-height:min(88vh,760px);max-height:min(88dvh,760px);overflow:hidden}
+.opEditDialog::backdrop{background:#101B2D83}
+.opPhoneDialog{max-width:410px}
+.opEditForm{display:flex;flex-direction:column;max-height:inherit}
+.opEditHead,.opEditFoot{padding:14px 18px;background:#F7F5EF}
+.opEditHead h2{font-size:20px;line-height:1.1;margin:0 0 4px}
+.opEditHead p{font-size:13px;margin:0;color:#5D6472;overflow-wrap:anywhere}
+.opEditBody{min-height:0;overflow:auto;overscroll-behavior:contain;padding:14px 18px}
+.opEditHint{margin:0 0 13px;font-size:13px;line-height:1.4;color:#4F5B70}
+.opEditBody fieldset{border:0;padding:0;margin:0;min-width:0}
+.opEditGrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px}
+.opEditWide,.opPhoneDialog .opEditField{grid-column:1/-1}
+.opEditField label{display:block;font-size:12.5px;font-weight:750;margin-bottom:4px}
+.opEditField input,.opEditField select{width:100%;padding:7px 9px;min-height:42px;font-size:16px}
+.opEditField [aria-invalid="true"]{border-color:${RED};outline-color:${RED}}
+.opEditError{color:${RED};font-size:13px;font-weight:650;margin:0 0 5px}
+.opEditError small{display:block}
+.opEditGroup{margin-top:12px;border-top:1px solid ${LINE};padding-top:2px}
+.opEditGroup summary{font-size:13px;font-weight:750;cursor:pointer;padding:10px 0;overflow-wrap:anywhere}
+.opEditUtilities{margin-top:10px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.opEditUtilities button{min-height:38px;font-size:13px;text-align:left}
+.opEditUtilities small{color:#5D6472}
+.opEditFoot{border-top:1px solid ${LINE};flex-shrink:0}
+.opEditActs{display:flex;justify-content:flex-end;gap:8px}
+.opEditActs button{min-height:42px}
+.opEditActs button:disabled{opacity:.55;cursor:wait}
+@media (max-width:500px){
+  .opEditHead,.opEditBody,.opEditFoot{padding-left:14px;padding-right:14px}
+  .opEditMobileWide{grid-column:1/-1}
+  .opEditActs button{flex:1}
+}
 @media (max-width:820px){
   .opLanePicker{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:6px;margin:0 0 9px}
   .opLanePicker button{grid-column:span 2;padding:7px 4px;font-size:12px;min-height:38px}
@@ -746,6 +879,8 @@ const OP_CSS = `
   .opNums b{font-size:18px}
   .opMark,.opMove,.opAdd,.opZola,.opDetails summary{min-height:40px}
   .opAdd,.opZola{display:inline-flex;align-items:center}
+  .opEditLink,.opPhoneEdit,.opPhoneCall{min-height:44px}
+  .opEditLink{padding:5px 9px}
   .opDetails summary{padding:11px 0 4px}
 }
 @media (max-width:760px){
