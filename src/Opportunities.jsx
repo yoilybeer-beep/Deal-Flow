@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo, useRef } from "react";
 import { supabase } from "./supabaseClient";
 import { QuickActions } from "./crmKit";
 import {
-  ACTIVE_STAGES, BOARD_BOROUGHS, CLOSED_STAGES, addressBorough, boroughName, clearCall, hasCall,
+  ACTIVE_STAGES, BOARD_BOROUGHS, CLOSED_STAGES, addressBorough, boroughName, clearCall, hasCall, lotDimensions,
   moveProspect, neighborBorough, ownerPhone, parcelMetrics, prospectBorough, prospectKey as pkey, prospectPhone, recordCall,
   prospectStage, researchTag, street, withBorough,
 } from "./opportunityBoard";
@@ -424,6 +424,7 @@ function ZoLa({ url, small }) {
 
 function Prospect({ p, stage, entry, people, phone, called, onStatus, onLogCall, onClearCall, onNote, onAdd, onOpen }) {
   const b = p.base || {}, m = parcelMetrics(b), pick = researchTag(p), assembly = assemblyLabel(p);
+  const dimensions = lotDimensions(b);
   const [note, setNote] = useState(entry.note || "");
   useEffect(() => setNote(entry.note || ""), [entry.note]);
   const bldg = [b.bldg_class, b.floors > 0 && `${b.floors} fl`, b.units > 0 && `${b.units} unit${Number(b.units) === 1 ? "" : "s"}`,
@@ -446,7 +447,14 @@ function Prospect({ p, stage, entry, people, phone, called, onStatus, onLogCall,
         <ZoLa url={b.zola} />
       </div>
       <div className="opNums">
-        <div><span>Lot area</span><b>{sizeLabel(m.lot) || "—"}</b></div>
+        <div>
+          <span>Lot area</span>
+          <div className="opLotValue">
+            <b>{sizeLabel(m.lot) || "—"}</b>
+            {dimensions.label && <>{" "}<small>({dimensions.label})</small></>}
+          </div>
+          {b.irregular_lot === true && <small>Irregular lot</small>}
+        </div>
         <div><span>Buildable · this lot</span><b>{m.aor ? `~${sizeLabel(m.aor)}` : "—"}</b><small>{m.aor ? "Est. as of right" : "Not available"}</small></div>
       </div>
       <div className="opCardFlags">
@@ -476,7 +484,7 @@ function Prospect({ p, stage, entry, people, phone, called, onStatus, onLogCall,
         {pick && <div className="opMeta">{pick} is a research recommendation, not seller interest.</div>}
         <div className="opDetailsCopy">
           {bldg && <div><b>Existing</b> {bldg}</div>}
-          {b.front_ft > 0 && <div><b>Frontage</b> {far(b.front_ft)} ft{b.depth_ft > 0 && ` · ${far(b.depth_ft)} ft deep`}</div>}
+          {dimensions.front && <div><b>Frontage</b> {dimensions.front} ft{dimensions.depth && ` · ${dimensions.depth} ft deep`}</div>}
           {m.legacy && <div><b>Estimate basis</b> Lot area × {far(m.far)} FAR from the original list.</div>}
           {sizeLabel(b.unused_sf) && <div><b>Unused on this lot</b> ~{sizeLabel(b.unused_sf)}</div>}
           {m.uap && <div><b>This lot with UAP</b> ~{sizeLabel(m.uap)} if applicable</div>}
@@ -656,9 +664,11 @@ const OP_CSS = `
 .opSub{font-size:11.5px;color:#5D6472;margin-top:2px}
 .opZola{display:inline-block;flex-shrink:0;font-size:11px;font-weight:750;color:${BLUE};text-decoration:none;border:1px solid ${LINE};border-radius:20px;padding:5px 7px}
 .opZola.sm{padding:4px 7px}
-.opNums{display:grid;grid-template-columns:4fr 5fr;gap:5px;background:#F5F3EC;border-radius:7px;padding:7px 6px;margin:5px 0 8px}
+.opNums{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;background:#F5F3EC;border-radius:7px;padding:7px 6px;margin:5px 0 8px}
 .opNums span,.opNums small{display:block;font-size:10px;color:#595447;line-height:1.23}
 .opNums b{font-size:14px;font-weight:800;display:block;line-height:1.25;margin:2px 0 1px}
+.opLotValue{display:flex;flex-wrap:wrap;align-items:baseline;column-gap:4px;overflow-wrap:anywhere}
+.opLotValue small{font-size:11px;min-width:0}
 .opNums > div:last-child b{color:#765721}
 .opCardFlags,.opOwnerLine,.opCardBtns{display:flex;align-items:center;flex-wrap:wrap;gap:5px;margin-top:5px}
 .opCallFlag,.opPick{display:inline-block;border-radius:14px;background:#F0F1F3;color:#455063;padding:3px 6px;font-size:10.5px;font-weight:750;line-height:1.15}
@@ -731,7 +741,7 @@ const OP_CSS = `
   .opLane[data-shown="false"]{display:none}
   .opCard{padding:12px}
   .opCardTop{gap:8px}
-  .opNums{padding:8px 10px}
+  .opNums{grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);padding:8px 10px}
   .opNums span,.opNums small{font-size:11px}
   .opNums b{font-size:18px}
   .opMark,.opMove,.opAdd,.opZola,.opDetails summary{min-height:40px}

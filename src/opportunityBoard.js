@@ -50,6 +50,20 @@ export function parcelMetrics(base = {}) {
   return { lot, far, aor: positive(base.buildable_sf_aor) ?? legacy, uap: positive(base.buildable_sf_uap), legacy: legacy !== null };
 }
 
+const feetFormatter = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
+const formatFeet = (value) => {
+  if (typeof value === "string" && !/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(value.trim())) return "";
+  const number = positive(value);
+  return number === null ? "" : number < 0.01 ? "<0.01" : feetFormatter.format(number);
+};
+export function lotDimensions({ front_ft, depth_ft } = {}) {
+  // Source dimensions are in feet for this lot only. Never infer depth from area.
+  const front = formatFeet(front_ft);
+  const depth = front ? formatFeet(depth_ft) : "";
+  const label = depth ? `${front} × ${depth} ft` : front ? `${front} ft front` : "";
+  return { front, depth, label };
+}
+
 export function ownerPhone(value) {
   if (typeof value !== "string" && typeof value !== "number") return "";
   const clean = String(value).replace(/\s*(?:ext\.?|x|#)\s*\d+\s*$/i, "").trim();

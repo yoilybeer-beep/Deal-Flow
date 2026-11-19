@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  addressBorough, clearCall, hasCall, moveProspect, neighborBorough, ownerPhone, parcelMetrics, prospectBorough,
+  addressBorough, clearCall, hasCall, lotDimensions, moveProspect, neighborBorough, ownerPhone, parcelMetrics, prospectBorough,
   prospectKey, prospectPhone, prospectStage, recordCall, researchTag, withBorough,
 } from "../src/opportunityBoard.js";
 
@@ -22,6 +22,27 @@ test("borough is explicit, valid 10-digit BBL, then reliable address; key never 
   assert.equal(withBorough(p.base.address, "Brooklyn"), "80 Fixture Way, Brooklyn");
   assert.equal(prospectKey({ ...p, borough: "Manhattan" }), "2026-01-01|3000000001");
   assert.equal(prospectKey({ date: "2026-01-01", rank: 17 }), "2026-01-01|17");
+});
+
+test("lot dimensions use this lot’s reported feet and compact decimal precision", () => {
+  assert.equal(lotDimensions({ front_ft: 50, depth_ft: 100 }).label, "50 × 100 ft");
+  assert.equal(lotDimensions({ front_ft: " 50.10 ", depth_ft: "100.125" }).label, "50.1 × 100.13 ft");
+  assert.equal(lotDimensions({ front_ft: "1234.567", depth_ft: 987.65 }).label, "1,234.57 × 987.65 ft");
+  assert.equal(lotDimensions({ front_ft: 0.004 }).label, "<0.01 ft front");
+});
+
+test("missing depth leaves just frontage; never infer depth or use combined data", () => {
+  const base = { front_ft: 50, lot_sf: 5000, combined_depth_ft: 100 };
+  assert.deepEqual(lotDimensions(base), { front: "50", depth: "", label: "50 ft front" });
+  assert.equal(lotDimensions({ depth_ft: 100, lot_sf: 5000 }).label, "");
+  assert.equal(lotDimensions().label, "");
+});
+
+test("malformed and nonpositive dimensions are ignored", () => {
+  for (const invalid of [null, "", " ", 0, "0", -25, "-25", NaN, Infinity, "Infinity", "50 ft", "0x32", [50], true, {}]) {
+    assert.equal(lotDimensions({ front_ft: invalid, depth_ft: 100 }).label, "");
+    assert.equal(lotDimensions({ front_ft: 50, depth_ft: invalid }).label, "50 ft front");
+  }
 });
 
 test("standalone totals prefer known AOR; blanks and explicit unknown don't borrow combined or UAP", () => {
