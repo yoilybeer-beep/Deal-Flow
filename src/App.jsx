@@ -6,6 +6,7 @@ import { supabase } from "./supabaseClient";
 import Contacts, { contactMatches, matchingNote } from "./Contacts";
 import Team from "./Team";
 import Opportunities, { OPPS_PREFIX } from "./Opportunities";
+import DevelopmentLeads from "./DevelopmentLeads";
 import RentalUW, { isRentalModel } from "./RentalUW";
 import { ClassicUnderwriting, classicBlankModel, classicModelFromDeal } from "./ClassicUW";
 import { blankRental, newUnit, typicalExpenses } from "./rentalCalc";
@@ -2056,7 +2057,7 @@ const blankBuyer = () => ({
   followUpDate: "", lastContacted: "",
 });
 
-function DealDesk({ view, notify, onUnderwrite, onUnderwriteRental, onUnderwriteClassic, userId, userName, openId, onOpened }) {
+function DealDesk({ view, notify, onUnderwrite, onUnderwriteRental, onUnderwriteClassic, userId, userName, openId, onOpened, draftSeed }) {
   const [deals, setDeals] = useState([]);
   const [buyers, setBuyers] = useState([]);
   const [loaded, setLoaded] = useState(false);
@@ -2090,6 +2091,13 @@ function DealDesk({ view, notify, onUnderwrite, onUnderwriteRental, onUnderwrite
   }, []);
 
   useEffect(() => { setDealForm(null); setBuyerForm(null); }, [view]);
+  useEffect(() => {
+    if (view !== "deals" || !draftSeed) return;
+    setDealForm({ ...blankDeal(), address: draftSeed.address, borough: draftSeed.borough, zone: "Custom",
+      assetType: "Development / Land", fromPrivateLeads: true,
+      notes: draftSeed.addressEntered ? "Working address entered manually; confirm parcel before underwriting." : "Verify parcel and zoning independently before underwriting." });
+    onOpened?.();
+  }, [view, draftSeed]);
 
   // opened from Home's Today list or from a converted contact: jump straight to the record
   useEffect(() => {
@@ -2642,7 +2650,7 @@ function DealForm({ deal, setDeal, buyers, onSave, onCancel, onDelete, onShare, 
     }
   };
   useEffect(() => {
-    if (!mine) return;
+    if (!mine || deal.fromPrivateLeads) return;  // Private lead draft: no external lookup until explicitly requested.
     const address = (deal.address || "").trim();
     if (deal.lot && deal.lot.query === deal.address) return;   // already looked up
     if (address.length < 5 || !/\d/.test(address)) return;
@@ -3157,6 +3165,7 @@ function Shell({ user }) {
   const [view, setView] = useState("home");     // home | deals | buyers | contacts | zcalc | uw | team
   const [openTarget, setOpenTarget] = useState(null);   // { view, id } to open one record after switching screens
   const go = (v, id) => { setOpenTarget(id ? { view: v, id } : null); setView(v); window.scrollTo(0, 0); };
+  const goFromResearch = (v, draft) => { setOpenTarget({ view: v, draft }); setView(v); window.scrollTo(0, 0); };
   const [uwModel, setUwModel] = useState(() => blankModel());
   const [returnTo, setReturnTo] = useState(null);
   const [toast, setToast] = useState("");
@@ -3195,7 +3204,8 @@ function Shell({ user }) {
   // invite links land here with a session in the URL; ask for a password once
   const [needsPassword, setNeedsPassword] = useState(() => /type=(invite|recovery)/.test(window.location.hash));
 
-  const NAV = [["home", "Home"], ["opps", "New Opportunities"], ["deals", "Deals"], ["buyers", "Buyers"], ["contacts", "Contacts"], ["zcalc", "Zoning calc"], ["uw", "Underwriting"], ["uwc", "Classic UW"], ["rent", "Rental UW"],
+  const canDevelop = role === "admin" || role === "member";
+  const NAV = [["home", "Home"], ["opps", "New Opportunities"], ...(canDevelop ? [["development", "Development Leads"]] : []), ["deals", "Deals"], ["buyers", "Buyers"], ["contacts", "Contacts"], ["zcalc", "Zoning calc"], ["uw", "Underwriting"], ["uwc", "Classic UW"], ["rent", "Rental UW"],
     ...(role === "admin" ? [["team", "Team"]] : [])];
 
   return (
@@ -3234,6 +3244,7 @@ function Shell({ user }) {
               {!userName && <NamePrompt onSaved={setUserName} />}
               <HomeSearch onOpen={go} />
               <TodayPanel onOpen={go} notify={notify} />
+              {canDevelop && <p className="homeIntro"><button type="button" className="ghost" onClick={() => go("development")}>Open Development Leads →</button></p>}
               <p className="homeIntro">Where do you want to work?</p>
               <div className="homeCards">
                 <div className="homeCard" onClick={() => setView("deals")}>
@@ -3284,16 +3295,21 @@ function Shell({ user }) {
 
           {(view === "deals" || view === "buyers" || view === "zcalc") && (
             <DealDesk view={view} notify={notify} onUnderwrite={underwriteDeal} onUnderwriteRental={underwriteRental} onUnderwriteClassic={underwriteClassic} userId={userId} userName={displayName}
-              openId={openTarget?.view === view ? openTarget.id : null} onOpened={() => setOpenTarget(null)} />
+              openId={openTarget?.view === view ? openTarget.id : null} draftSeed={openTarget?.view === view ? openTarget.draft : null}
+              onOpened={() => setOpenTarget(null)} />
           )}
 
           {view === "team" && role === "admin" && <Team userId={userId} notify={notify} />}
 
           {view === "opps" && <Opportunities userId={userId} userName={displayName} notify={notify} onGo={go} />}
 
+          {view === "development" && canDevelop && <DevelopmentLeads key={userId} userId={userId}
+            accountLabel={user.email || displayName} onDraft={goFromResearch} />}
+
           {view === "contacts" && (
             <Contacts notify={notify} userId={userId} userName={displayName} onGo={go}
-              openId={openTarget?.view === "contacts" ? openTarget.id : null} onOpened={() => setOpenTarget(null)} />
+              openId={openTarget?.view === "contacts" ? openTarget.id : null} draftSeed={openTarget?.view === "contacts" ? openTarget.draft : null}
+              onOpened={() => setOpenTarget(null)} />
           )}
 
           {view === "rent" && (

@@ -59,7 +59,7 @@ export function matchingNote(c, query) {
 
 const sortNotes = (notes) => [...(notes || [])].sort((a, b) => (b.noted_at || "").localeCompare(a.noted_at || ""));
 
-export default function Contacts({ notify, userId, userName, onGo, openId, onOpened }) {
+export default function Contacts({ notify, userId, userName, onGo, openId, onOpened, draftSeed }) {
   const [rows, setRows] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [form, setForm] = useState(null);
@@ -80,6 +80,12 @@ export default function Contacts({ notify, userId, userName, onGo, openId, onOpe
     setLoaded(true);
   };
   useEffect(() => { load(true); }, []);
+  useEffect(() => {
+    if (!draftSeed) return;
+    setForm({ ...blankContact(), address: draftSeed.address, name: draftSeed.contactName || "",
+      phone: draftSeed.phone || "", area: AREAS.includes(draftSeed.borough) ? draftSeed.borough : "" });
+    onOpened?.();
+  }, [draftSeed]);
 
   // one tap: every seller on a deal and every buyer becomes a contact (no duplicates)
   const [syncing, setSyncing] = useState(false);
