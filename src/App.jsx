@@ -7,6 +7,7 @@ import Contacts, { contactMatches, matchingNote } from "./Contacts";
 import Team from "./Team";
 import Opportunities, { OPPS_PREFIX } from "./Opportunities";
 import DevelopmentLeads from "./DevelopmentLeads";
+import ExcelUnderwriting from "./ExcelUnderwriting";
 import RentalUW, { isRentalModel } from "./RentalUW";
 import { ClassicUnderwriting, classicBlankModel, classicModelFromDeal } from "./ClassicUW";
 import { blankRental, newUnit, typicalExpenses } from "./rentalCalc";
@@ -1111,6 +1112,7 @@ function Underwriting({ initialModel, onExit, onClassic, notify, userId, userNam
 
   return (
     <div className="uw">
+      <ExcelUnderwriting key={userId} userId={userId} />
       <header style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", gap: 14, flexWrap: "wrap", marginBottom: 20 }}>
         <div>
           <div className="eyebrow">Underwriting</div>
