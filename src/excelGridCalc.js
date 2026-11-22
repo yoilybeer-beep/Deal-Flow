@@ -2,6 +2,8 @@
 // Unsupported workbook formulas fail explicitly; originals are checked against Excel caches.
 const CELL = /^([A-Z]{1,3})([1-9]\d{0,6})$/i;
 const COL = /^[A-Z]{1,3}$/i;
+const ROW = /^[1-9]\d{0,6}$/;
+const FORMULA_CODES=new Set(["#DIV/0!","#VALUE!","#REF!","#NAME?","#NUM!","#N/A","#NULL!","#CIRC!"]);
 const MAX_GRID = 768;
 const MAX_COLS = 128;
 const fail = (code) => { throw new Error(code); };
@@ -20,7 +22,7 @@ export function rangePosition(ref) {
   if(!s || !e) throw new Error("Invalid spreadsheet range");
   return {r1:Math.min(s.row,e.row),r2:Math.max(s.row,e.row),c1:Math.min(s.col,e.col),c2:Math.max(s.col,e.col)};
 }
-const tokenPattern=/\s+|[A-Za-z_][\w.]*\[\[#This Row\],\[[^\]]+\]\]|'(?:[^']|'')*'|"(?:[^"]|"")*"|\$?[A-Za-z_][A-Za-z0-9_.]*\$?[0-9]*|(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?|<>|<=|>=|[+\-*/^%(),:!=<> &]/iy;
+const tokenPattern=/\s+|#(?:DIV\/0!|VALUE!|REF!|NAME\?|NUM!|N\/A|NULL!)|\$[1-9]\d{0,6}|[A-Za-z_][\w.]*\[\[#This Row\],\[[^\]]+\]\]|'(?:[^']|'')*'|"(?:[^"]|"")*"|\$?[A-Za-z_][A-Za-z0-9_.]*\$?[0-9]*|(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?|<>|<=|>=|[+\-*/^%(),:!=<> &]/iy;
 const binary={"=":1,"<>":1,">":1,"<":1,">=":1,"<=":1,"&":2,"+":3,"-":3,"*":4,"/":4,"^":5};
 export function compileFormula(input) {
   const source=input.replace(/^=/,"");
@@ -40,7 +42,8 @@ export function compileFormula(input) {
     if(t==="-" || t==="+") return {tag:"unary",op:t,v:expr(6)};
     if(t==="(") { const v=expr(); expects(")"); return v; }
     if(t[0]==='"') return {tag:"val",v:t.slice(1,-1).replaceAll('""','"')};
-    if(/^(?:\d|\.\d)/.test(t)) return {tag:"val",v:Number(t)};
+    if(FORMULA_CODES.has(t.toUpperCase()))return {tag:"error",code:t.toUpperCase()};
+    if(/^(?:\d|\.\d)/.test(t) && peek()!==":") return {tag:"val",v:Number(t)};
     const structured=/^([\w.]+)\[\[#This Row\],\[([^\]]+)\]\]$/i.exec(t);
     if(structured) return {tag:"struct",table:structured[1],column:structured[2]};
     if(peek()==="(") {
@@ -55,8 +58,8 @@ export function compileFormula(input) {
     a=a.replaceAll("$", "").toUpperCase();
     let b=null;
     if(peek()===":") { take(); b=(take()||"").replaceAll("$","").toUpperCase(); }
-    if(!CELL.test(a) && !(b && COL.test(a) && COL.test(b))) fail("#NAME?");
-    if(b && !(CELL.test(b) || COL.test(a) && COL.test(b))) fail("#REF!");
+    if(!CELL.test(a) && !(b && (COL.test(a)&&COL.test(b)||ROW.test(a)&&ROW.test(b)))) fail("#NAME?");
+    if(b && !(CELL.test(a)&&CELL.test(b)||COL.test(a)&&COL.test(b)||ROW.test(a)&&ROW.test(b))) fail("#REF!");
     return {tag:"ref",sheet,a,b};
   }
   function expr(min=1) {
@@ -104,20 +107,24 @@ function meets(x,crit) {
   }
   return comparable(x,goal,op);
 }
-function reference(book,sheet,a,b) {
+function reference(book,sheet,a,b,limits) {
   const lookup=book.sheets.find(s=>s.name.toLowerCase()===sheet.toLowerCase()); if(!lookup) fail("#REF!");
   const p=cellPosition(a);
   let r;
-  if(!p && b && COL.test(a) && COL.test(b)) r={c1:Math.min(colNumber(a),colNumber(b)),c2:Math.max(colNumber(a),colNumber(b)),r1:1,r2:Math.min(MAX_GRID,lookup.maxRow||MAX_GRID)};
+  if(!p && b && COL.test(a) && COL.test(b)) r={c1:Math.min(colNumber(a),colNumber(b)),c2:Math.max(colNumber(a),colNumber(b)),r1:1,r2:Math.min(MAX_GRID,limits.get(lookup.name)?.row||MAX_GRID)};
+  else if(!p && b && ROW.test(a) && ROW.test(b)) r={r1:Math.min(+a,+b),r2:Math.max(+a,+b),c1:1,c2:Math.min(MAX_COLS,limits.get(lookup.name)?.col||MAX_COLS)};
   else if(p && (!b || CELL.test(b))) r=rangePosition(a+(b?":"+b:""));
   else fail("#REF!");
   if(b && ((r.r2-r.r1+1)*(r.c2-r.c1+1)>MAX_GRID*MAX_COLS)) fail("#REF!");
   return {ref:true,sheet:lookup.name,...r};
 }
-const FORMULA_CODES=new Set(["#DIV/0!","#VALUE!","#REF!","#NAME?","#NUM!","#N/A","#CIRC!"]);
 export function recalculate(book, edits=new Map()) {
   const cache=new Map(), running=new Set(), parsed=new Map(), tableMap=new Map((book.tables||[]).map(t=>[t.name.toLowerCase(),t]));
   const sheetMap=new Map(book.sheets.map(s=>[s.name,s]));
+  const limits=new Map(book.sheets.map(s=>[s.name,{row:Math.max(s.maxRow||1,s.bounds?.r2||1),col:Math.max(s.maxCol||1,s.bounds?.c2||1)}]));
+  for(const key of edits.keys()) {
+    const [s,a]=key.split("\u0000"), n=limits.get(s), p=cellPosition(a);if(n&&p){n.row=Math.max(n.row,p.row);n.col=Math.max(n.col,p.col);}
+  }
   const assigned=(s,a)=>edits.get(gridKey(s,a))||sheetMap.get(s)?.cells.get(a)||null;
   function read(s,a) {
     const k=gridKey(s,a), c=assigned(s,a);
@@ -140,12 +147,13 @@ export function recalculate(book, edits=new Map()) {
     const go=(node)=>interpret(node,s,a);
     const val=(node)=>scalar(go(node));
     if(n.tag==="val") return n.v;
-    if(n.tag==="ref") return reference(book,n.sheet||s,n.a,n.b);
+    if(n.tag==="error") return fail(n.code);
+    if(n.tag==="ref") return reference(book,n.sheet||s,n.a,n.b,limits);
     if(n.tag==="struct") {
       const t=tableMap.get(n.table.toLowerCase()), p=cellPosition(a);
       const col=t?.headers.findIndex(h=>h.trim().toLowerCase()===n.column.trim().toLowerCase());
       if(!t||!p||col<0||p.row<t.r1||p.row>t.r2||t.sheet!==s) fail("#REF!");
-      return reference(book,s,cellAddress(p.row,t.c1+col));
+      return reference(book,s,cellAddress(p.row,t.c1+col),null,limits);
     }
     if(n.tag==="unary"){const d=numeric(val(n.v)); return n.op==="%"?d/100:n.op==="-"?-d:d;}
     if(n.tag==="math") {

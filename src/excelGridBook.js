@@ -171,8 +171,8 @@ function setCell(doc,element,c,r) {
     else {element.setAttribute("t","inlineStr");const is=doc.createElementNS(NS,"is"); element.appendChild(is); append(is,"t",value).setAttributeNS("http://www.w3.org/XML/1998/namespace","xml:space","preserve");}
   }
 }
-export function exportGridBook(book,edits,results=recalculate(book,edits)) {
-  if(!edits.size)return book.bytes;
+export function exportGridBook(book,edits,results=recalculate(book,edits),refresh=false) {
+  if(!edits.size&&!refresh)return book.bytes;
   const parts={...book.parts}, serial=new XMLSerializer();
   for(const s of book.sheets) {
     const doc=xml(parts,s.path), data=child(doc.documentElement,"sheetData"), rows=new Map(kids(data,"row").map(r=>[+get(r,"r"),r]));
@@ -196,3 +196,5 @@ export function exportGridBook(book,edits,results=recalculate(book,edits)) {
   parts["xl/workbook.xml"]=strToU8(serial.serializeToString(doc));
   return zipSync(parts,{level:6});
 }
+
+export {NS,REL,get,kids,child,desc,xml,relationships,setCell};
