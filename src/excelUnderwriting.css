@@ -6,3 +6,6 @@
 .uwExcel__action:hover{background:#143f72}.uwExcel__action:focus-visible{outline:3px solid #3c85ce;outline-offset:3px}.uwExcel__action:disabled{opacity:.7;cursor:wait}
 .uwExcel__error{color:#7c2025;margin:0;width:100%;font-size:13px}
 @media(max-width:480px){.uwExcel{padding:14px;gap:12px}.uwExcel__action{width:100%}}
+
+.uwExcel__choices{display:flex;gap:8px;flex-wrap:wrap}.uwExcel__download{color:#185190;background:#fff;border:1px solid #a9bfd6}.uwExcel__download:hover{background:#eef5fc}.uwExcel__download:focus-visible{outline-offset:2px}
+@media(max-width:480px){.uwExcel__choices{width:100%}}

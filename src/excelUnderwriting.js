@@ -18,7 +18,11 @@ export function workbookBytes(base64, size) {
 }
 
 export function downloadMasterCopy(base64, size) {
-  const blob = new Blob([workbookBytes(base64, size)], { type: XLSX_MIME });
+  downloadExcelBytes(workbookBytes(base64, size));
+}
+
+export function downloadExcelBytes(bytes) {
+  const blob = new Blob([bytes], { type: XLSX_MIME });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
